@@ -13,7 +13,15 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("removal denied by default", () => BreakpointRequestValidation.ValidateRemoval(1, "sample.cpp", 12, null, "", false), "mutation_policy_required"),
     ("removal requires location identity", () => BreakpointRequestValidation.ValidateRemoval(1, null, 0, null, "", true), "expected_location_required"),
     ("removal requires condition identity", () => BreakpointRequestValidation.ValidateRemoval(1, "sample.cpp", 12, null, null, true), "expected_condition_required"),
-    ("source removal snapshot accepted", () => BreakpointRequestValidation.ValidateRemoval(1, "sample.cpp", 12, null, "", true), null)
+    ("source removal snapshot accepted", () => BreakpointRequestValidation.ValidateRemoval(1, "sample.cpp", 12, null, "", true), null),
+    ("member depth lower bound", () => (BreakpointRequestValidation.ClampMemberDepth(-1).ToString(), null), "0"),
+    ("member depth upper bound", () => (BreakpointRequestValidation.ClampMemberDepth(10).ToString(), null), "3"),
+    ("member count lower bound", () => (BreakpointRequestValidation.ClampMemberCount(0).ToString(), null), "1"),
+    ("member count upper bound", () => (BreakpointRequestValidation.ClampMemberCount(100).ToString(), null), "40"),
+    ("current frame snapshot accepted", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Sample.dll").ToString(), null), "True"),
+    ("changed frame count rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 6, "Run", "Run", "Sample.dll", "Sample.dll").ToString(), null), "False"),
+    ("changed frame function rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Other", "Sample.dll", "Sample.dll").ToString(), null), "False"),
+    ("changed frame module rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Other.dll").ToString(), null), "False")
 };
 
 foreach (var test in cases)

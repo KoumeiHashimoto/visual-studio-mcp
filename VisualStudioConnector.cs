@@ -654,6 +654,312 @@ public static class VisualStudioConnector
     private static string LimitDiagnostic(string message) =>
         message.Length <= 1024 ? message : message[..1024];
 
+    /// <summary>
+    /// Lists threads in the explicitly bound Visual Studio instance while execution is paused.
+    /// </summary>
+    public static DebuggerInspectionResponse ListDebuggerThreads()
+    {
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic threads = dte.Debugger.CurrentProgram.Threads;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var count = (int)threads.Count;
+            var items = new List<DebuggerThreadInfo>();
+            var returned = Math.Min(count, 64);
+            for (var index = 1; index <= returned; index++)
+            {
+                dynamic thread = threads.Item(index);
+                var id = (int)thread.ID;
+                items.Add(new DebuggerThreadInfo
+                {
+                    Id = id,
+                    Name = ReadBoundedString(() => (string?)thread.Name),
+                    FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
+                    IsCurrent = id == ReadInteger(() => (int)currentThread.ID)
+                });
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Listed {items.Count} thread(s).",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                Threads = items,
+                TotalCount = count,
+                Truncated = count > returned
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the thread inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Lists stack frames in the current thread while execution is paused.
+    /// </summary>
+    public static DebuggerInspectionResponse GetDebuggerStack()
+    {
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            var items = new List<DebuggerFrameInfo>();
+            var returned = Math.Min(count, 128);
+            dynamic currentFrame = dte.Debugger.CurrentStackFrame;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentFunction = ReadBoundedString(() => (string?)currentFrame.FunctionName);
+            var currentModule = ReadBoundedString(() => (string?)currentFrame.Module);
+            var markedCurrent = false;
+            for (var index = 1; index <= returned; index++)
+            {
+                dynamic frame = frames.Item(index);
+                var frameInfo = ReadDebuggerFrame(index, frame, false);
+                frameInfo.IsCurrent = !markedCurrent &&
+                    string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
+                    string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
+                markedCurrent |= frameInfo.IsCurrent;
+                items.Add(frameInfo);
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Listed {items.Count} frame(s) for the current thread.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                CurrentThreadId = ReadInteger(() => (int)currentThread.ID),
+                Frames = items,
+                TotalCount = count,
+                Truncated = count > returned
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the stack inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Selects a debugger thread after resolving its current process thread ID.
+    /// </summary>
+    public static DebuggerInspectionResponse SelectDebuggerThread(int threadId)
+    {
+        if (threadId <= 0) return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current thread list.");
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic threads = dte.Debugger.CurrentProgram.Threads;
+            var count = (int)threads.Count;
+            for (var index = 1; index <= Math.Min(count, 512); index++)
+            {
+                dynamic thread = threads.Item(index);
+                if ((int)thread.ID != threadId) continue;
+                dte.Debugger.CurrentThread = (EnvDTE.Thread)thread;
+                return new DebuggerInspectionResponse
+                {
+                    Success = true,
+                    Code = "ok",
+                    Message = $"Selected thread {threadId}.",
+                    TargetProcessId = _targetProcessId,
+                    DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                    Threads = new List<DebuggerThreadInfo> { ReadDebuggerThread(threadId, thread, true) }
+                };
+            }
+
+            return CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the thread selection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Selects a stack frame after checking its function name against the current snapshot.
+    /// </summary>
+    public static DebuggerInspectionResponse SelectDebuggerFrame(
+        int index,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount)
+    {
+        if (index < 1 || index > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+            expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
+            return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            if (index > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(index);
+            var current = ReadDebuggerFrame(index, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(index, expectedFrameCount, count,
+                expectedFunction, current.Function, expectedModule, current.Module))
+                return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before selecting a frame.");
+
+            dte.Debugger.CurrentStackFrame = (StackFrame)frame;
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Selected frame {index} ({current.Function}).",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                Frames = new List<DebuggerFrameInfo> { new()
+                    {
+                        Index = current.Index,
+                        Function = current.Function,
+                        Module = current.Module,
+                        File = current.File,
+                        Line = current.Line,
+                        Language = current.Language,
+                        IsCurrent = true
+                    } }
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the frame selection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Reads locals from a snapshot-validated frame with bounded member expansion.
+    /// </summary>
+    public static DebuggerInspectionResponse GetDebuggerLocals(
+        int frameIndex,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount,
+        int expectedThreadId,
+        int maxDepth,
+        int maxItems,
+        bool allowMemberExpansion)
+    {
+        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+            expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1 || expectedThreadId <= 0)
+            return CreateInspectionError("invalid_frame", "Pass the frame index, function, module, total frame count, and thread ID from the latest debugger snapshot.");
+        maxDepth = BreakpointRequestValidation.ClampMemberDepth(maxDepth);
+        maxItems = BreakpointRequestValidation.ClampMemberCount(maxItems);
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
+            if (currentThreadId != expectedThreadId)
+                return CreateInspectionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            if (frameIndex > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(frameIndex);
+            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, count,
+                expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
+                return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before reading locals.");
+
+            dynamic locals = frame.Locals;
+            var localCount = (int)locals.Count;
+            var returned = Math.Min(localCount, maxItems);
+            var budget = maxItems;
+            var items = new List<DebuggerVariableInfo>();
+            for (var index = 1; index <= returned && budget > 0; index++)
+            {
+                dynamic local = locals.Item(index);
+                items.Add(ReadDebuggerVariable(local, maxDepth, allowMemberExpansion, ref budget));
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Read {items.Count} local(s) from frame {frameIndex}.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                CurrentThreadId = currentThreadId,
+                Locals = items,
+                TotalCount = localCount,
+                Truncated = localCount > returned || budget == 0 || items.Any(item => item.Truncated)
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the local inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    private static (DTE2 Dte, string Mode) GetPausedDebugger()
+    {
+        var (dte, mode) = GetBoundDebugger();
+        if (!mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase))
+            throw new BreakpointOperationException("not_paused", "The Visual Studio debugger must be paused at a break event for thread, frame, or local inspection.");
+        return (dte, mode);
+    }
+
+    private static DebuggerThreadInfo ReadDebuggerThread(int id, dynamic thread, bool isCurrent) => new()
+    {
+        Id = id,
+        Name = ReadBoundedString(() => (string?)thread.Name),
+        FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
+        IsCurrent = isCurrent
+    };
+
+    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent) => new()
+    {
+        Index = index,
+        Function = ReadBoundedString(() => (string?)frame.FunctionName),
+        Module = ReadBoundedString(() => (string?)frame.Module),
+        File = ReadVariableString(() => (string?)frame.File),
+        Line = ReadInteger(() => (int)frame.LineCharOffset),
+        Language = ReadBoundedString(() => (string?)frame.Language),
+        IsCurrent = isCurrent
+    };
+
+    private static DebuggerVariableInfo ReadDebuggerVariable(dynamic expression, int depth, bool allowMemberExpansion, ref int remaining)
+    {
+        remaining--;
+        var result = new DebuggerVariableInfo
+        {
+            Name = ReadVariableString(() => (string?)expression.Name),
+            Type = ReadVariableString(() => (string?)expression.Type),
+            Value = ReadVariableString(() => (string?)expression.Value)
+        };
+        if (!allowMemberExpansion || depth <= 0 || remaining <= 0) return result;
+
+        try
+        {
+            dynamic members = expression.DataMembers;
+            var count = (int)members.Count;
+            var returned = Math.Min(count, remaining);
+            for (var index = 1; index <= returned && remaining > 0; index++)
+            {
+                dynamic member = members.Item(index);
+                result.Children.Add(ReadDebuggerVariable(member, depth - 1, allowMemberExpansion, ref remaining));
+            }
+            result.Truncated = count > returned || remaining == 0;
+        }
+        catch (COMException)
+        {
+            result.Truncated = true;
+        }
+
+        return result;
+    }
+
+    private static DebuggerInspectionResponse CreateInspectionError(string code, string message) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId
+    };
+
+    private static string ReadVariableString(Func<string?> read)
+    {
+        var value = ReadBoundedString(read);
+        return value.Length <= 256 ? value : value[..256];
+    }
+
     private sealed class BreakpointOperationException(string code, string message) : Exception(message)
     {
         public string Code { get; } = code;

@@ -30,6 +30,10 @@ VisualStudioMcpServer.exe stdio --parent-pid <PID> --parent-start-ticks <UTC pro
 
 `list_breakpoints` is read-only and returns at most 25 entries. `set_breakpoint` and `remove_breakpoint` require `allowMutation=true`. A condition expression also requires `allowConditionEvaluation=true`. Removal requires the location and condition fields returned by the latest list response; a changed list entry is rejected as stale. Breakpoint IDs are one-based indexes and can change after edits. Results use structured JSON with an error code and message.
 
+While the debugger is paused, `list_debugger_threads` lists up to 64 threads, `get_call_stack` lists up to 128 frames for the current thread, `select_debugger_thread` selects a live thread ID, and `select_debugger_frame` selects a one-based frame after checking its function name against the latest stack snapshot. `get_debugger_locals` requires the frame index and expected function from that snapshot. Stale indexes and a changed debugger state return structured errors.
+
+Local inspection returns at most 40 values, limits nested expansion to depth 3, and truncates each displayed name, type, or value to 256 characters. Member expansion is off by default; set `allowMemberExpansion=true` to request it. C++ Natvis and managed debugger visualizers can expose different member sets, and values beyond the limits are intentionally omitted. The server does not retain COM references between requests.
+
 ### VSIX-managed Streamable HTTP
 
 The VSIX starts the executable in this form:
@@ -55,7 +59,7 @@ The server enumerates the Running Object Table and parses the PID from Visual St
 
 COM calls execute on a dedicated STA worker thread. Rejected calls are retried for a bounded interval, and calls have a finite wait limit. Tool output, request body size, and enumerated member counts are bounded.
 
-## Breakpoint validation checks
+## Debugger validation checks
 
 Run the argument and safety-policy checks with:
 
@@ -63,7 +67,7 @@ Run the argument and safety-policy checks with:
 dotnet run --project .\tests\BreakpointValidation\BreakpointValidation.csproj
 ```
 
-These checks do not exercise COM or replace the required native C++ and C# Visual Studio 2026 sessions.
+These checks cover request policies and bounds; they do not exercise COM or replace the required native C++ and C# Visual Studio 2026 sessions.
 
 ## License
 
