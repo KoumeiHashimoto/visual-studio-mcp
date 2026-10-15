@@ -20,7 +20,15 @@ The VSIX packages the `net10.0/win-x64` publish output. Its parent repository ha
 
 ### stdio
 
-Run `VisualStudioMcpServer.exe` with no arguments (or `stdio`). The server uses MCP stdio and discovers all existing tool types in the assembly. The original tools include read-only solution, Error List, and Output Window inspection, plus existing build/debug operations. Treat this mode as trusted local client access. COM lookup requires exactly one matching Visual Studio instance in the ROT because stdio has no VSIX-supplied process ID.
+Run `VisualStudioMcpServer.exe` with no arguments (or `stdio`). The server uses MCP stdio and discovers all tool types in the assembly. The original tools include read-only solution, Error List, and Output Window inspection, plus existing build/debug operations. Treat this mode as trusted local client access. COM lookup requires exactly one matching Visual Studio instance in the ROT because stdio has no VSIX-supplied process ID.
+
+Breakpoint tools require an explicit process identity so they cannot choose a Visual Studio instance on the client's behalf. Launch stdio with the `devenv.exe` PID and its UTC process-start ticks:
+
+```text
+VisualStudioMcpServer.exe stdio --parent-pid <PID> --parent-start-ticks <UTC process start ticks>
+```
+
+`list_breakpoints` is read-only and returns at most 25 entries. `set_breakpoint` and `remove_breakpoint` require `allowMutation=true`. A condition expression also requires `allowConditionEvaluation=true`. Removal requires the location and condition fields returned by the latest list response; a changed list entry is rejected as stale. Breakpoint IDs are one-based indexes and can change after edits. Results use structured JSON with an error code and message.
 
 ### VSIX-managed Streamable HTTP
 
@@ -43,9 +51,19 @@ HTTP requests without a valid bearer token receive 401. A non-loopback Host/conn
 
 ## Visual Studio binding and COM
 
-The server enumerates the Running Object Table and parses the PID from Visual Studio DTE monikers. HTTP mode accepts only the DTE registered for the supplied parent PID; stdio mode accepts a unique match only. It does not use generic `GetActiveObject` to choose an arbitrary Visual Studio instance.
+The server enumerates the Running Object Table and parses the PID from Visual Studio DTE monikers. HTTP mode accepts only the DTE registered for the supplied parent PID; stdio mode accepts a unique match only. Breakpoint tools additionally require the supplied PID and process-start time to remain current on each operation. They do not use generic `GetActiveObject` to choose an arbitrary Visual Studio instance.
 
 COM calls execute on a dedicated STA worker thread. Rejected calls are retried for a bounded interval, and calls have a finite wait limit. Tool output, request body size, and enumerated member counts are bounded.
+
+## Breakpoint validation checks
+
+Run the argument and safety-policy checks with:
+
+```powershell
+dotnet run --project .\tests\BreakpointValidation\BreakpointValidation.csproj
+```
+
+These checks do not exercise COM or replace the required native C++ and C# Visual Studio 2026 sessions.
 
 ## License
 
