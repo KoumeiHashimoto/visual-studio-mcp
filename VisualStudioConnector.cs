@@ -954,6 +954,88 @@ public static class VisualStudioConnector
         TargetProcessId = _targetProcessId
     };
 
+    /// <summary>
+    /// Evaluates an expression on a validated paused stack frame with explicit safety policies.
+    /// </summary>
+    public static DebuggerExpressionResponse EvaluateDebuggerExpression(
+        string? expressionText,
+        int frameIndex,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount,
+        int expectedThreadId,
+        bool allowEvaluation,
+        bool allowSideEffects)
+    {
+        var expressionValidation = BreakpointRequestValidation.ValidateExpression(
+            expressionText, allowEvaluation, allowSideEffects);
+        if (expressionValidation.Code is not null)
+            return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
+        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) ||
+            expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
+            expectedFrameCount < 1 || expectedThreadId <= 0)
+            return CreateExpressionError("invalid_frame", "Pass the frame identity from the latest get_call_stack response.");
+
+        try
+        {
+            var (dte, _) = GetPausedDebugger();
+            var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
+            if (currentThreadId != expectedThreadId)
+                return CreateExpressionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var frameCount = (int)frames.Count;
+            if (frameIndex > frameCount)
+                return CreateExpressionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(frameIndex);
+            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, frameCount,
+                expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
+                return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
+
+            dynamic debugger = dte.Debugger;
+            dynamic result = debugger.GetExpression3(
+                expressionText,
+                (StackFrame)frame,
+                false,
+                false,
+                allowSideEffects,
+                5000);
+            var isValid = (bool)result.IsValidValue;
+            return new DebuggerExpressionResponse
+            {
+                Success = isValid,
+                Code = isValid ? "ok" : "invalid_expression",
+                Message = isValid ? "Expression evaluated." : "The debugger could not produce a value for this expression.",
+                TargetProcessId = _targetProcessId,
+                Expression = LimitDiagnostic(expressionText!),
+                Type = ReadVariableString(() => (string?)result.Type),
+                Value = ReadExpressionValue(() => (string?)result.Value),
+                SideEffectsAllowed = allowSideEffects
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateExpressionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateExpressionError("evaluation_failed", $"Visual Studio rejected expression evaluation (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateExpressionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    private static string ReadExpressionValue(Func<string?> read)
+    {
+        try
+        {
+            var value = read() ?? string.Empty;
+            return value.Length <= 4096 ? value : value[..4096];
+        }
+        catch { return string.Empty; }
+    }
+
+    private static DebuggerExpressionResponse CreateExpressionError(string code, string message) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId
+    };
+
     private static string ReadVariableString(Func<string?> read)
     {
         var value = ReadBoundedString(read);
