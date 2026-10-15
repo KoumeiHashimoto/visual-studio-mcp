@@ -1,4 +1,4 @@
-using ModelContextProtocol.Server;
+﻿using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 using System.ComponentModel;
 
@@ -48,30 +48,12 @@ public static class DebugControlTool
     }
 
     [McpServerTool]
-    [Description("Gets the current call stack when stopped at a breakpoint. Returns empty if not debugging or not at breakpoint.")]
+    [Description("Gets up to 128 stack frames for the current thread while paused in the bound Visual Studio instance. Returns structured JSON and fails when the target is stale or running.")]
     public static string GetCallStack(
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
         string format = "text")
     {
-        var frames = VisualStudioConnector.GetCallStack();
-
-        if (frames.Count == 0)
-        {
-            return "No call stack available (not at breakpoint or not debugging)";
-        }
-
-        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
-        {
-            return JsonConvert.SerializeObject(frames, Formatting.Indented);
-        }
-
-        var lines = new List<string> { $"Call Stack ({frames.Count} frames):", "" };
-        for (int i = 0; i < frames.Count; i++)
-        {
-            var f = frames[i];
-            lines.Add($"  [{i}] {f.FunctionName} at {f.FileName}:{f.LineNumber}");
-        }
-
-        return string.Join("\n", lines);
+        return McpOutputBounds.Limit(JsonConvert.SerializeObject(
+            StaComDispatcher.Invoke(VisualStudioConnector.GetDebuggerStack), Formatting.None));
     }
 }
