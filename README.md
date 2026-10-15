@@ -34,6 +34,8 @@ While the debugger is paused, `list_debugger_threads` lists up to 64 threads, `g
 
 Local inspection returns at most 40 values, limits nested expansion to depth 3, and truncates each displayed name, type, or value to 256 characters. Member expansion is off by default; set `allowMemberExpansion=true` to request it. C++ Natvis and managed debugger visualizers can expose different member sets, and values beyond the limits are intentionally omitted. The server does not retain COM references between requests.
 
+`evaluate_expression` requires `allowEvaluation=true`, a paused frame identity from the latest stack snapshot, and a current thread ID. Evaluation has a 5 second debugger timeout and a 15 second STA wait bound; the returned value is capped at 4096 characters. Automatic property and function evaluation is disabled by default. In that mode, a conservative syntax check rejects function calls, assignments, increments, statements, and object construction. Set `allowSideEffects=true` only when code execution or state changes from evaluation are intended. Visual Studio documents that expressions, property evaluation, and implicit function calls can have side effects; this API keeps the caller in control and does not attempt to classify every language expression perfectly.
+
 ### VSIX-managed Streamable HTTP
 
 The VSIX starts the executable in this form:
