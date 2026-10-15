@@ -1139,9 +1139,9 @@ public static class VisualStudioConnector
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
 
-            dynamic debugger = dte.Debugger;
-            dynamic result = debugger.GetExpression3(
-                expressionText,
+            var debugger = (EnvDTE100.Debugger5)dte.Debugger;
+            var result = debugger.GetExpression3(
+                expressionText!,
                 (StackFrame)frame,
                 false,
                 false,
@@ -1161,6 +1161,7 @@ public static class VisualStudioConnector
             };
         }
         catch (BreakpointOperationException ex) { return CreateExpressionError(ex.Code, ex.Message); }
+        catch (InvalidCastException) { return CreateExpressionError("evaluation_not_supported", "The bound Visual Studio debugger does not provide the Debugger5 expression-evaluation interface."); }
         catch (COMException ex) { return CreateExpressionError("evaluation_failed", $"Visual Studio rejected expression evaluation (HRESULT 0x{ex.HResult:X8})."); }
         catch (Exception ex) { return CreateExpressionError("operation_failed", LimitDiagnostic(ex.Message)); }
     }
