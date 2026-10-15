@@ -1,136 +1,52 @@
 # Visual Studio MCP Bridge
 
-A **Model Context Protocol (MCP)** server that connects AI coding assistants (like Claude) to **Visual Studio 2022/2026** via COM automation.
+An MCP server fork for Visual Studio 2022/2026. The v1.0 HTTP mode is intended to be launched and owned by the Visual Studio Debug MCP VSIX. It binds to loopback, authenticates every request, and targets the Visual Studio process ID supplied by its parent. The original stdio mode remains available for direct client launches.
 
-This bridge enables AI agents to:
-- 📖 Read build output, debug logs, and error lists
-- 🔨 Build solutions and check for errors
-- 🐛 Start/stop debugging sessions
-- 📍 Inspect call stacks at breakpoints
+The original upstream is [alon-mini/visual-studio-mcp](https://github.com/alon-mini/visual-studio-mcp). This fork preserves its MIT license and attribution. Changes for HTTP hosting and instance binding belong in this fork.
 
-Perfect for **autonomous AI-driven development workflows** where the agent can build, test, and debug without human intervention.
+## Build
 
----
+Requirements: Windows x64, .NET SDK 10, and the .NET 10 runtime for framework-dependent execution.
 
-## 🚀 Quick Start
-
-### Prerequisites
-- **Windows 10/11**
-- **.NET 8.0 SDK** or higher
-- **Visual Studio 2022 or 2026** (must be running)
-- **Claude Desktop** or another MCP-compatible client
-
-### Installation
-
-1. **Clone and build:**
-   ```powershell
-   git clone https://github.com/YOUR_USERNAME/vs-mcp-bridge.git
-   cd vs-mcp-bridge
-   dotnet publish -c Release -f net8.0 -r win-x64 --self-contained false
-   ```
-
-2. **Register with Claude:**
-   ```powershell
-   claude mcp add vs-bridge -- "<full-path>\bin\Release\net8.0\win-x64\publish\VisualStudioMcpServer.exe"
-   ```
-
-3. **Open Visual Studio** with any solution, then start using the tools!
-
----
-
-## 🛠️ Available Tools
-
-### Information Tools
-| Tool | Description |
-|------|-------------|
-| `GetSolutionInfo` | Returns current solution path and list of projects |
-| `ListOutputPanes` | Lists all Output Window panes (Build, Debug, etc.) |
-| `ReadOutputPane` | Reads content from a specific pane (with truncation) |
-| `GetErrorList` | Returns all errors and warnings from the Error List |
-
-### Build & Debug Tools
-| Tool | Description |
-|------|-------------|
-| `BuildSolution` | Builds the solution and returns success/error count |
-| `StartDebugging` | Starts debugging (F5) |
-| `StartWithoutDebugging` | Runs without debugger (Ctrl+F5) |
-| `StopDebugging` | Stops the current debug session |
-| `GetDebuggerState` | Returns current state (design/running/breakpoint) |
-| `GetCallStack` | Returns call stack when stopped at a breakpoint |
-
----
-
-## 🤖 Autonomous Testing Workflow
-
-Claude can now run this autonomous development loop:
-
-```
-1. BuildSolution → Check for compile errors
-2. If errors: GetErrorList → Analyze and fix code → Rebuild
-3. If success: StartDebugging
-4. GetDebuggerState → Monitor execution
-5. If at breakpoint: GetCallStack → Analyze the issue
-6. StopDebugging → Make fixes → Repeat
+```powershell
+dotnet restore .\VisualStudioMcpServer.csproj
+dotnet build .\VisualStudioMcpServer.csproj -c Release -f net8.0 --no-restore
+dotnet build .\VisualStudioMcpServer.csproj -c Release -f net10.0 --no-restore
 ```
 
----
+The VSIX packages the `net10.0/win-x64` publish output. Its parent repository has a transport smoke test at `scripts/Smoke-Test-Transports.ps1`.
 
-## ⚙️ Technical Details
+## Run modes
 
-### COM Message Filter
-Visual Studio is a single-threaded COM server. When VS is busy (building, debugging), it rejects COM calls. This bridge implements `IOleMessageFilter` to automatically retry rejected calls.
+### stdio
 
-### .NET Core Compatibility  
-Since `Marshal.GetActiveObject` was removed in .NET Core, this project uses P/Invoke to `oleaut32.dll` and `ole32.dll` for COM object retrieval.
+Run `VisualStudioMcpServer.exe` with no arguments (or `stdio`). The server uses MCP stdio and discovers all existing tool types in the assembly. The original tools include read-only solution, Error List, and Output Window inspection, plus existing build/debug operations. Treat this mode as trusted local client access. COM lookup requires exactly one matching Visual Studio instance in the ROT because stdio has no VSIX-supplied process ID.
 
-### STAThread Requirement
-COM automation requires a Single-Threaded Apartment (STA). The main thread is marked with `[STAThread]` to ensure proper COM interop.
+### VSIX-managed Streamable HTTP
 
----
+The VSIX starts the executable in this form:
 
-## 📋 Tool Parameters
-
-### ReadOutputPane
-```
-paneName: string   - Name (or partial name) of the pane to read
-maxLines: int      - Max lines to return from end (default: 50, 0 = all)
+```text
+VisualStudioMcpServer.exe http --parent-pid <PID> --parent-start-ticks <UTC process start ticks> --endpoint-file <ACL-protected path>
 ```
 
-### BuildSolution
-```
-waitForBuild: bool - Wait for completion (default: true)
-format: string     - Output format: "text" or "json"
-```
+The server verifies both the parent PID and process start time, creates a random 256-bit bearer token, binds Kestrel to an OS-assigned port on `127.0.0.1`, and writes the endpoint URL and token to the protected endpoint descriptor. The MCP endpoint is `/mcp`; the authenticated VSIX shutdown endpoint is `/_vsix/shutdown`. Parent-process exit stops the listener.
 
-### GetErrorList / GetSolutionInfo / GetDebuggerState / GetCallStack
-```
-format: string     - Output format: "text" or "json"
-```
+HTTP exposes only these v1.0 read-only tools:
 
----
+- `get_solution_info`
+- `get_error_list`
+- `list_output_panes`
+- `read_output_pane`
 
-## 🔧 Troubleshooting
+HTTP requests without a valid bearer token receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. The bearer token is not placed in process arguments or logs.
 
-| Issue | Solution |
-|-------|----------|
-| "No VS instance found" | Ensure Visual Studio is running with a solution open |
-| Tools not appearing | Restart Claude after re-registering the MCP |
-| COM errors | Make sure VS isn't in a modal dialog (e.g., unsaved changes prompt) |
+## Visual Studio binding and COM
 
----
+The server enumerates the Running Object Table and parses the PID from Visual Studio DTE monikers. HTTP mode accepts only the DTE registered for the supplied parent PID; stdio mode accepts a unique match only. It does not use generic `GetActiveObject` to choose an arbitrary Visual Studio instance.
 
-## 📄 License
+COM calls execute on a dedicated STA worker thread. Rejected calls are retried for a bounded interval, and calls have a finite wait limit. Tool output, request body size, and enumerated member counts are bounded.
 
-MIT License - see [LICENSE](LICENSE) for details.
+## License
 
----
-
-## 🤝 Contributing
-
-Contributions welcome! Feel free to open issues or PRs.
-
-### Ideas for future tools:
-- `SetBreakpoint` - Add/remove breakpoints programmatically
-- `EvaluateExpression` - Evaluate expressions in debugger context
-- `OpenFile` - Open specific files in VS editor
-- `NavigateToError` - Jump to error location
+MIT License. See [LICENSE](LICENSE).

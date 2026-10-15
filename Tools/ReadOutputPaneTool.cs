@@ -1,4 +1,4 @@
-using ModelContextProtocol.Server;
+﻿using ModelContextProtocol.Server;
 using System.ComponentModel;
 
 namespace VisualStudioMcpServer.Tools;
@@ -16,7 +16,7 @@ public static class ReadOutputPaneTool
         [Description("The name (or partial name) of the Output Window pane to read (e.g., 'Build', 'Debug')")]
         string paneName,
 
-        [Description("Maximum number of lines to return from the end of the pane. Defaults to 50. Set to 0 for all content (use with caution).")]
+        [Description("Maximum number of lines to return from the end of the pane. Defaults to 50 and is capped at 2000 lines.")]
         int maxLines = 50)
     {
         if (string.IsNullOrWhiteSpace(paneName))
@@ -24,7 +24,7 @@ public static class ReadOutputPaneTool
             return "Error: paneName is required. Use ListOutputPanes to see available panes.";
         }
 
-        var content = VisualStudioConnector.ReadOutputPane(paneName, maxLines);
+        var content = StaComDispatcher.Invoke(() => VisualStudioConnector.ReadOutputPane(paneName, maxLines));
 
         if (content == null)
         {
@@ -36,6 +36,6 @@ public static class ReadOutputPaneTool
             return $"Output pane '{paneName}' is empty.";
         }
 
-        return content;
+        return McpOutputBounds.Limit(content);
     }
 }

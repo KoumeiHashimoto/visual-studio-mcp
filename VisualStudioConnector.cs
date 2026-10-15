@@ -1,4 +1,6 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text.RegularExpressions;
 using EnvDTE;
 using EnvDTE80;
 
@@ -11,41 +13,31 @@ namespace VisualStudioMcpServer;
 public static class VisualStudioConnector
 {
     private static DTE2? _cachedDte;
-
-    // P/Invoke declarations for GetActiveObject (removed in .NET Core)
-    [DllImport("oleaut32.dll", PreserveSig = false)]
-    private static extern void GetActiveObject(ref Guid rclsid, IntPtr pvReserved, [MarshalAs(UnmanagedType.IUnknown)] out object ppunk);
-
-    [DllImport("ole32.dll")]
-    private static extern int CLSIDFromProgID([MarshalAs(UnmanagedType.LPWStr)] string lpszProgID, out Guid pclsid);
+    private static int? _targetProcessId;
+    private static int? _cachedProcessId;
 
     /// <summary>
-    /// .NET Core compatible implementation of Marshal.GetActiveObject
+    /// 接続対象のVisual StudioプロセスIDを設定します。
     /// </summary>
-    private static object GetActiveObject(string progId)
+    /// <param name="processId">対象PID。nullの場合はROT上の一意なVisual Studioだけを許可します。</param>
+    public static void SetTargetProcessId(int? processId)
     {
-        int hr = CLSIDFromProgID(progId, out Guid clsid);
-        if (hr < 0)
-            Marshal.ThrowExceptionForHR(hr);
-
-        GetActiveObject(ref clsid, IntPtr.Zero, out object obj);
-        return obj;
+        _targetProcessId = processId;
+        _cachedDte = null;
+        _cachedProcessId = null;
     }
 
     /// <summary>
-    /// Gets the active Visual Studio DTE instance.
-    /// Tries generic ProgID first, then VS2026-specific.
+    /// 指定PIDに一致するVisual Studio DTEをROTから取得します。
     /// </summary>
     public static DTE2? GetActiveVS()
     {
-        // Return cached instance if still valid
         if (_cachedDte != null)
         {
             try
             {
-                // Test if still connected by accessing a property
                 _ = _cachedDte.Version;
-                return _cachedDte;
+                if (!_targetProcessId.HasValue || _cachedProcessId == _targetProcessId.Value) return _cachedDte;
             }
             catch
             {
@@ -53,26 +45,45 @@ public static class VisualStudioConnector
             }
         }
 
-        // Try generic ProgID first
-        try
+        Marshal.ThrowExceptionForHR(GetRunningObjectTable(0, out var runningObjectTable));
+        runningObjectTable.EnumRunning(out var monikerEnumerator);
+        Marshal.ThrowExceptionForHR(CreateBindCtx(0, out var bindContext));
+        var monikers = new IMoniker[1];
+        var matches = new List<(int ProcessId, DTE2 Dte)>();
+        while (monikerEnumerator.Next(1, monikers, IntPtr.Zero) == 0)
         {
-            _cachedDte = (DTE2)GetActiveObject("VisualStudio.DTE");
-            return _cachedDte;
-        }
-        catch
-        {
-            // Try VS2026 specific ProgID
+            string displayName;
+            try { monikers[0].GetDisplayName(bindContext, null, out displayName); }
+            catch (COMException) { continue; }
+
+            var match = Regex.Match(displayName, @"^!?VisualStudio\.DTE\.(?<version>\d+\.\d+):(?<pid>\d+)$",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (!match.Success || !int.TryParse(match.Groups["pid"].Value, out var pid)) continue;
+            if (_targetProcessId.HasValue && pid != _targetProcessId.Value) continue;
+
             try
             {
-                _cachedDte = (DTE2)GetActiveObject("VisualStudio.DTE.18.0");
-                return _cachedDte;
+                runningObjectTable.GetObject(monikers[0], out var candidate);
+                if (candidate is DTE2 dte && (!_targetProcessId.HasValue || pid == _targetProcessId.Value))
+                    matches.Add((pid, dte));
             }
-            catch
+            catch (COMException)
             {
-                return null;
+                // ROT登録の終了と列挙の競合は候補を除外します
             }
         }
+
+        if (matches.Count != 1) return null;
+        _cachedDte = matches[0].Dte;
+        _cachedProcessId = matches[0].ProcessId;
+        return _cachedDte;
     }
+
+    [DllImport("ole32.dll")]
+    private static extern int GetRunningObjectTable(int reserved, out IRunningObjectTable runningObjectTable);
+
+    [DllImport("ole32.dll")]
+    private static extern int CreateBindCtx(int reserved, out IBindCtx bindContext);
 
     /// <summary>
     /// Gets all output window pane names.
@@ -88,6 +99,7 @@ public static class VisualStudioConnector
         foreach (OutputWindowPane pane in outputWindow.OutputWindowPanes)
         {
             names.Add(pane.Name);
+            if (names.Count >= 100) break;
         }
 
         return names;
@@ -118,17 +130,12 @@ public static class VisualStudioConnector
         if (matchingPane == null) return null;
 
         var textDoc = matchingPane.TextDocument;
-        var startPoint = textDoc.StartPoint.CreateEditPoint();
-        var fullText = startPoint.GetText(textDoc.EndPoint);
-
-        if (maxLines <= 0) return fullText;
-
-        // Truncate to last N lines
-        var lines = fullText.Split('\n');
-        if (lines.Length <= maxLines) return fullText;
-
-        var truncatedLines = lines.Skip(lines.Length - maxLines).ToArray();
-        return $"[Truncated to last {maxLines} lines]\n" + string.Join('\n', truncatedLines);
+        var endPoint = textDoc.EndPoint;
+        var firstLine = Math.Max(1, endPoint.Line - Math.Clamp(maxLines, 1, 2000) + 1);
+        var startPoint = endPoint.CreateEditPoint();
+        startPoint.MoveToLineAndOffset(firstLine, 1);
+        var text = startPoint.GetText(endPoint);
+        return firstLine > 1 ? $"[Truncated to the last {endPoint.Line - firstLine + 1} lines]\n{text}" : text;
     }
 
     /// <summary>
@@ -143,7 +150,7 @@ public static class VisualStudioConnector
         var errorList = dte.ToolWindows.ErrorList;
         var errorItems = errorList.ErrorItems;
 
-        for (int i = 1; i <= errorItems.Count; i++)
+        for (int i = 1; i <= Math.Min(errorItems.Count, 500); i++)
         {
             var item = errorItems.Item(i);
             items.Add(new ErrorItem
@@ -195,6 +202,7 @@ public static class VisualStudioConnector
             if (!string.IsNullOrEmpty(project.Name))
             {
                 info.Projects.Add(project.Name);
+                if (info.Projects.Count >= 100) break;
             }
         }
 
