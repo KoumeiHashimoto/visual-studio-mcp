@@ -896,6 +896,153 @@ public static class VisualStudioConnector
         return (dte, mode);
     }
 
+    /// <summary>
+    /// Performs an explicitly authorized debugger control action and waits asynchronously for an observed state transition.
+    /// </summary>
+    public static async Task<DebuggerControlResponse> ControlDebuggerAsync(
+        string action,
+        bool allowDebuggerControl,
+        int timeoutMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        var validation = BreakpointRequestValidation.ValidateDebuggerControl(action, allowDebuggerControl);
+        if (validation.Code is not null)
+            return CreateDebuggerControlError(action, validation.Code, validation.Message ?? "The debugger control request is invalid.");
+
+        timeoutMilliseconds = Math.Clamp(timeoutMilliseconds, 1000, 10000);
+        var startedAt = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            var initial = StaComDispatcher.Invoke(() =>
+            {
+                var (dte, mode) = GetBoundDebugger();
+                var isPaused = mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase);
+                var isRunning = mode.Equals("dbgRunMode", StringComparison.OrdinalIgnoreCase);
+                if (action == "pause" && !isRunning)
+                    throw new BreakpointOperationException("invalid_debugger_state", "Pause requires the bound debugger to be running.");
+                if (action != "pause" && !isPaused)
+                    throw new BreakpointOperationException("invalid_debugger_state", "Continue and step actions require the bound debugger to be paused.");
+
+                var location = ReadCurrentLocation(dte);
+                dynamic debugger = dte.Debugger;
+                switch (action)
+                {
+                    case "pause": debugger.Break(false); break;
+                    case "continue": debugger.Go(false); break;
+                    case "step_into": debugger.StepInto(false); break;
+                    case "step_over": debugger.StepOver(false); break;
+                    case "step_out": debugger.StepOut(false); break;
+                }
+                return new DebuggerControlObservation(mode, location.Function, location.File, location.Line);
+            }, TimeSpan.FromSeconds(15));
+
+            var sawRunning = action == "continue";
+            while (startedAt.ElapsedMilliseconds < timeoutMilliseconds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                var current = StaComDispatcher.Invoke(() =>
+                {
+                    var (dte, mode) = GetBoundDebugger();
+                    var location = mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase)
+                        ? ReadCurrentLocation(dte)
+                        : default;
+                    return new DebuggerControlObservation(mode, location.Function, location.File, location.Line);
+                }, TimeSpan.FromSeconds(3));
+
+                var isPaused = current.Mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase);
+                var isRunning = current.Mode.Equals("dbgRunMode", StringComparison.OrdinalIgnoreCase);
+                if (isRunning) sawRunning = true;
+
+                var complete = action switch
+                {
+                    "pause" => isPaused,
+                    "continue" => !isPaused,
+                    _ => isPaused && (sawRunning || !initial.HasSameLocation(current))
+                };
+                if (!complete) continue;
+
+                return new DebuggerControlResponse
+                {
+                    Success = true,
+                    Code = "ok",
+                    Message = $"Debugger action '{action}' completed; observed mode {current.Mode}.",
+                    TargetProcessId = _targetProcessId,
+                    Action = action,
+                    DebuggerMode = current.Mode,
+                    ElapsedMilliseconds = (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue)
+                };
+            }
+
+            var finalMode = StaComDispatcher.Invoke(() => GetBoundDebugger().Mode, TimeSpan.FromSeconds(3));
+            return CreateDebuggerControlError(action, "transition_timeout",
+                $"The debugger did not reach the expected state within {timeoutMilliseconds} ms; last observed mode was {finalMode}.",
+                finalMode, (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (OperationCanceledException)
+        {
+            return CreateDebuggerControlError(action, "cancelled", "The debugger state wait was cancelled after the control request was sent.",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (BreakpointOperationException ex)
+        {
+            return CreateDebuggerControlError(action, ex.Code, ex.Message,
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (COMException ex)
+        {
+            return CreateDebuggerControlError(action, "com_error", $"Visual Studio rejected the debugger control request (HRESULT 0x{ex.HResult:X8}).",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (TimeoutException)
+        {
+            return CreateDebuggerControlError(action, "com_timeout", "The Visual Studio COM request exceeded its bounded dispatcher wait.",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (Exception ex)
+        {
+            return CreateDebuggerControlError(action, "operation_failed", LimitDiagnostic(ex.Message),
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+    }
+
+    private static (string Function, string File, int Line) ReadCurrentLocation(DTE2 dte)
+    {
+        try
+        {
+            dynamic frame = dte.Debugger.CurrentStackFrame;
+            if (frame is null) return (string.Empty, string.Empty, 0);
+            return (
+                ReadBoundedString(() => (string?)frame.FunctionName),
+                ReadVariableString(() => (string?)frame.File),
+                ReadInteger(() => (int)frame.LineCharOffset));
+        }
+        catch (COMException) { return (string.Empty, string.Empty, 0); }
+    }
+
+    private static DebuggerControlResponse CreateDebuggerControlError(
+        string action,
+        string code,
+        string message,
+        string? debuggerMode = null,
+        int elapsedMilliseconds = 0) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId,
+        Action = action,
+        DebuggerMode = debuggerMode,
+        ElapsedMilliseconds = elapsedMilliseconds
+    };
+
+    private readonly record struct DebuggerControlObservation(string Mode, string Function, string File, int Line)
+    {
+        public bool HasSameLocation(DebuggerControlObservation other) =>
+            string.Equals(Function, other.Function, StringComparison.Ordinal) &&
+            string.Equals(File, other.File, StringComparison.OrdinalIgnoreCase) && Line == other.Line;
+    }
+
     private static DebuggerThreadInfo ReadDebuggerThread(int id, dynamic thread, bool isCurrent) => new()
     {
         Id = id,
