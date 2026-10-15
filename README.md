@@ -48,12 +48,17 @@ VisualStudioMcpServer.exe http --parent-pid <PID> --parent-start-ticks <UTC proc
 
 The server verifies both the parent PID and process start time, creates a random 256-bit bearer token, binds Kestrel to an OS-assigned port on `127.0.0.1`, and writes the endpoint URL and token to the protected endpoint descriptor. The MCP endpoint is `/mcp`; the authenticated VSIX shutdown endpoint is `/_vsix/shutdown`. Parent-process exit stops the listener.
 
-HTTP exposes only these v1.0 read-only tools:
+Authenticated HTTP exposes the following bounded solution and debugger tools:
 
 - `get_solution_info`
 - `get_error_list`
 - `list_output_panes`
 - `read_output_pane`
+- `list_breakpoints`, `set_breakpoint`, `remove_breakpoint`
+- `list_debugger_threads`, `get_call_stack`, `select_debugger_thread`, `select_debugger_frame`, `get_debugger_locals`
+- `evaluate_expression`, `control_debugger`
+
+Breakpoint changes, expression evaluation, side-effectful expression evaluation, member expansion, and execution control retain their explicit per-request policy flags over HTTP. Authentication, loopback binding, Host and Origin validation, and the parent-process identity check apply to these tools as well. Legacy `start_debugging`, `stop_debugging`, and build tools remain available only through stdio.
 
 HTTP requests without a valid bearer token receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. The bearer token is not placed in process arguments or logs.
 
