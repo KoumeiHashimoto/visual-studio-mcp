@@ -554,7 +554,7 @@ public static class VisualStudioConnector
     private static (DTE2 Dte, string Mode) GetBoundDebugger()
     {
         if (!_targetProcessId.HasValue || !_targetProcessStartTicks.HasValue)
-            throw new BreakpointOperationException("target_identity_required", "Breakpoint tools require an explicit Visual Studio PID and process start time. Launch stdio with --parent-pid and --parent-start-ticks, or use VSIX-managed HTTP mode.");
+            throw new BreakpointOperationException("target_identity_required", "Debugger operations require an explicit Visual Studio PID and process start time. Launch stdio with --parent-pid and --parent-start-ticks, or use VSIX-managed HTTP mode.");
 
         try
         {
@@ -957,7 +957,7 @@ public static class VisualStudioConnector
                 var complete = action switch
                 {
                     "pause" => isPaused,
-                    "continue" => !isPaused,
+                    "continue" => !isPaused || (isPaused && !initial.HasSameLocation(current)),
                     _ => isPaused && (sawRunning || !initial.HasSameLocation(current))
                 };
                 if (!complete) continue;
