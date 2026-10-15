@@ -3,7 +3,7 @@
 namespace VisualStudioMcpServer;
 
 /// <summary>
-/// Visual StudioのCOMビジー状態に対する上限付き再試行を提供します。
+/// Provides bounded retries for rejected COM calls while Visual Studio is busy.
 /// </summary>
 [ComImport]
 [Guid("00000016-0000-0000-C000-000000000046")]
@@ -21,7 +21,7 @@ public interface IOleMessageFilter
 }
 
 /// <summary>
-/// COM呼び出し拒否時に最大8秒だけ再試行します。
+/// Retries rejected COM calls for up to eight seconds.
 /// </summary>
 public sealed class MessageFilter : IOleMessageFilter
 {
@@ -34,7 +34,7 @@ public sealed class MessageFilter : IOleMessageFilter
     private static extern int CoRegisterMessageFilter(IOleMessageFilter? newFilter, out IOleMessageFilter? oldFilter);
 
     /// <summary>
-    /// STAスレッドにCOMメッセージフィルターを登録します。
+    /// Registers the COM message filter on the current STA thread.
     /// </summary>
     public static void Register()
     {
@@ -42,7 +42,7 @@ public sealed class MessageFilter : IOleMessageFilter
     }
 
     /// <summary>
-    /// 現在のSTAスレッドからCOMメッセージフィルターを解除します。
+    /// Revokes the COM message filter from the current STA thread.
     /// </summary>
     public static void Revoke()
     {

@@ -1,20 +1,20 @@
 ﻿namespace VisualStudioMcpServer.Tools;
 
 /// <summary>
-/// MCP応答が一定サイズを超えないよう制限します。
+/// Keeps MCP responses within a fixed size limit.
 /// </summary>
 internal static class McpOutputBounds
 {
     private const int MaximumCharacters = 65536;
 
     /// <summary>
-    /// 応答文字列を最大64Ki文字に制限します。
+    /// Limits response strings to 64 Ki characters.
     /// </summary>
-    /// <param name="value">MCP応答。</param>
-    /// <returns>上限内の応答。</returns>
+    /// <param name="value">The MCP response.</param>
+    /// <returns>The bounded response.</returns>
     public static string Limit(string value)
     {
         if (value.Length <= MaximumCharacters) return value;
-        return value[..MaximumCharacters] + "\n[応答を64Ki文字で切り詰めました]";
+        return value[..MaximumCharacters] + "\n[Response truncated at 64 Ki characters]";
     }
 }

@@ -3,7 +3,7 @@
 namespace VisualStudioMcpServer;
 
 /// <summary>
-/// Visual Studio COM呼び出しを専用STAスレッドへ集約します。
+/// Marshals Visual Studio COM calls to a dedicated STA thread.
 /// </summary>
 internal static class StaComDispatcher
 {
@@ -13,7 +13,7 @@ internal static class StaComDispatcher
     private static int _threadId;
 
     /// <summary>
-    /// COM実行用スレッドを一度だけ開始します。
+    /// Starts the COM worker thread once.
     /// </summary>
     public static void Start()
     {
@@ -34,12 +34,12 @@ internal static class StaComDispatcher
     }
 
     /// <summary>
-    /// 処理をSTAスレッドへ送り、上限時間内に結果を返します。
+    /// Queues an operation on the STA thread and waits for a bounded time.
     /// </summary>
-    /// <typeparam name="T">処理結果の型。</typeparam>
-    /// <param name="operation">STA上で実行する処理。</param>
-    /// <param name="timeout">待機上限。</param>
-    /// <returns>処理結果。</returns>
+    /// <typeparam name="T">The operation result type.</typeparam>
+    /// <param name="operation">The operation to run on the STA thread.</param>
+    /// <param name="timeout">The maximum wait time.</param>
+    /// <returns>The operation result.</returns>
     public static T Invoke<T>(Func<T> operation, TimeSpan? timeout = null)
     {
         Start();

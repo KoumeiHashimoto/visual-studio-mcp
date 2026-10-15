@@ -17,9 +17,9 @@ public static class VisualStudioConnector
     private static int? _cachedProcessId;
 
     /// <summary>
-    /// 接続対象のVisual StudioプロセスIDを設定します。
+    /// Sets the target Visual Studio process ID.
     /// </summary>
-    /// <param name="processId">対象PID。nullの場合はROT上の一意なVisual Studioだけを許可します。</param>
+    /// <param name="processId">The target PID. If null, requires one unique Visual Studio in the ROT.</param>
     public static void SetTargetProcessId(int? processId)
     {
         _targetProcessId = processId;
@@ -28,7 +28,7 @@ public static class VisualStudioConnector
     }
 
     /// <summary>
-    /// 指定PIDに一致するVisual Studio DTEをROTから取得します。
+    /// Gets the Visual Studio DTE from the ROT that matches the specified PID.
     /// </summary>
     public static DTE2? GetActiveVS()
     {
@@ -69,7 +69,7 @@ public static class VisualStudioConnector
             }
             catch (COMException)
             {
-                // ROT登録の終了と列挙の競合は候補を除外します
+                // Ignore candidates whose ROT registration ended during enumeration.
             }
         }
 

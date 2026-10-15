@@ -21,15 +21,15 @@ using VisualStudioMcpServer.Tools;
 [assembly: SupportedOSPlatform("windows")]
 
 /// <summary>
-/// Visual Studio向けMCPサーバーのstdioとHTTPホストを起動します。
+/// Starts the stdio and HTTP hosts for the Visual Studio MCP server.
 /// </summary>
 internal static class Program
 {
     /// <summary>
-    /// MCPサーバーを起動します。
+    /// Starts the MCP server.
     /// </summary>
-    /// <param name="args">起動モードとVisual Studio所有者情報。</param>
-    /// <returns>終了コード。</returns>
+    /// <param name="args">The startup mode and Visual Studio owner information.</param>
+    /// <returns>The process exit code.</returns>
     private static async Task<int> Main(string[] args)
     {
         try
@@ -57,7 +57,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// 標準入出力トランスポートを起動します。
+    /// Starts the stdio transport.
     /// </summary>
     private static async Task RunStdioAsync()
     {
@@ -72,9 +72,9 @@ internal static class Program
     }
 
     /// <summary>
-    /// VSIX管理下の認証付きloopback HTTPホストを起動します。
+    /// Starts the authenticated loopback HTTP host managed by the VSIX.
     /// </summary>
-    /// <param name="args">親プロセスと接続情報ファイル。</param>
+    /// <param name="args">The parent process identity and endpoint descriptor path.</param>
     private static async Task RunHttpAsync(string[] args)
     {
         var options = HttpOptions.Parse(args);
@@ -171,7 +171,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// 親Visual Studioの終了を監視します。
+    /// Monitors the parent Visual Studio process for exit.
     /// </summary>
     private static async Task MonitorParentAsync(Process parent, IHostApplicationLifetime lifetime, CancellationToken token)
     {
@@ -180,7 +180,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// OriginがloopbackのHTTP originであることを確認します。
+    /// Checks that the Origin is an HTTP loopback origin.
     /// </summary>
     private static bool IsAllowedOrigin(string origin)
     {
@@ -192,7 +192,7 @@ internal static class Program
     }
 
     /// <summary>
-    /// トークンを一定時間比較で照合します。
+    /// Compares bearer tokens in constant time.
     /// </summary>
     private static bool TokenEquals(string expected, string actual)
     {
@@ -226,31 +226,31 @@ internal static class Program
 }
 
 /// <summary>
-/// HTTPトランスポートで公開する読み取り専用ツールの許可リストです。
+/// Allowlist of read-only tools exposed through the HTTP transport.
 /// </summary>
 [McpServerToolType]
 public sealed class ReadOnlyHttpTools
 {
-    /// <summary>現在開いているソリューションの情報を取得します。</summary>
+    /// <summary>Gets information about the currently open solution.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Returns information about the currently open Visual Studio solution.")]
     public static string GetSolutionInfo(
         [System.ComponentModel.Description("Output format: 'text' or 'json'.")] string format = "text") =>
         GetSolutionInfoTool.GetSolutionInfo(format);
 
-    /// <summary>Error Listの項目を取得します。</summary>
+    /// <summary>Gets items from the Error List.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Returns errors and warnings from the Visual Studio Error List.")]
     public static string GetErrorList(
         [System.ComponentModel.Description("Output format: 'text' or 'json'.")] string format = "text") =>
         GetErrorListTool.GetErrorList(format);
 
-    /// <summary>Output Windowのpane名を取得します。</summary>
+    /// <summary>Lists Output Window pane names.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Lists available Visual Studio Output Window panes.")]
     public static string ListOutputPanes() => ListOutputPanesTool.ListOutputPanes();
 
-    /// <summary>Output Window paneの末尾を取得します。</summary>
+    /// <summary>Gets the tail of an Output Window pane.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Reads a bounded number of lines from a Visual Studio Output Window pane.")]
     public static string ReadOutputPane(
