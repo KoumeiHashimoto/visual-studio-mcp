@@ -18,6 +18,7 @@ public static class VisualStudioConnector
     private static int? _targetProcessId;
     private static int? _cachedProcessId;
     private static long? _targetProcessStartTicks;
+    private static readonly SemaphoreSlim DebuggerControlGate = new(1, 1);
 
     /// <summary>
     /// Sets the target Visual Studio process ID.
@@ -283,10 +284,8 @@ public static class VisualStudioConnector
         {
             try
             {
-                dynamic currentFrame = dte.Debugger.CurrentStackFrame;
+                var currentFrame = dte.Debugger.CurrentStackFrame;
                 state.CurrentFunction = currentFrame.FunctionName;
-                state.CurrentFile = Path.GetFileName((string)(currentFrame.File ?? ""));
-                state.CurrentLine = (int)(currentFrame.LineCharOffset ?? 0);
             }
             catch { }
         }
@@ -295,7 +294,7 @@ public static class VisualStudioConnector
         {
             "dbgDesignMode" => "Not debugging (Design mode)",
             "dbgRunMode" => "Running (no breakpoint)",
-            "dbgBreakMode" => $"At breakpoint: {state.CurrentFunction} ({state.CurrentFile}:{state.CurrentLine})",
+            "dbgBreakMode" => $"At breakpoint: {state.CurrentFunction} (source coordinates unavailable through EnvDTE)",
             _ => state.Mode
         };
 
@@ -376,12 +375,13 @@ public static class VisualStudioConnector
                 frames.Add(new StackFrameInfo
                 {
                     FunctionName = frame.FunctionName ?? "",
-                    FileName = Path.GetFileName((string)(frame.File ?? "")),
-                    LineNumber = (int)(frame.LineCharOffset ?? 0),
+                    // EnvDTE.StackFrame does not expose source coordinates.
+                    FileName = "",
+                    LineNumber = 0,
                     Language = frame.Language ?? ""
                 });
             }
-            catch { /* Some frames may not have file info */ }
+            catch { /* A frame can become unavailable while execution changes. */ }
         }
 
         return frames;
@@ -911,9 +911,18 @@ public static class VisualStudioConnector
 
         timeoutMilliseconds = Math.Clamp(timeoutMilliseconds, 1000, 10000);
         var startedAt = System.Diagnostics.Stopwatch.StartNew();
+        DebuggerControlEvents? controlEvents = null;
+        var gateEntered = false;
+        var dispatchState = 0;
+        using var requestLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var requestToken = requestLifetime.Token;
         try
         {
-            var initial = StaComDispatcher.Invoke(() =>
+            gateEntered = await DebuggerControlGate.WaitAsync(0, cancellationToken).ConfigureAwait(false);
+            if (!gateEntered)
+                return CreateDebuggerControlError(action, "debugger_control_busy", "Another debugger control request is in progress. Wait for it to finish before retrying.");
+
+            StaComDispatcher.Invoke(() =>
             {
                 var (dte, mode) = GetBoundDebugger();
                 var isPaused = mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase);
@@ -923,8 +932,12 @@ public static class VisualStudioConnector
                 if (action != "pause" && !isPaused)
                     throw new BreakpointOperationException("invalid_debugger_state", "Continue and step actions require the bound debugger to be paused.");
 
-                var location = ReadCurrentLocation(dte);
-                dynamic debugger = dte.Debugger;
+                var debugger = dte.Debugger;
+                controlEvents = new DebuggerControlEvents(dte);
+                requestToken.ThrowIfCancellationRequested();
+                if (startedAt.ElapsedMilliseconds >= timeoutMilliseconds ||
+                    Interlocked.CompareExchange(ref dispatchState, 1, 0) != 0)
+                    throw new TimeoutException("The debugger control request expired before execution was sent.");
                 switch (action)
                 {
                     case "pause": debugger.Break(false); break;
@@ -933,43 +946,29 @@ public static class VisualStudioConnector
                     case "step_over": debugger.StepOver(false); break;
                     case "step_out": debugger.StepOut(false); break;
                 }
-                return new DebuggerControlObservation(mode, location.Function, location.File, location.Line);
-            }, TimeSpan.FromSeconds(15));
+                return true;
+            }, TimeSpan.FromMilliseconds(timeoutMilliseconds));
 
-            var sawRunning = action == "continue";
             while (startedAt.ElapsedMilliseconds < timeoutMilliseconds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-                var current = StaComDispatcher.Invoke(() =>
-                {
-                    var (dte, mode) = GetBoundDebugger();
-                    var location = mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase)
-                        ? ReadCurrentLocation(dte)
-                        : default;
-                    return new DebuggerControlObservation(mode, location.Function, location.File, location.Line);
-                }, TimeSpan.FromSeconds(3));
-
-                var isPaused = current.Mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase);
-                var isRunning = current.Mode.Equals("dbgRunMode", StringComparison.OrdinalIgnoreCase);
-                if (isRunning) sawRunning = true;
-
-                var complete = action switch
-                {
-                    "pause" => isPaused,
-                    "continue" => !isPaused || (isPaused && !initial.HasSameLocation(current)),
-                    _ => isPaused && (sawRunning || !initial.HasSameLocation(current))
-                };
+                await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+                var mode = StaComDispatcher.Invoke(() => GetBoundDebugger().Mode, TimeSpan.FromSeconds(3));
+                var complete = DebuggerControlCompletion.HasCompleted(action, mode,
+                    controlEvents!.SawRun, controlEvents.SawBreak, controlEvents.SawDesign);
+                if (!complete && mode == "dbgDesignMode")
+                    return CreateDebuggerControlError(action, "debugger_ended", "The debug session ended before the requested step completed.", mode,
+                        (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
                 if (!complete) continue;
 
                 return new DebuggerControlResponse
                 {
                     Success = true,
                     Code = "ok",
-                    Message = $"Debugger action '{action}' completed; observed mode {current.Mode}.",
+                    Message = $"Debugger action '{action}' completed; observed mode {mode}.",
                     TargetProcessId = _targetProcessId,
                     Action = action,
-                    DebuggerMode = current.Mode,
+                    DebuggerMode = mode,
                     ElapsedMilliseconds = (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue)
                 };
             }
@@ -981,7 +980,7 @@ public static class VisualStudioConnector
         }
         catch (OperationCanceledException)
         {
-            return CreateDebuggerControlError(action, "cancelled", "The debugger state wait was cancelled after the control request was sent.",
+            return CreateDebuggerControlError(action, "cancelled", "The debugger control wait was cancelled. A command already sent to Visual Studio may still finish.",
                 elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
         }
         catch (BreakpointOperationException ex)
@@ -996,7 +995,7 @@ public static class VisualStudioConnector
         }
         catch (TimeoutException)
         {
-            return CreateDebuggerControlError(action, "com_timeout", "The Visual Studio COM request exceeded its bounded dispatcher wait.",
+            return CreateDebuggerControlError(action, "com_timeout", "The Visual Studio COM wait expired. A command already sent may still finish; new control requests remain blocked until STA cleanup completes.",
                 elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
         }
         catch (Exception ex)
@@ -1004,20 +1003,40 @@ public static class VisualStudioConnector
             return CreateDebuggerControlError(action, "operation_failed", LimitDiagnostic(ex.Message),
                 elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
         }
+        finally
+        {
+            Interlocked.CompareExchange(ref dispatchState, 2, 0);
+            requestLifetime.Cancel();
+            if (gateEntered)
+            {
+                Task? cleanup = null;
+                try
+                {
+                    cleanup = StaComDispatcher.Post(() => controlEvents?.Dispose());
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Debugger event cleanup scheduling failed ({ex.GetType().Name}).");
+                    DebuggerControlGate.Release();
+                }
+                if (cleanup is not null)
+                {
+                    var release = ReleaseDebuggerControlAfterCleanupAsync(cleanup);
+                    try { await release.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
+                    catch (TimeoutException)
+                    {
+                        Console.Error.WriteLine("Debugger event cleanup is pending; control remains locked until it completes.");
+                    }
+                }
+            }
+        }
     }
 
-    private static (string Function, string File, int Line) ReadCurrentLocation(DTE2 dte)
+    private static async Task ReleaseDebuggerControlAfterCleanupAsync(Task cleanup)
     {
-        try
-        {
-            dynamic frame = dte.Debugger.CurrentStackFrame;
-            if (frame is null) return (string.Empty, string.Empty, 0);
-            return (
-                ReadBoundedString(() => (string?)frame.FunctionName),
-                ReadVariableString(() => (string?)frame.File),
-                ReadInteger(() => (int)frame.LineCharOffset));
-        }
-        catch (COMException) { return (string.Empty, string.Empty, 0); }
+        try { await cleanup.ConfigureAwait(false); }
+        catch (Exception ex) { Console.Error.WriteLine($"Debugger event cleanup failed ({ex.GetType().Name})."); }
+        finally { DebuggerControlGate.Release(); }
     }
 
     private static DebuggerControlResponse CreateDebuggerControlError(
@@ -1036,13 +1055,6 @@ public static class VisualStudioConnector
         ElapsedMilliseconds = elapsedMilliseconds
     };
 
-    private readonly record struct DebuggerControlObservation(string Mode, string Function, string File, int Line)
-    {
-        public bool HasSameLocation(DebuggerControlObservation other) =>
-            string.Equals(Function, other.Function, StringComparison.Ordinal) &&
-            string.Equals(File, other.File, StringComparison.OrdinalIgnoreCase) && Line == other.Line;
-    }
-
     private static DebuggerThreadInfo ReadDebuggerThread(int id, dynamic thread, bool isCurrent) => new()
     {
         Id = id,
@@ -1051,13 +1063,14 @@ public static class VisualStudioConnector
         IsCurrent = isCurrent
     };
 
+    /// <summary>Reads supported frame metadata; EnvDTE.StackFrame has no source-coordinate properties.</summary>
     private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent) => new()
     {
         Index = index,
         Function = ReadBoundedString(() => (string?)frame.FunctionName),
         Module = ReadBoundedString(() => (string?)frame.Module),
-        File = ReadVariableString(() => (string?)frame.File),
-        Line = ReadInteger(() => (int)frame.LineCharOffset),
+        File = string.Empty,
+        Line = 0,
         Language = ReadBoundedString(() => (string?)frame.Language),
         IsCurrent = isCurrent
     };

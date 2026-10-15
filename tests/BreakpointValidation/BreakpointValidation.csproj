@@ -8,5 +8,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Tools/BreakpointModels.cs" Link="BreakpointModels.cs" />
+    <Compile Include="../../DebuggerControlCompletion.cs" Link="DebuggerControlCompletion.cs" />
+    <Compile Include="../../StaComDispatcher.cs" Link="StaComDispatcher.cs" />
+    <Compile Include="../../MessageFilter.cs" Link="MessageFilter.cs" />
   </ItemGroup>
 </Project>
