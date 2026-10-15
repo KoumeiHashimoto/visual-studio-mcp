@@ -1,5 +1,7 @@
 ﻿using System.ComponentModel;
 
+using System.Text.RegularExpressions;
+
 namespace VisualStudioMcpServer.Tools;
 
 /// <summary>
@@ -165,7 +167,37 @@ public sealed class DebuggerVariableInfo
 }
 
 /// <summary>
-/// Validates breakpoint request arguments before Visual Studio COM is called.
+/// Carries a bounded result for debugger expression evaluation.
+/// </summary>
+public sealed class DebuggerExpressionResponse
+{
+    /// <summary>Gets or sets whether evaluation produced a valid value.</summary>
+    public bool Success { get; set; }
+
+    /// <summary>Gets or sets a stable error code when evaluation failed.</summary>
+    public string Code { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets an actionable result message.</summary>
+    public string Message { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the Visual Studio process ID.</summary>
+    public int? TargetProcessId { get; set; }
+
+    /// <summary>Gets or sets the evaluated expression.</summary>
+    public string Expression { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the result type.</summary>
+    public string Type { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the result value.</summary>
+    public string Value { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets whether automatic property/function evaluation was enabled.</summary>
+    public bool SideEffectsAllowed { get; set; }
+}
+
+/// <summary>
+/// Validates debugger request arguments before Visual Studio COM is called.
 /// </summary>
 public static class BreakpointRequestValidation
 {
@@ -174,6 +206,23 @@ public static class BreakpointRequestValidation
 
     /// <summary>Clamps total locals and members to the supported response bound.</summary>
     public static int ClampMemberCount(int count) => Math.Clamp(count, 1, 40);
+
+    /// <summary>
+    /// Validates expression size and explicit evaluation/side-effect permissions.
+    /// </summary>
+    public static (string? Code, string? Message) ValidateExpression(
+        string? expression,
+        bool allowEvaluation,
+        bool allowSideEffects)
+    {
+        if (!allowEvaluation)
+            return ("evaluation_policy_required", "Set allowEvaluation=true to authorize debugger expression evaluation.");
+        if (string.IsNullOrWhiteSpace(expression) || expression.Length > 1024)
+            return ("invalid_expression", "Expression text must contain 1 to 1024 characters.");
+        if (!allowSideEffects && !IsConservativeReadOnlyExpression(expression))
+            return ("side_effect_policy_required", "This expression can call code or mutate state. Set allowSideEffects=true explicitly if that behavior is intended.");
+        return (null, null);
+    }
 
     /// <summary>
     /// Validates that a stack-frame reference still identifies the expected snapshot entry.
@@ -191,6 +240,41 @@ public static class BreakpointRequestValidation
         string.Equals(expectedFunction, currentFunction, StringComparison.Ordinal) &&
         expectedModule is not null &&
         string.Equals(expectedModule, currentModule, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Conservatively rejects expression syntax that can assign, invoke functions, or construct values.
+    /// </summary>
+    public static bool IsConservativeReadOnlyExpression(string? expression)
+    {
+        if (string.IsNullOrWhiteSpace(expression) || expression.Length > 1024) return false;
+        char quote = '\0';
+        var escaped = false;
+        for (var index = 0; index < expression.Length; index++)
+        {
+            var current = expression[index];
+            if (quote != '\0')
+            {
+                if (escaped) { escaped = false; continue; }
+                if (current == '\\') { escaped = true; continue; }
+                if (current == quote) quote = '\0';
+                continue;
+            }
+
+            if (current is '\'' or '"') { quote = current; continue; }
+            if (current is '(' or ')' or '[' or ']' or ';' ||
+                ((current is '+' or '-') && index + 1 < expression.Length && expression[index + 1] == current))
+                return false;
+            if (current == '=')
+            {
+                var previous = index > 0 ? expression[index - 1] : '\0';
+                var next = index + 1 < expression.Length ? expression[index + 1] : '\0';
+                if (previous is not ('=' or '!' or '<' or '>') && next != '=') return false;
+            }
+        }
+
+        return quote == '\0' && !Regex.IsMatch(expression,
+            @"\b(new|delete|throw|await|yield|ref|out)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
 
     /// <summary>
     /// Validates a source or function breakpoint request and its safety policies.
