@@ -36,6 +36,8 @@ Local inspection returns at most 40 values, limits nested expansion to depth 3, 
 
 `evaluate_expression` requires `allowEvaluation=true`, a paused frame identity from the latest stack snapshot, and a current thread ID. Evaluation has a 5 second debugger timeout and a 15 second STA wait bound; the returned value is capped at 4096 characters. Automatic property and function evaluation is disabled by default. In that mode, a conservative syntax check rejects function calls, assignments, increments, statements, and object construction. Set `allowSideEffects=true` only when code execution or state changes from evaluation are intended. Visual Studio documents that expressions, property evaluation, and implicit function calls can have side effects; this API keeps the caller in control and does not attempt to classify every language expression perfectly.
 
+`control_debugger` supports `pause`, `continue`, `step_into`, `step_over`, and `step_out`. Every action requires `allowDebuggerControl=true` and uses the explicitly bound Visual Studio PID. Pause is accepted only while the debugger is running; continue and step actions are accepted only while paused. Each action uses the non-waiting EnvDTE command and polls the same bound target asynchronously for a state transition. The wait is clamped to 1 to 10 seconds (5 seconds by default), polls every 100 ms, and honors MCP request cancellation. A step completes only after a run-to-break transition or a changed source location is observed; otherwise the result is a structured timeout. Cancellation stops the wait after dispatch and does not imply that the already-sent debugger action was reversed.
+
 ### VSIX-managed Streamable HTTP
 
 The VSIX starts the executable in this form:

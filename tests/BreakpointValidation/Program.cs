@@ -30,7 +30,10 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("expression evaluation denied by default", () => BreakpointRequestValidation.ValidateExpression("value + 1", false, false), "evaluation_policy_required"),
     ("assignment evaluation requires side-effect policy", () => BreakpointRequestValidation.ValidateExpression("value = 1", true, false), "side_effect_policy_required"),
     ("read-only expression accepted with evaluation authorization", () => BreakpointRequestValidation.ValidateExpression("value + 1", true, false), null),
-    ("expression size bound enforced", () => BreakpointRequestValidation.ValidateExpression(new string('a', 1025), true, true), "invalid_expression")
+    ("expression size bound enforced", () => BreakpointRequestValidation.ValidateExpression(new string('a', 1025), true, true), "invalid_expression"),
+    ("debugger control denied by default", () => BreakpointRequestValidation.ValidateDebuggerControl("pause", false), "debugger_control_policy_required"),
+    ("unknown debugger control action rejected", () => BreakpointRequestValidation.ValidateDebuggerControl("terminate", true), "invalid_action"),
+    ("step action accepted with explicit policy", () => BreakpointRequestValidation.ValidateDebuggerControl("step_over", true), null)
 };
 
 foreach (var test in cases)

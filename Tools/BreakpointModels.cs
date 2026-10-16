@@ -197,10 +197,47 @@ public sealed class DebuggerExpressionResponse
 }
 
 /// <summary>
+/// Carries the observed result of a bounded debugger control operation.
+/// </summary>
+public sealed class DebuggerControlResponse
+{
+    /// <summary>Gets or sets whether the requested state transition was observed.</summary>
+    public bool Success { get; set; }
+
+    /// <summary>Gets or sets a stable result code.</summary>
+    public string Code { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets an actionable result message.</summary>
+    public string Message { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the Visual Studio process ID.</summary>
+    public int? TargetProcessId { get; set; }
+
+    /// <summary>Gets or sets the requested operation.</summary>
+    public string Action { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the final observed debugger mode.</summary>
+    public string? DebuggerMode { get; set; }
+
+    /// <summary>Gets or sets the elapsed wait in milliseconds.</summary>
+    public int ElapsedMilliseconds { get; set; }
+}
+
+/// <summary>
 /// Validates debugger request arguments before Visual Studio COM is called.
 /// </summary>
 public static class BreakpointRequestValidation
 {
+    /// <summary>Validates explicit authorization and supported debugger control actions.</summary>
+    public static (string? Code, string? Message) ValidateDebuggerControl(string? action, bool allowDebuggerControl)
+    {
+        if (action is not ("pause" or "continue" or "step_into" or "step_over" or "step_out"))
+            return ("invalid_action", "Action must be pause, continue, step_into, step_over, or step_out.");
+        if (!allowDebuggerControl)
+            return ("debugger_control_policy_required", "Set allowDebuggerControl=true to authorize debugger execution control.");
+        return (null, null);
+    }
+
     /// <summary>Clamps member expansion depth to the supported safe range.</summary>
     public static int ClampMemberDepth(int depth) => Math.Clamp(depth, 0, 3);
 
