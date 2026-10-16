@@ -9,9 +9,12 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
 {
     private readonly int _targetPid;
     private readonly long _targetStartTicks;
+    private readonly BuildEventOwnership _eventOwnership = new();
     private DTE2? _dte;
+    private string? _solutionPath;
     private bool _dispatching;
-    private bool _ownedBuild;
+    private BuildAction? _requestedAction;
+    private int _eventSequence;
 
     public DteBuildOperationAdapter(int targetPid, long targetStartTicks)
     {
@@ -41,6 +44,7 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
 
         var solution = dte.Solution;
         var fullName = solution?.FullName;
+        _solutionPath = string.IsNullOrWhiteSpace(fullName) ? null : fullName;
         var solutionBuild = solution?.SolutionBuild;
         var state = solutionBuild?.BuildState ?? vsBuildState.vsBuildStateDone;
         var configuration = solutionBuild?.ActiveConfiguration;
@@ -71,11 +75,13 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
     private Action<BuildEventSnapshot>? _onBegin;
     private Action<BuildEventSnapshot>? _onDone;
 
-    public void Dispatch(BuildAction action) => StaComDispatcher.Invoke(() =>
+    public void Dispatch(BuildAction action, int correlationWindowMilliseconds) => StaComDispatcher.Invoke(() =>
     {
         var dte = _dte ?? VisualStudioConnector.GetActiveVS()
             ?? throw new COMException("The registered Visual Studio automation object is disconnected.");
         _dispatching = true;
+        _requestedAction = action;
+        _eventOwnership.BeginDispatch(correlationWindowMilliseconds, DateTimeOffset.UtcNow);
         try
         {
             switch (action)
@@ -105,33 +111,97 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
 
     private void OnBuildBegin(vsBuildScope scope, vsBuildAction action)
     {
-        var owned = _dispatching;
-        if (owned) _ownedBuild = true;
-        _onBegin?.Invoke(ReadEventSnapshot(owned));
+        if (scope != vsBuildScope.vsBuildScopeSolution)
+        {
+            if (!_eventOwnership.IsOwnedBuild) _onBegin?.Invoke(new BuildEventSnapshot(_solutionPath, true, false, null, false) { EventScope = scope.ToString(), EventAction = action.ToString() });
+            return;
+        }
+        Interlocked.Increment(ref _eventSequence);
+        var owned = _eventOwnership.OnBuildBegin(_dispatching, MatchesRequestedAction(action), DateTimeOffset.UtcNow);
+        _onBegin?.Invoke(new BuildEventSnapshot(_solutionPath, true, false, null, owned) { EventScope = scope.ToString(), EventAction = action.ToString() });
     }
 
     private void OnBuildDone(vsBuildScope scope, vsBuildAction action)
     {
-        var owned = _ownedBuild;
-        _onDone?.Invoke(ReadEventSnapshot(owned));
-        _ownedBuild = false;
+        if (scope != vsBuildScope.vsBuildScopeSolution)
+        {
+            if (!_eventOwnership.IsOwnedBuild) _onDone?.Invoke(new BuildEventSnapshot(_solutionPath, true, false, null, false) { IsTerminalState = false, EventScope = scope.ToString(), EventAction = action.ToString() });
+            return;
+        }
+        var sequence = Interlocked.Increment(ref _eventSequence);
+        var matchesAction = MatchesRequestedAction(action);
+        var owned = _eventOwnership.OnBuildDone(_dispatching, matchesAction, DateTimeOffset.UtcNow);
+        var onDone = _onDone;
+        var solutionPath = _solutionPath;
+        _ = StaComDispatcher.Post(() =>
+        {
+            BuildEventSnapshot snapshot;
+            try { snapshot = ReadEventSnapshot(owned, sequence, scope, action); }
+            catch (COMException)
+            {
+                snapshot = new BuildEventSnapshot(solutionPath, true, false, null, owned)
+                {
+                    IsTerminalState = false,
+                    EventScope = scope.ToString(),
+                    EventAction = action.ToString()
+                };
+            }
+            catch (InvalidComObjectException)
+            {
+                snapshot = new BuildEventSnapshot(solutionPath, true, false, null, owned)
+                {
+                    IsTerminalState = false,
+                    EventScope = scope.ToString(),
+                    EventAction = action.ToString()
+                };
+            }
+            catch (Exception)
+            {
+                snapshot = new BuildEventSnapshot(solutionPath, true, false, null, owned)
+                {
+                    IsTerminalState = false,
+                    EventScope = scope.ToString(),
+                    EventAction = action.ToString()
+                };
+            }
+            onDone?.Invoke(snapshot);
+        });
     }
 
-    private BuildEventSnapshot ReadEventSnapshot(bool owned)
+    private BuildEventSnapshot ReadEventSnapshot(bool owned, int sequence, vsBuildScope scope, vsBuildAction action)
     {
         var dte = _dte;
         if (dte is null) return new BuildEventSnapshot(null, true, false, null, false);
         var solutionBuild = dte.Solution.SolutionBuild;
-        var inProgress = solutionBuild.BuildState == vsBuildState.vsBuildStateInProgress;
+        var state = solutionBuild.BuildState;
+        var inProgress = state == vsBuildState.vsBuildStateInProgress;
+        var terminal = state is vsBuildState.vsBuildStateDone or vsBuildState.vsBuildStateNotStarted;
+        var hasBuildResult = state == vsBuildState.vsBuildStateDone;
         int? failedProjects = null;
-        if (!inProgress)
+        if (hasBuildResult && _requestedAction != BuildAction.Clean)
         {
             try { failedProjects = solutionBuild.LastBuildInfo; }
             catch (COMException) { }
         }
-        return new BuildEventSnapshot(dte.Solution.FullName, inProgress,
-            false, failedProjects, owned);
+        var path = dte.Solution.FullName;
+        if (Interlocked.CompareExchange(ref _eventSequence, 0, 0) != sequence) terminal = false;
+        return new BuildEventSnapshot(path, inProgress,
+            false, failedProjects, owned)
+        {
+            IsTerminalState = terminal,
+            HasBuildResult = hasBuildResult,
+            EventScope = scope.ToString(),
+            EventAction = action.ToString()
+        };
     }
+
+    private bool MatchesRequestedAction(vsBuildAction action) => _requestedAction switch
+    {
+        BuildAction.Build => action == vsBuildAction.vsBuildActionBuild,
+        BuildAction.Rebuild => action == vsBuildAction.vsBuildActionRebuildAll,
+        BuildAction.Clean => action == vsBuildAction.vsBuildActionClean,
+        _ => false
+    };
 
     private sealed class Subscription(DteBuildOperationAdapter owner) : IDisposable
     {
@@ -151,7 +221,7 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
             current._buildEvents = null;
             current._dte = null;
             current._dispatching = false;
-            current._ownedBuild = false;
+            current._eventOwnership.Reset();
         }
     }
 }

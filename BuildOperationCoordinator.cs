@@ -26,7 +26,13 @@ internal sealed record BuildEventSnapshot(
     bool IsBuildInProgress,
     bool IsCancelled,
     int? FailedProjectCount,
-    bool IsOwnedOperation);
+    bool IsOwnedOperation)
+{
+    public bool IsTerminalState { get; init; } = true;
+    public bool HasBuildResult { get; init; } = true;
+    public string? EventScope { get; init; }
+    public string? EventAction { get; init; }
+}
 
 internal enum BuildAction { Build, Rebuild, Clean }
 
@@ -36,7 +42,7 @@ internal interface IBuildOperationAdapter
 {
     BuildTargetSnapshot ReadTargetSnapshot();
     IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone);
-    void Dispatch(BuildAction action);
+    void Dispatch(BuildAction action, int correlationWindowMilliseconds);
     void DisposeSubscription(IDisposable subscription);
 }
 
@@ -173,7 +179,7 @@ internal sealed class BuildOperationCoordinator
                 active.Dispatching = true;
             }
 
-            try { _adapter.Dispatch(action); }
+            try { _adapter.Dispatch(action, timeout); }
             catch (BuildActionUnavailableException ex)
             {
                 Finish(active, "unknown", "build_action_unavailable", Limit(ex.Message), null, null, false);
@@ -253,10 +259,11 @@ internal sealed class BuildOperationCoordinator
         {
             if (!ReferenceEquals(_active, op) || op.Terminal) return;
             var sameSolution = PathsEqual(evt.SolutionPath, op.SolutionPath);
-            if (!op.Dispatching || !evt.IsOwnedOperation || !sameSolution)
+            if (!evt.IsOwnedOperation || !sameSolution)
             {
                 op.ForeignActivity = true;
-                op.Current = Snapshot(op, false, "A foreign or uncertain build event was observed.", "unknown", "unknown", null, null, code: "build_busy");
+                op.ForeignActivityReason ??= $"A foreign or uncertain build event was observed (scope={evt.EventScope ?? "unknown"}, action={evt.EventAction ?? "unknown"}).";
+                op.Current = Snapshot(op, false, op.ForeignActivityReason, "unknown", "unknown", null, null, code: "build_busy");
                 return;
             }
             op.BeginObserved = true;
@@ -266,16 +273,29 @@ internal sealed class BuildOperationCoordinator
 
     private void OnBuildDone(ActiveOperation op, BuildEventSnapshot evt)
     {
+        var cleanup = false;
         lock (_sync)
         {
             if (!ReferenceEquals(_active, op) || op.Terminal) return;
-            if (!evt.IsOwnedOperation || !PathsEqual(evt.SolutionPath, op.SolutionPath))
+            if (op.ForeignActivity || !evt.IsOwnedOperation || !PathsEqual(evt.SolutionPath, op.SolutionPath))
             {
                 op.ForeignActivity = true;
-                op.Current = Snapshot(op, false, "A foreign or uncertain build completion was observed.", "unknown", "unknown", null, evt.IsBuildInProgress, code: "result_unknown");
-                return;
+                op.ForeignActivityReason ??= $"A foreign or uncertain build event was observed (scope={evt.EventScope ?? "unknown"}, action={evt.EventAction ?? "unknown"}).";
+                if (evt.IsTerminalState && !evt.IsBuildInProgress)
+                {
+                    FinishLocked(op, "unknown", "result_unknown", Limit($"{op.ForeignActivityReason} Completion was observed (scope={evt.EventScope ?? "unknown"}, action={evt.EventAction ?? "unknown"}); the result cannot be attributed safely."), null, null, false);
+                    cleanup = true;
+                }
+                else
+                    op.Current = Snapshot(op, false, $"A foreign or uncertain build completion was observed (scope={evt.EventScope ?? "unknown"}, action={evt.EventAction ?? "unknown"}).", "unknown", "unknown", null, evt.IsBuildInProgress, code: "result_unknown");
             }
-            if (!op.BeginObserved)
+            else if (!evt.IsTerminalState)
+            {
+                op.DoneObserved = true;
+                op.DoneEvent = evt;
+                if (op.Dispatched) CompleteFromDoneLocked(op);
+            }
+            else if (!op.BeginObserved)
             {
                 op.FastDone = true;
                 op.DoneEvent = evt;
@@ -289,12 +309,22 @@ internal sealed class BuildOperationCoordinator
                 if (op.Dispatched) CompleteFromDoneLocked(op);
             }
         }
-        CleanupIfTerminal(op, op.Subscription);
+        if (cleanup || op.Terminal) CleanupIfTerminal(op, op.Subscription);
     }
 
     private void CompleteFromDoneLocked(ActiveOperation op)
     {
         var evt = op.DoneEvent!;
+        if (!evt.IsTerminalState)
+        {
+            op.Current = Snapshot(op, false, "Visual Studio did not report a terminal build state; operation ownership remains reserved.", "unknown", "unknown", null, evt.IsBuildInProgress, code: "result_unknown");
+            return;
+        }
+        if (!evt.HasBuildResult)
+        {
+            FinishLocked(op, "unknown", "result_unknown", "Visual Studio reported no completed build result for the operation.", null, null, evt.IsBuildInProgress);
+            return;
+        }
         if (evt.IsCancelled) FinishLocked(op, "failed", "build_cancelled", "Visual Studio cancelled the build operation.", false, evt.FailedProjectCount, evt.IsBuildInProgress);
         else if (evt.IsBuildInProgress)
             FinishLocked(op, "unknown", "result_unknown", "Visual Studio did not provide a trustworthy terminal build result.", null, evt.FailedProjectCount, evt.IsBuildInProgress);
@@ -317,7 +347,7 @@ internal sealed class BuildOperationCoordinator
         lock (_sync)
         {
             if (op.Terminal) return op.Current;
-            var waitResult = Snapshot(op, false, message, op.BeginObserved ? "running" : "unknown", null, null, op.BeginObserved, code: code);
+            var waitResult = Snapshot(op, false, message, op.Current.State, null, null, op.Current.IsBuildInProgress, code: code);
             if (!op.ForeignActivity) op.Current = waitResult;
             return waitResult;
         }
@@ -407,6 +437,7 @@ internal sealed class BuildOperationCoordinator
         public BuildOperationResult Current { get; set; } = null!;
         public IDisposable? Subscription { get; set; }
         public bool Dispatching, Dispatched, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, GateReleased;
+        public string? ForeignActivityReason { get; set; }
         public BuildEventSnapshot? DoneEvent { get; set; }
     }
 }

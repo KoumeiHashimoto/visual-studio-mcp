@@ -10,6 +10,25 @@ void Check(bool condition, string name)
     checks++;
 }
 
+{
+    var ownership = new BuildEventOwnership();
+    var now = DateTimeOffset.UtcNow;
+    Check(!ownership.OnBuildBegin(false, true, now), "manual build begin before dispatch is foreign");
+    ownership.BeginDispatch(1000, now);
+    Check(ownership.OnBuildDone(true, true, now), "fast done without a begin is owned only inside dispatch");
+    Check(!ownership.OnBuildDone(false, true, now), "late done without an owned begin is not adopted");
+    ownership.BeginDispatch(1000, now);
+    Check(ownership.OnBuildBegin(true, true, now) && ownership.OnBuildDone(false, true, now), "ordinary begin and delayed done preserve ownership");
+    ownership.BeginDispatch(1000, now);
+    Check(ownership.OnBuildBegin(false, true, now.AddMilliseconds(250)), "matching begin after dispatch returns is correlated within its window");
+    Check(ownership.OnBuildDone(false, true, now.AddMilliseconds(500)), "delayed done preserves asynchronously correlated ownership");
+    ownership.BeginDispatch(1000, now);
+    Check(!ownership.OnBuildBegin(false, false, now.AddMilliseconds(1)), "mismatched action is not adopted");
+    Check(!ownership.OnBuildDone(false, true, now.AddMilliseconds(2)), "mismatched event clears pending correlation");
+    ownership.BeginDispatch(1000, now);
+    Check(!ownership.OnBuildBegin(false, true, now.AddMilliseconds(1001)), "expired correlation window does not adopt a manual build");
+}
+
 var guards = new (string Code, BuildTargetSnapshot Target, string? ExpectedPath, int? Pid, long? Ticks, bool Allowed)[]
 {
     ("build_policy_required", validTarget, validTarget.SolutionPath, 41, 1001, false),
@@ -53,7 +72,7 @@ foreach (var action in Enum.GetValues<BuildAction>())
     var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, EventSolutionPath = @"C:\other\other.sln" };
     var coordinator = new BuildOperationCoordinator(adapter);
     var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
-    Check(result.Code == "build_wait_timeout" && result.Outcome is null, "foreign completion cannot complete owned operation");
+    Check(result.Code == "result_unknown" && result.Outcome == "unknown", "foreign completion cannot complete owned operation");
     Check(coordinator.GetStatus(result.OperationId).Code == "result_unknown", "uncertain operation remains visible");
 }
 
@@ -76,17 +95,45 @@ foreach (var action in Enum.GetValues<BuildAction>())
 }
 
 {
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, TerminalState = false };
+    var coordinator = new BuildOperationCoordinator(adapter);
+    var result = await coordinator.ExecuteAsync(BuildAction.Clean, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Code == "build_wait_timeout" && result.Outcome is null, "nonterminal Done snapshot cannot claim clean success");
+    Check(coordinator.GetStatus(result.OperationId).State == "unknown", "nonterminal Done snapshot preserves unknown status");
+}
+
+{
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, HasBuildResult = false };
+    var result = await new BuildOperationCoordinator(adapter).ExecuteAsync(BuildAction.Clean, validTarget.SolutionPath, 41, 1001, true);
+    Check(result.Code == "result_unknown" && result.Outcome == "unknown", "NotStarted cannot reuse LastBuildInfo or claim clean success");
+}
+
+{
     var gate = new SemaphoreSlim(1, 1);
     var adapter = new FakeAdapter(validTarget);
     var coordinator = new BuildOperationCoordinator(adapter, gate);
     var first = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
-    Check(!first.Success && first.Code == "build_wait_timeout" && first.State == "unknown", "timeout leaves operation pending");
+    Check(!first.Success && first.Code == "build_wait_timeout" && first.State == "starting", "timeout preserves the last observed pending state");
     Check(coordinator.GetStatus(first.OperationId).Code == "build_wait_timeout", "status reflects caller wait timeout while operation remains active");
     var blocked = await coordinator.ExecuteAsync(BuildAction.Clean, validTarget.SolutionPath, 41, 1001, true, 1000);
     Check(blocked.Code == "build_busy", "concurrent workspace mutation is rejected");
     adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
     Check(coordinator.GetStatus(first.OperationId).Outcome == "succeeded", "late completion releases and records operation");
     Check(gate.Wait(0), "gate released only after terminal event");
+    gate.Release();
+}
+
+{
+    var gate = new SemaphoreSlim(1, 1);
+    var adapter = new FakeAdapter(validTarget);
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var initial = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(initial.Code == "build_wait_timeout" && initial.State == "starting", "delayed build event starts from pending status");
+    adapter.RaiseBegin(new BuildEventSnapshot(validTarget.SolutionPath, true, false, null, true));
+    Check(coordinator.GetStatus(initial.OperationId).State == "running", "owned begin delivered after dispatch is accepted");
+    adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
+    Check(coordinator.GetStatus(initial.OperationId).Outcome == "succeeded", "delayed begin and completion finish the correlated operation");
+    Check(gate.Wait(0), "delayed correlated completion releases the gate");
     gate.Release();
 }
 
@@ -130,6 +177,8 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
     public bool CompleteDuringDispatch { get; init; }
     public int? FailedCount { get; init; } = 0;
     public bool DoneStillInProgress { get; init; }
+    public bool TerminalState { get; init; } = true;
+    public bool HasBuildResult { get; init; } = true;
     public bool BeginOnSubscribe { get; init; }
     public bool BeginDuringDispatch { get; init; } = true;
     public string? EventSolutionPath { get; init; }
@@ -146,7 +195,7 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
         if (BeginOnSubscribe) _begin(new BuildEventSnapshot(snapshot.SolutionPath, true, false, null, false));
         return new Detach(this);
     }
-    public void Dispatch(BuildAction action)
+    public void Dispatch(BuildAction action, int correlationWindowMilliseconds)
     {
         DispatchCount++;
         SubscribedBeforeDispatch = _begin is not null && _done is not null;
@@ -155,9 +204,10 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
         if (!CompleteDuringDispatch) return;
         var path = EventSolutionPath ?? snapshot.SolutionPath;
         if (BeginDuringDispatch) _begin?.Invoke(new BuildEventSnapshot(path, true, false, null, true));
-        _done?.Invoke(new BuildEventSnapshot(path, DoneStillInProgress, false, FailedCount, true));
+        _done?.Invoke(new BuildEventSnapshot(path, DoneStillInProgress, false, FailedCount, true) { IsTerminalState = TerminalState, HasBuildResult = HasBuildResult });
     }
     public void DisposeSubscription(IDisposable subscription) => subscription.Dispose();
+    public void RaiseBegin(BuildEventSnapshot evt) => _begin?.Invoke(evt);
     public void RaiseDone(BuildEventSnapshot evt) => _done?.Invoke(evt);
     private sealed class Detach(FakeAdapter adapter) : IDisposable
     {
