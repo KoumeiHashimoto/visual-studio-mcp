@@ -36,7 +36,7 @@ internal static class Program
         {
             if (args.Length == 0 || args[0].Equals("stdio", StringComparison.OrdinalIgnoreCase))
             {
-                await RunStdioAsync();
+                await RunStdioAsync(args.Length == 0 ? Array.Empty<string>() : args[1..]);
                 return 0;
             }
 
@@ -46,7 +46,7 @@ internal static class Program
                 return 0;
             }
 
-            Console.Error.WriteLine("Usage: VisualStudioMcpServer.exe [stdio | http --parent-pid PID --parent-start-ticks TICKS --endpoint-file PATH]");
+            Console.Error.WriteLine("Usage: VisualStudioMcpServer.exe [stdio [--parent-pid PID --parent-start-ticks TICKS] | http --parent-pid PID --parent-start-ticks TICKS --endpoint-file PATH]");
             return 2;
         }
         catch (Exception ex)
@@ -59,8 +59,11 @@ internal static class Program
     /// <summary>
     /// Starts the stdio transport.
     /// </summary>
-    private static async Task RunStdioAsync()
+    private static async Task RunStdioAsync(string[] args)
     {
+        var targetIdentity = HttpOptions.ParseOptionalParentIdentity(args);
+        if (targetIdentity.HasValue)
+            VisualStudioConnector.SetTargetProcessIdentity(targetIdentity.Value.ProcessId, targetIdentity.Value.StartTicks);
         StaComDispatcher.Start();
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
@@ -84,7 +87,7 @@ internal static class Program
             throw new InvalidOperationException("The specified Visual Studio process identity is stale.");
         }
 
-        VisualStudioConnector.SetTargetProcessId(options.ParentPid);
+        VisualStudioConnector.SetTargetProcessIdentity(options.ParentPid, options.ParentStartTicks);
         StaComDispatcher.Start();
         var tokenBytes = RandomNumberGenerator.GetBytes(32);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
@@ -205,6 +208,23 @@ internal static class Program
 
     private sealed record HttpOptions(int ParentPid, long ParentStartTicks, string EndpointFile)
     {
+        public static (int ProcessId, long StartTicks)? ParseOptionalParentIdentity(string[] args)
+        {
+            string? Value(string name)
+            {
+                var index = Array.IndexOf(args, name);
+                return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+            }
+
+            var pidValue = Value("--parent-pid");
+            var ticksValue = Value("--parent-start-ticks");
+            if (pidValue is null && ticksValue is null) return null;
+            if (!int.TryParse(pidValue, out var pid) || pid <= 0 ||
+                !long.TryParse(ticksValue, out var startTicks) || startTicks <= 0)
+                throw new ArgumentException("Stdio target binding requires both --parent-pid and --parent-start-ticks.");
+            return (pid, startTicks);
+        }
+
         public static HttpOptions Parse(string[] args)
         {
             string? Value(string name)
