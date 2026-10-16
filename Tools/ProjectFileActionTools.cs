@@ -211,13 +211,30 @@ public sealed class ProjectFileActionTools
         var project = ProjectWorkspaceConnector.FindProject(solution.Projects, expectedProject, selected.Kind,
             string.Empty, selected.LogicalPath, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase), DateTimeOffset.UtcNow.AddSeconds(5), CancellationToken.None);
         if (project is null) throw new ProjectWorkspaceException("stale_project", "The project no longer matches its captured path and ancestry.");
-        if (!project.Saved) throw new ProjectWorkspaceException("dirty_project", "Save or discard project-file changes before changing registration.");
-        foreach (Document document in dte.Documents)
+        try
         {
-            try { if (!document.Saved && ProjectWorkspaceConnector.PathsEqual(document.FullName, filePath ?? selectedItem?.FullPath)) throw new ProjectWorkspaceException("dirty_document", "The source file has unsaved editor changes; save it before changing registration."); }
-            catch (ProjectWorkspaceException) { throw; }
-            catch (COMException) { }
+            if (!project.Saved) throw new ProjectWorkspaceException("project_dirty", "Save or discard project-file changes before changing registration.");
         }
+        catch (ProjectWorkspaceException) { throw; }
+        catch (COMException) { throw new ProjectWorkspaceException("unsupported_state", "Visual Studio could not report the project's saved state."); }
+        var documentStates = new List<bool?>();
+        try
+        {
+            var documents = dte.Documents;
+            var documentCount = documents.Count;
+            if (documentCount > 10000) throw new ProjectWorkspaceException("unsupported_state", "The open document list is too large to verify safely.");
+            for (var index = 1; index <= documentCount; index++)
+            {
+                try { documentStates.Add(documents.Item(index).Saved); }
+                catch (COMException) { documentStates.Add(null); }
+            }
+            if (documents.Count != documentCount) throw new ProjectWorkspaceException("unsupported_state", "The open document list changed during the registration preflight.");
+        }
+        catch (ProjectWorkspaceException) { throw; }
+        catch (COMException) { throw new ProjectWorkspaceException("unsupported_state", "Visual Studio could not report the saved state of every open document."); }
+        var documentStateError = ProjectMutationPreflight.GetError(documentStates);
+        if (documentStateError == "document_dirty") throw new ProjectWorkspaceException("document_dirty", "Save or discard all unsaved editor documents before changing project registration.");
+        if (documentStateError is not null) throw new ProjectWorkspaceException("unsupported_state", "Visual Studio could not report the saved state of every open document.");
         bool changed;
         if (filePath is not null)
         {

@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../ProjectSnapshotStore.cs" Link="ProjectSnapshotStore.cs" />
+    <Compile Include="../../ProjectMutationPreflight.cs" Link="ProjectMutationPreflight.cs" />
     <Compile Include="../../Tools/ProjectWorkspaceModels.cs" Link="ProjectWorkspaceModels.cs" />
   </ItemGroup>
 </Project>

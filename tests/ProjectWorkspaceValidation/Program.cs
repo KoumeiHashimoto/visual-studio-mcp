@@ -47,6 +47,17 @@ var oversized = new ProjectSnapshotData("oversized", 42, 638900000000000000, @"C
     Array.Empty<string>(), DateTimeOffset.UnixEpoch);
 Check(!new ProjectSnapshotStore(() => now).TryPut(oversized), "oversized snapshot rejected");
 
+var mutationCalls = 0;
+var dirtyStateError = ProjectMutationPreflight.GetError(new bool?[] { true, false });
+if (dirtyStateError is null) mutationCalls++;
+Check(dirtyStateError == "document_dirty", "dirty open documents block project registration changes");
+Check(mutationCalls == 0, "dirty document preflight prevents registration and save calls");
+
+var unknownStateError = ProjectMutationPreflight.GetError(new bool?[] { true, null });
+Check(unknownStateError == "unsupported_state", "unavailable document state fails closed");
+
+Check(ProjectMutationPreflight.GetError(new bool?[] { true, true }) is null, "clean open documents allow project registration preflight");
+
 Console.WriteLine($"PASS {checkCount} ProjectWorkspaceValidation checks");
 
 static ProjectSnapshotData CreateProject(string id, string name) => new(id, 42, 638900000000000000,
