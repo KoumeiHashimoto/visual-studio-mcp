@@ -17,33 +17,36 @@ public static class GetSolutionInfoTool
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
         string format = "text")
     {
-        var info = StaComDispatcher.Invoke(VisualStudioConnector.GetSolutionInfo);
-
-        if (info == null)
+        return ReadOnlyToolInvocation.Invoke("get_solution_info", () =>
         {
-            return "No solution is currently open in Visual Studio, or Visual Studio is not running.";
-        }
+            var info = VisualStudioConnector.GetSolutionInfo();
 
-        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
-        {
-            return McpOutputBounds.Limit(JsonConvert.SerializeObject(info, Formatting.Indented));
-        }
+            if (info == null)
+            {
+                return ReadOnlyToolInvocation.Error("no_solution", "No solution is currently open in the target Visual Studio instance. Open a solution or folder and retry.");
+            }
 
-        // Text format
-        var lines = new List<string>
-        {
-            "Current Solution:",
-            $"  Name: {info.SolutionName}",
-            $"  Path: {info.SolutionPath}",
-            "",
-            $"Projects ({info.Projects.Count}):"
-        };
+            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
+            {
+                return McpOutputBounds.Limit(JsonConvert.SerializeObject(info, Formatting.Indented));
+            }
 
-        foreach (var project in info.Projects)
-        {
-            lines.Add($"  - {project}");
-        }
+            // Text format
+            var lines = new List<string>
+            {
+                "Current Solution:",
+                $"  Name: {info.SolutionName}",
+                $"  Path: {info.SolutionPath}",
+                "",
+                $"Projects ({info.Projects.Count}):"
+            };
 
-        return McpOutputBounds.Limit(string.Join("\n", lines));
+            foreach (var project in info.Projects)
+            {
+                lines.Add($"  - {project}");
+            }
+
+            return McpOutputBounds.Limit(string.Join("\n", lines));
+        });
     }
 }
