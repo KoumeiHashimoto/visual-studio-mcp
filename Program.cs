@@ -318,7 +318,7 @@ public sealed class DebuggerHttpTools
     /// <summary>Gets a bounded call stack for the current selected thread.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread in the bound paused debugger.")]
-    public static string GetCallStack() => DebugControlTool.GetCallStack("json");
+    public static string GetCallStack() => DebuggerInspectionTool.GetDebuggerStack();
 
     /// <summary>Selects a current stack frame after snapshot validation.</summary>
     [McpServerTool]

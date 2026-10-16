@@ -16,6 +16,9 @@ public static class DebuggerInspectionTool
     [Description("Lists up to 64 debugger threads in the currently paused process. Returns structured JSON.")]
     public static string ListDebuggerThreads() => Invoke(VisualStudioConnector.ListDebuggerThreads);
 
+    /// <summary>Lists stack frames in the bound paused debugger.</summary>
+    public static string GetDebuggerStack() => Invoke(VisualStudioConnector.GetDebuggerStack);
+
     /// <summary>Selects a thread by its current operating system thread ID.</summary>
     [McpServerTool]
     [Description("Selects a thread from the latest list_debugger_threads response. The request is revalidated against the current paused process.")]
