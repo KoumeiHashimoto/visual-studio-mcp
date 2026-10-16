@@ -33,7 +33,13 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("expression size bound enforced", () => BreakpointRequestValidation.ValidateExpression(new string('a', 1025), true, true), "invalid_expression"),
     ("debugger control denied by default", () => BreakpointRequestValidation.ValidateDebuggerControl("pause", false), "debugger_control_policy_required"),
     ("unknown debugger control action rejected", () => BreakpointRequestValidation.ValidateDebuggerControl("terminate", true), "invalid_action"),
-    ("step action accepted with explicit policy", () => BreakpointRequestValidation.ValidateDebuggerControl("step_over", true), null)
+    ("step action accepted with explicit policy", () => BreakpointRequestValidation.ValidateDebuggerControl("step_over", true), null),
+    ("fast same-frame step completes after a break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("step_over", "dbgBreakMode", false, true, false).ToString(), null), "True"),
+    ("paused state alone does not prove step completion", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("step_over", "dbgBreakMode", false, false, false).ToString(), null), "False"),
+    ("running step is not complete", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("step_into", "dbgRunMode", true, false, false).ToString(), null), "False"),
+    ("continue can immediately hit another breakpoint", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", true, true, false).ToString(), null), "True"),
+    ("continue cannot reuse an unchanged paused state", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", false, false, false).ToString(), null), "False"),
+    ("pause observes a new break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("pause", "dbgBreakMode", false, true, false).ToString(), null), "True")
 };
 
 foreach (var test in cases)
@@ -45,3 +51,61 @@ foreach (var test in cases)
 }
 
 Console.WriteLine($"Passed {cases.Length} breakpoint validation checks.");
+
+if (OperatingSystem.IsWindows())
+{
+    var apartment = VisualStudioMcpServer.StaComDispatcher.Invoke(() => Thread.CurrentThread.GetApartmentState());
+    if (apartment != ApartmentState.STA) throw new InvalidOperationException("COM dispatcher must use STA.");
+
+    var expected = new InvalidOperationException("dispatcher exception probe");
+    try
+    {
+        VisualStudioMcpServer.StaComDispatcher.Invoke<int>(() => throw expected);
+        throw new Exception("The dispatcher did not preserve the original exception.");
+    }
+    catch (InvalidOperationException actual) when (ReferenceEquals(actual, expected)) { }
+
+    var expectedCom = new System.Runtime.InteropServices.COMException("COM exception probe", unchecked((int)0x80010001));
+    try
+    {
+        VisualStudioMcpServer.StaComDispatcher.Invoke<int>(() => throw expectedCom);
+        throw new Exception("The dispatcher did not preserve COM exception identity.");
+    }
+    catch (System.Runtime.InteropServices.COMException actual) when (ReferenceEquals(actual, expectedCom)) { }
+
+    using var entered = new ManualResetEventSlim();
+    using var release = new ManualResetEventSlim();
+    var blocker = Task.Run(() => VisualStudioMcpServer.StaComDispatcher.Invoke(() =>
+    {
+        entered.Set();
+        if (!release.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Test blocker was not released.");
+        return true;
+    }));
+    var expiredOperationRan = false;
+    var cleanupRan = false;
+    Task? cleanup = null;
+    try
+    {
+        if (!entered.Wait(TimeSpan.FromSeconds(2))) throw new TimeoutException("Test blocker did not start.");
+        try
+        {
+            VisualStudioMcpServer.StaComDispatcher.Invoke(() => expiredOperationRan = true, TimeSpan.FromMilliseconds(50));
+            throw new Exception("The queued operation did not time out.");
+        }
+        catch (TimeoutException) { }
+        cleanup = VisualStudioMcpServer.StaComDispatcher.Post(() => cleanupRan = true);
+        try
+        {
+            cleanup.WaitAsync(TimeSpan.FromMilliseconds(50)).GetAwaiter().GetResult();
+            throw new Exception("Cleanup should still be waiting behind the blocker.");
+        }
+        catch (TimeoutException) { }
+    }
+    finally { release.Set(); }
+    blocker.GetAwaiter().GetResult();
+    cleanup!.GetAwaiter().GetResult();
+    VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
+    if (expiredOperationRan) throw new InvalidOperationException("An expired queued operation executed after its caller timed out.");
+    if (!cleanupRan) throw new InvalidOperationException("Required cleanup was discarded when its caller stopped waiting.");
+    Console.WriteLine("Passed 5 Windows STA dispatcher checks.");
+}
