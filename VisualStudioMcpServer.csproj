@@ -18,7 +18,12 @@
     <PackageReference Include="Newtonsoft.Json" Version="13.*" />
     <PackageReference Include="envdte" Version="17.*" />
     <PackageReference Include="envdte80" Version="17.*" />
+    <PackageReference Include="envdte100" Version="17.*" />
     <PackageReference Include="stdole" Version="17.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
 
 

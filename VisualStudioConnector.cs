@@ -1,8 +1,10 @@
 ﻿using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
+using SystemProcess = System.Diagnostics.Process;
 using System.Text.RegularExpressions;
 using EnvDTE;
 using EnvDTE80;
+using VisualStudioMcpServer.Tools;
 
 namespace VisualStudioMcpServer;
 
@@ -15,6 +17,8 @@ public static class VisualStudioConnector
     private static DTE2? _cachedDte;
     private static int? _targetProcessId;
     private static int? _cachedProcessId;
+    private static long? _targetProcessStartTicks;
+    private static readonly SemaphoreSlim DebuggerControlGate = new(1, 1);
 
     /// <summary>
     /// Sets the target Visual Studio process ID.
@@ -23,6 +27,22 @@ public static class VisualStudioConnector
     public static void SetTargetProcessId(int? processId)
     {
         _targetProcessId = processId;
+        _targetProcessStartTicks = processId.HasValue
+            ? SystemProcess.GetProcessById(processId.Value).StartTime.ToUniversalTime().Ticks
+            : null;
+        _cachedDte = null;
+        _cachedProcessId = null;
+    }
+
+    /// <summary>
+    /// Sets the Visual Studio process identity used for debugger operations.
+    /// </summary>
+    /// <param name="processId">The Visual Studio process ID.</param>
+    /// <param name="processStartTicks">The process start time in UTC ticks.</param>
+    public static void SetTargetProcessIdentity(int processId, long processStartTicks)
+    {
+        _targetProcessId = processId;
+        _targetProcessStartTicks = processStartTicks;
         _cachedDte = null;
         _cachedProcessId = null;
     }
@@ -264,10 +284,8 @@ public static class VisualStudioConnector
         {
             try
             {
-                dynamic currentFrame = dte.Debugger.CurrentStackFrame;
+                var currentFrame = dte.Debugger.CurrentStackFrame;
                 state.CurrentFunction = currentFrame.FunctionName;
-                state.CurrentFile = Path.GetFileName((string)(currentFrame.File ?? ""));
-                state.CurrentLine = (int)(currentFrame.LineCharOffset ?? 0);
             }
             catch { }
         }
@@ -276,7 +294,7 @@ public static class VisualStudioConnector
         {
             "dbgDesignMode" => "Not debugging (Design mode)",
             "dbgRunMode" => "Running (no breakpoint)",
-            "dbgBreakMode" => $"At breakpoint: {state.CurrentFunction} ({state.CurrentFile}:{state.CurrentLine})",
+            "dbgBreakMode" => $"At breakpoint: {state.CurrentFunction} (source coordinates unavailable through EnvDTE)",
             _ => state.Mode
         };
 
@@ -357,15 +375,841 @@ public static class VisualStudioConnector
                 frames.Add(new StackFrameInfo
                 {
                     FunctionName = frame.FunctionName ?? "",
-                    FileName = Path.GetFileName((string)(frame.File ?? "")),
-                    LineNumber = (int)(frame.LineCharOffset ?? 0),
+                    // EnvDTE.StackFrame does not expose source coordinates.
+                    FileName = "",
+                    LineNumber = 0,
                     Language = frame.Language ?? ""
                 });
             }
-            catch { /* Some frames may not have file info */ }
+            catch { /* A frame can become unavailable while execution changes. */ }
         }
 
         return frames;
+    }
+
+    /// <summary>
+    /// Lists breakpoints from the explicitly bound Visual Studio instance.
+    /// </summary>
+    public static BreakpointToolResponse ListBreakpoints()
+    {
+        try
+        {
+            var (dte, mode) = GetBoundDebugger();
+            dynamic breakpoints = dte.Debugger.Breakpoints;
+            var count = (int)breakpoints.Count;
+            var items = new List<BreakpointInfo>();
+            var returnedCount = Math.Min(count, 25);
+            for (var index = 1; index <= returnedCount; index++)
+            {
+                dynamic breakpoint = breakpoints.Item(index);
+                items.Add(ReadBreakpoint(index, breakpoint));
+            }
+
+            return new BreakpointToolResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = count == 0 ? "No breakpoints are configured." : $"Listed {items.Count} breakpoint(s).",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                Breakpoints = items,
+                TotalCount = count,
+                Truncated = count > returnedCount
+            };
+        }
+        catch (BreakpointOperationException ex)
+        {
+            return CreateBreakpointError(ex.Code, ex.Message);
+        }
+        catch (COMException ex)
+        {
+            return CreateBreakpointError("com_error", $"Visual Studio rejected the breakpoint list request (HRESULT 0x{ex.HResult:X8}).");
+        }
+        catch (Exception ex)
+        {
+            return CreateBreakpointError("operation_failed", LimitDiagnostic(ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Adds a source or function breakpoint to the explicitly bound Visual Studio instance.
+    /// </summary>
+    public static BreakpointToolResponse SetBreakpoint(
+        string? file,
+        int line,
+        string? function,
+        string? condition,
+        bool allowMutation,
+        bool allowConditionEvaluation)
+    {
+        var validation = BreakpointRequestValidation.Validate(
+            file, line, function, condition, allowMutation, allowConditionEvaluation);
+        if (validation.Code is not null)
+            return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint request is invalid.");
+
+        if ((file?.Length ?? 0) > 2048 || (function?.Length ?? 0) > 2048 || (condition?.Length ?? 0) > 2048)
+            return CreateBreakpointError("invalid_location", "Breakpoint arguments exceed their size limits.");
+
+        try
+        {
+            var (dte, mode) = GetBoundDebugger();
+            dynamic breakpoints = dte.Debugger.Breakpoints;
+            var sourceFile = string.IsNullOrWhiteSpace(file) ? string.Empty : file;
+            var functionName = string.IsNullOrWhiteSpace(function) ? string.Empty : function;
+            dte.Debugger.Breakpoints.Add(
+                functionName,
+                sourceFile,
+                line,
+                1,
+                condition ?? string.Empty,
+                dbgBreakpointConditionType.dbgBreakpointConditionTypeWhenTrue,
+                string.Empty,
+                string.Empty,
+                0,
+                string.Empty,
+                0,
+                dbgHitCountType.dbgHitCountTypeNone);
+            var index = (int)breakpoints.Count;
+            dynamic added = breakpoints.Item(index);
+            return new BreakpointToolResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = "Breakpoint added. List breakpoints to obtain its current snapshot ID.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                Breakpoints = new List<BreakpointInfo> { ReadBreakpoint(index, added) },
+                TotalCount = (int)breakpoints.Count
+            };
+        }
+        catch (BreakpointOperationException ex)
+        {
+            return CreateBreakpointError(ex.Code, ex.Message);
+        }
+        catch (COMException ex)
+        {
+            return CreateBreakpointError("invalid_location", $"Visual Studio could not resolve the breakpoint location (HRESULT 0x{ex.HResult:X8}). Check the file, line, function, and condition for the selected project.");
+        }
+        catch (Exception ex)
+        {
+            return CreateBreakpointError("operation_failed", LimitDiagnostic(ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Removes the listed breakpoint after rechecking its location against the current snapshot.
+    /// </summary>
+    public static BreakpointToolResponse RemoveBreakpoint(
+        int id,
+        string? expectedFile,
+        int expectedLine,
+        string? expectedFunction,
+        string? expectedCondition,
+        bool allowMutation)
+    {
+        var validation = BreakpointRequestValidation.ValidateRemoval(
+            id, expectedFile, expectedLine, expectedFunction, expectedCondition, allowMutation);
+        if (validation.Code is not null)
+            return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint removal request is invalid.");
+
+        try
+        {
+            var (dte, mode) = GetBoundDebugger();
+            dynamic breakpoints = dte.Debugger.Breakpoints;
+            var count = (int)breakpoints.Count;
+            if (id > count)
+                return CreateBreakpointError("stale_breakpoint_id", "The breakpoint id is no longer present. List breakpoints again.");
+
+            dynamic breakpoint = breakpoints.Item(id);
+            var current = ReadBreakpoint(id, breakpoint);
+            if (!BreakpointMatches(current, expectedFile, expectedLine, expectedFunction, expectedCondition))
+                return CreateBreakpointError("stale_breakpoint_id", "The breakpoint at this id changed since it was listed. List breakpoints again before removing it.");
+
+            breakpoint.Delete();
+            return new BreakpointToolResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = "Breakpoint removed.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                Breakpoints = new List<BreakpointInfo> { current },
+                TotalCount = count - 1
+            };
+        }
+        catch (BreakpointOperationException ex)
+        {
+            return CreateBreakpointError(ex.Code, ex.Message);
+        }
+        catch (COMException ex)
+        {
+            return CreateBreakpointError("com_error", $"Visual Studio rejected the breakpoint removal request (HRESULT 0x{ex.HResult:X8}).");
+        }
+        catch (Exception ex)
+        {
+            return CreateBreakpointError("operation_failed", LimitDiagnostic(ex.Message));
+        }
+    }
+
+    private static (DTE2 Dte, string Mode) GetBoundDebugger()
+    {
+        if (!_targetProcessId.HasValue || !_targetProcessStartTicks.HasValue)
+            throw new BreakpointOperationException("target_identity_required", "Debugger operations require an explicit Visual Studio PID and process start time. Launch stdio with --parent-pid and --parent-start-ticks, or use VSIX-managed HTTP mode.");
+
+        try
+        {
+            using var target = SystemProcess.GetProcessById(_targetProcessId.Value);
+            if (target.HasExited || target.StartTime.ToUniversalTime().Ticks != _targetProcessStartTicks.Value)
+                throw new BreakpointOperationException("stale_target", "The bound Visual Studio process has exited or its PID was reused.");
+        }
+        catch (ArgumentException)
+        {
+            throw new BreakpointOperationException("stale_target", "The bound Visual Studio process has exited.");
+        }
+        catch (InvalidOperationException)
+        {
+            throw new BreakpointOperationException("stale_target", "The bound Visual Studio process has exited.");
+        }
+
+        var dte = GetActiveVS();
+        if (dte is null || _cachedProcessId != _targetProcessId)
+            throw new BreakpointOperationException("target_not_registered", "The bound Visual Studio instance is not available in the Running Object Table.");
+
+        try
+        {
+            var mode = dte.Debugger.CurrentMode.ToString();
+            if (string.IsNullOrWhiteSpace(mode))
+                throw new BreakpointOperationException("debugger_state_unavailable", "Visual Studio returned no debugger state.");
+            return (dte, mode);
+        }
+        catch (COMException ex) when (ex.HResult == unchecked((int)0x80010108))
+        {
+            throw new BreakpointOperationException("dte_disconnected", "The bound Visual Studio DTE connection was lost. The request was not sent to another instance.");
+        }
+        catch (COMException)
+        {
+            throw new BreakpointOperationException("debugger_state_unavailable", "Could not read debugger state from the bound Visual Studio instance.");
+        }
+    }
+
+    private static BreakpointInfo ReadBreakpoint(int id, dynamic breakpoint)
+    {
+        return new BreakpointInfo
+        {
+            Id = id,
+            File = ReadBoundedString(() => (string?)breakpoint.File),
+            Line = ReadInteger(() => (int)breakpoint.FileLine),
+            Function = ReadBoundedString(() => (string?)breakpoint.FunctionName),
+            Condition = ReadBoundedString(() => (string?)breakpoint.Condition),
+            Enabled = ReadBoolean(() => (bool)breakpoint.Enabled),
+            HitCount = ReadNullableInteger(() => (int)breakpoint.CurrentHits)
+        };
+    }
+
+    private static bool BreakpointMatches(
+        BreakpointInfo current,
+        string? expectedFile,
+        int expectedLine,
+        string? expectedFunction,
+        string? expectedCondition)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedFile) &&
+            (!string.Equals(current.File, expectedFile, StringComparison.OrdinalIgnoreCase) || current.Line != expectedLine))
+            return false;
+        if (!string.IsNullOrWhiteSpace(expectedFunction) &&
+            !string.Equals(current.Function, expectedFunction, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return string.Equals(current.Condition, expectedCondition, StringComparison.Ordinal);
+    }
+
+    private static string ReadBoundedString(Func<string?> read)
+    {
+        try
+        {
+            var value = read() ?? string.Empty;
+            return value.Length <= 512 ? value : value[..512];
+        }
+        catch { return string.Empty; }
+    }
+
+    private static int ReadInteger(Func<int> read)
+    {
+        try { return read(); } catch { return 0; }
+    }
+
+    private static int? ReadNullableInteger(Func<int> read)
+    {
+        try { return read(); } catch { return null; }
+    }
+
+    private static bool ReadBoolean(Func<bool> read)
+    {
+        try { return read(); } catch { return false; }
+    }
+
+    private static BreakpointToolResponse CreateBreakpointError(string code, string message) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId
+    };
+
+    private static string LimitDiagnostic(string message) =>
+        message.Length <= 1024 ? message : message[..1024];
+
+    /// <summary>
+    /// Lists threads in the explicitly bound Visual Studio instance while execution is paused.
+    /// </summary>
+    public static DebuggerInspectionResponse ListDebuggerThreads()
+    {
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic threads = dte.Debugger.CurrentProgram.Threads;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var count = (int)threads.Count;
+            var items = new List<DebuggerThreadInfo>();
+            var returned = Math.Min(count, 64);
+            for (var index = 1; index <= returned; index++)
+            {
+                dynamic thread = threads.Item(index);
+                var id = (int)thread.ID;
+                items.Add(new DebuggerThreadInfo
+                {
+                    Id = id,
+                    Name = ReadBoundedString(() => (string?)thread.Name),
+                    FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
+                    IsCurrent = id == ReadInteger(() => (int)currentThread.ID)
+                });
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Listed {items.Count} thread(s).",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                Threads = items,
+                TotalCount = count,
+                Truncated = count > returned
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the thread inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Lists stack frames in the current thread while execution is paused.
+    /// </summary>
+    public static DebuggerInspectionResponse GetDebuggerStack()
+    {
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            var items = new List<DebuggerFrameInfo>();
+            var returned = Math.Min(count, 128);
+            dynamic currentFrame = dte.Debugger.CurrentStackFrame;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentFunction = ReadBoundedString(() => (string?)currentFrame.FunctionName);
+            var currentModule = ReadBoundedString(() => (string?)currentFrame.Module);
+            var markedCurrent = false;
+            for (var index = 1; index <= returned; index++)
+            {
+                dynamic frame = frames.Item(index);
+                var frameInfo = ReadDebuggerFrame(index, frame, false);
+                frameInfo.IsCurrent = !markedCurrent &&
+                    string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
+                    string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
+                markedCurrent |= frameInfo.IsCurrent;
+                items.Add(frameInfo);
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Listed {items.Count} frame(s) for the current thread.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                CurrentThreadId = ReadInteger(() => (int)currentThread.ID),
+                Frames = items,
+                TotalCount = count,
+                Truncated = count > returned
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the stack inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Selects a debugger thread after resolving its current process thread ID.
+    /// </summary>
+    public static DebuggerInspectionResponse SelectDebuggerThread(int threadId)
+    {
+        if (threadId <= 0) return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current thread list.");
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic threads = dte.Debugger.CurrentProgram.Threads;
+            var count = (int)threads.Count;
+            for (var index = 1; index <= Math.Min(count, 512); index++)
+            {
+                dynamic thread = threads.Item(index);
+                if ((int)thread.ID != threadId) continue;
+                dte.Debugger.CurrentThread = (EnvDTE.Thread)thread;
+                return new DebuggerInspectionResponse
+                {
+                    Success = true,
+                    Code = "ok",
+                    Message = $"Selected thread {threadId}.",
+                    TargetProcessId = _targetProcessId,
+                    DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                    Threads = new List<DebuggerThreadInfo> { ReadDebuggerThread(threadId, thread, true) }
+                };
+            }
+
+            return CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the thread selection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Selects a stack frame after checking its function name against the current snapshot.
+    /// </summary>
+    public static DebuggerInspectionResponse SelectDebuggerFrame(
+        int index,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount)
+    {
+        if (index < 1 || index > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+            expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
+            return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            if (index > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(index);
+            var current = ReadDebuggerFrame(index, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(index, expectedFrameCount, count,
+                expectedFunction, current.Function, expectedModule, current.Module))
+                return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before selecting a frame.");
+
+            dte.Debugger.CurrentStackFrame = (StackFrame)frame;
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Selected frame {index} ({current.Function}).",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                Frames = new List<DebuggerFrameInfo> { new()
+                    {
+                        Index = current.Index,
+                        Function = current.Function,
+                        Module = current.Module,
+                        File = current.File,
+                        Line = current.Line,
+                        Language = current.Language,
+                        IsCurrent = true
+                    } }
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the frame selection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    /// <summary>
+    /// Reads locals from a snapshot-validated frame with bounded member expansion.
+    /// </summary>
+    public static DebuggerInspectionResponse GetDebuggerLocals(
+        int frameIndex,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount,
+        int expectedThreadId,
+        int maxDepth,
+        int maxItems,
+        bool allowMemberExpansion)
+    {
+        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+            expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1 || expectedThreadId <= 0)
+            return CreateInspectionError("invalid_frame", "Pass the frame index, function, module, total frame count, and thread ID from the latest debugger snapshot.");
+        maxDepth = BreakpointRequestValidation.ClampMemberDepth(maxDepth);
+        maxItems = BreakpointRequestValidation.ClampMemberCount(maxItems);
+        try
+        {
+            var (dte, mode) = GetPausedDebugger();
+            var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
+            if (currentThreadId != expectedThreadId)
+                return CreateInspectionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var count = (int)frames.Count;
+            if (frameIndex > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(frameIndex);
+            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, count,
+                expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
+                return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before reading locals.");
+
+            dynamic locals = frame.Locals;
+            var localCount = (int)locals.Count;
+            var returned = Math.Min(localCount, maxItems);
+            var budget = maxItems;
+            var items = new List<DebuggerVariableInfo>();
+            for (var index = 1; index <= returned && budget > 0; index++)
+            {
+                dynamic local = locals.Item(index);
+                items.Add(ReadDebuggerVariable(local, maxDepth, allowMemberExpansion, ref budget));
+            }
+
+            return new DebuggerInspectionResponse
+            {
+                Success = true,
+                Code = "ok",
+                Message = $"Read {items.Count} local(s) from frame {frameIndex}.",
+                TargetProcessId = _targetProcessId,
+                DebuggerMode = mode,
+                CurrentThreadId = currentThreadId,
+                Locals = items,
+                TotalCount = localCount,
+                Truncated = localCount > returned || budget == 0 || items.Any(item => item.Truncated)
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
+        catch (COMException ex) { return CreateInspectionError("com_error", $"Visual Studio rejected the local inspection request (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateInspectionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    private static (DTE2 Dte, string Mode) GetPausedDebugger()
+    {
+        var (dte, mode) = GetBoundDebugger();
+        if (!mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase))
+            throw new BreakpointOperationException("not_paused", "The Visual Studio debugger must be paused at a break event for thread, frame, or local inspection.");
+        return (dte, mode);
+    }
+
+    /// <summary>
+    /// Performs an explicitly authorized debugger control action and waits asynchronously for an observed state transition.
+    /// </summary>
+    public static async Task<DebuggerControlResponse> ControlDebuggerAsync(
+        string action,
+        bool allowDebuggerControl,
+        int timeoutMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        var validation = BreakpointRequestValidation.ValidateDebuggerControl(action, allowDebuggerControl);
+        if (validation.Code is not null)
+            return CreateDebuggerControlError(action, validation.Code, validation.Message ?? "The debugger control request is invalid.");
+
+        timeoutMilliseconds = Math.Clamp(timeoutMilliseconds, 1000, 10000);
+        var startedAt = System.Diagnostics.Stopwatch.StartNew();
+        DebuggerControlEvents? controlEvents = null;
+        var gateEntered = false;
+        var dispatchState = 0;
+        using var requestLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var requestToken = requestLifetime.Token;
+        try
+        {
+            gateEntered = await DebuggerControlGate.WaitAsync(0, cancellationToken).ConfigureAwait(false);
+            if (!gateEntered)
+                return CreateDebuggerControlError(action, "debugger_control_busy", "Another debugger control request is in progress. Wait for it to finish before retrying.");
+
+            StaComDispatcher.Invoke(() =>
+            {
+                var (dte, mode) = GetBoundDebugger();
+                var isPaused = mode.Equals("dbgBreakMode", StringComparison.OrdinalIgnoreCase);
+                var isRunning = mode.Equals("dbgRunMode", StringComparison.OrdinalIgnoreCase);
+                if (action == "pause" && !isRunning)
+                    throw new BreakpointOperationException("invalid_debugger_state", "Pause requires the bound debugger to be running.");
+                if (action != "pause" && !isPaused)
+                    throw new BreakpointOperationException("invalid_debugger_state", "Continue and step actions require the bound debugger to be paused.");
+
+                var debugger = dte.Debugger;
+                controlEvents = new DebuggerControlEvents(dte);
+                requestToken.ThrowIfCancellationRequested();
+                if (startedAt.ElapsedMilliseconds >= timeoutMilliseconds ||
+                    Interlocked.CompareExchange(ref dispatchState, 1, 0) != 0)
+                    throw new TimeoutException("The debugger control request expired before execution was sent.");
+                switch (action)
+                {
+                    case "pause": debugger.Break(false); break;
+                    case "continue": debugger.Go(false); break;
+                    case "step_into": debugger.StepInto(false); break;
+                    case "step_over": debugger.StepOver(false); break;
+                    case "step_out": debugger.StepOut(false); break;
+                }
+                return true;
+            }, TimeSpan.FromMilliseconds(timeoutMilliseconds));
+
+            while (startedAt.ElapsedMilliseconds < timeoutMilliseconds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+                var mode = StaComDispatcher.Invoke(() => GetBoundDebugger().Mode, TimeSpan.FromSeconds(3));
+                var complete = DebuggerControlCompletion.HasCompleted(action, mode,
+                    controlEvents!.SawRun, controlEvents.SawBreak, controlEvents.SawDesign);
+                if (!complete && mode == "dbgDesignMode")
+                    return CreateDebuggerControlError(action, "debugger_ended", "The debug session ended before the requested step completed.", mode,
+                        (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+                if (!complete) continue;
+
+                return new DebuggerControlResponse
+                {
+                    Success = true,
+                    Code = "ok",
+                    Message = $"Debugger action '{action}' completed; observed mode {mode}.",
+                    TargetProcessId = _targetProcessId,
+                    Action = action,
+                    DebuggerMode = mode,
+                    ElapsedMilliseconds = (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue)
+                };
+            }
+
+            var finalMode = StaComDispatcher.Invoke(() => GetBoundDebugger().Mode, TimeSpan.FromSeconds(3));
+            return CreateDebuggerControlError(action, "transition_timeout",
+                $"The debugger did not reach the expected state within {timeoutMilliseconds} ms; last observed mode was {finalMode}.",
+                finalMode, (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (OperationCanceledException)
+        {
+            return CreateDebuggerControlError(action, "cancelled", "The debugger control wait was cancelled. A command already sent to Visual Studio may still finish.",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (BreakpointOperationException ex)
+        {
+            return CreateDebuggerControlError(action, ex.Code, ex.Message,
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (COMException ex)
+        {
+            return CreateDebuggerControlError(action, "com_error", $"Visual Studio rejected the debugger control request (HRESULT 0x{ex.HResult:X8}).",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (TimeoutException)
+        {
+            return CreateDebuggerControlError(action, "com_timeout", "The Visual Studio COM wait expired. A command already sent may still finish; new control requests remain blocked until STA cleanup completes.",
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        catch (Exception ex)
+        {
+            return CreateDebuggerControlError(action, "operation_failed", LimitDiagnostic(ex.Message),
+                elapsedMilliseconds: (int)Math.Min(startedAt.ElapsedMilliseconds, int.MaxValue));
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref dispatchState, 2, 0);
+            requestLifetime.Cancel();
+            if (gateEntered)
+            {
+                Task? cleanup = null;
+                try
+                {
+                    cleanup = StaComDispatcher.Post(() => controlEvents?.Dispose());
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Debugger event cleanup scheduling failed ({ex.GetType().Name}).");
+                    DebuggerControlGate.Release();
+                }
+                if (cleanup is not null)
+                {
+                    var release = ReleaseDebuggerControlAfterCleanupAsync(cleanup);
+                    try { await release.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
+                    catch (TimeoutException)
+                    {
+                        Console.Error.WriteLine("Debugger event cleanup is pending; control remains locked until it completes.");
+                    }
+                }
+            }
+        }
+    }
+
+    private static async Task ReleaseDebuggerControlAfterCleanupAsync(Task cleanup)
+    {
+        try { await cleanup.ConfigureAwait(false); }
+        catch (Exception ex) { Console.Error.WriteLine($"Debugger event cleanup failed ({ex.GetType().Name})."); }
+        finally { DebuggerControlGate.Release(); }
+    }
+
+    private static DebuggerControlResponse CreateDebuggerControlError(
+        string action,
+        string code,
+        string message,
+        string? debuggerMode = null,
+        int elapsedMilliseconds = 0) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId,
+        Action = action,
+        DebuggerMode = debuggerMode,
+        ElapsedMilliseconds = elapsedMilliseconds
+    };
+
+    private static DebuggerThreadInfo ReadDebuggerThread(int id, dynamic thread, bool isCurrent) => new()
+    {
+        Id = id,
+        Name = ReadBoundedString(() => (string?)thread.Name),
+        FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
+        IsCurrent = isCurrent
+    };
+
+    /// <summary>Reads supported frame metadata; EnvDTE.StackFrame has no source-coordinate properties.</summary>
+    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent) => new()
+    {
+        Index = index,
+        Function = ReadBoundedString(() => (string?)frame.FunctionName),
+        Module = ReadBoundedString(() => (string?)frame.Module),
+        File = string.Empty,
+        Line = 0,
+        Language = ReadBoundedString(() => (string?)frame.Language),
+        IsCurrent = isCurrent
+    };
+
+    private static DebuggerVariableInfo ReadDebuggerVariable(dynamic expression, int depth, bool allowMemberExpansion, ref int remaining)
+    {
+        remaining--;
+        var result = new DebuggerVariableInfo
+        {
+            Name = ReadVariableString(() => (string?)expression.Name),
+            Type = ReadVariableString(() => (string?)expression.Type),
+            Value = ReadVariableString(() => (string?)expression.Value)
+        };
+        if (!allowMemberExpansion || depth <= 0 || remaining <= 0) return result;
+
+        try
+        {
+            dynamic members = expression.DataMembers;
+            var count = (int)members.Count;
+            var returned = Math.Min(count, remaining);
+            for (var index = 1; index <= returned && remaining > 0; index++)
+            {
+                dynamic member = members.Item(index);
+                result.Children.Add(ReadDebuggerVariable(member, depth - 1, allowMemberExpansion, ref remaining));
+            }
+            result.Truncated = count > returned || remaining == 0;
+        }
+        catch (COMException)
+        {
+            result.Truncated = true;
+        }
+
+        return result;
+    }
+
+    private static DebuggerInspectionResponse CreateInspectionError(string code, string message) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId
+    };
+
+    /// <summary>
+    /// Evaluates an expression on a validated paused stack frame with explicit safety policies.
+    /// </summary>
+    public static DebuggerExpressionResponse EvaluateDebuggerExpression(
+        string? expressionText,
+        int frameIndex,
+        string? expectedFunction,
+        string? expectedModule,
+        int expectedFrameCount,
+        int expectedThreadId,
+        bool allowEvaluation,
+        bool allowSideEffects)
+    {
+        var expressionValidation = BreakpointRequestValidation.ValidateExpression(
+            expressionText, allowEvaluation, allowSideEffects);
+        if (expressionValidation.Code is not null)
+            return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
+        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) ||
+            expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
+            expectedFrameCount < 1 || expectedThreadId <= 0)
+            return CreateExpressionError("invalid_frame", "Pass the frame identity from the latest get_call_stack response.");
+
+        try
+        {
+            var (dte, _) = GetPausedDebugger();
+            var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
+            if (currentThreadId != expectedThreadId)
+                return CreateExpressionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            var frameCount = (int)frames.Count;
+            if (frameIndex > frameCount)
+                return CreateExpressionError("stale_frame", "The frame index is no longer present. Get the stack again.");
+            dynamic frame = frames.Item(frameIndex);
+            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, frameCount,
+                expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
+                return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
+
+            var debugger = (EnvDTE100.Debugger5)dte.Debugger;
+            var result = debugger.GetExpression3(
+                expressionText!,
+                (StackFrame)frame,
+                false,
+                false,
+                allowSideEffects,
+                5000);
+            var isValid = (bool)result.IsValidValue;
+            return new DebuggerExpressionResponse
+            {
+                Success = isValid,
+                Code = isValid ? "ok" : "invalid_expression",
+                Message = isValid ? "Expression evaluated." : "The debugger could not produce a value for this expression.",
+                TargetProcessId = _targetProcessId,
+                Expression = LimitDiagnostic(expressionText!),
+                Type = ReadVariableString(() => (string?)result.Type),
+                Value = ReadExpressionValue(() => (string?)result.Value),
+                SideEffectsAllowed = allowSideEffects
+            };
+        }
+        catch (BreakpointOperationException ex) { return CreateExpressionError(ex.Code, ex.Message); }
+        catch (InvalidCastException) { return CreateExpressionError("evaluation_not_supported", "The bound Visual Studio debugger does not provide the Debugger5 expression-evaluation interface."); }
+        catch (COMException ex) { return CreateExpressionError("evaluation_failed", $"Visual Studio rejected expression evaluation (HRESULT 0x{ex.HResult:X8})."); }
+        catch (Exception ex) { return CreateExpressionError("operation_failed", LimitDiagnostic(ex.Message)); }
+    }
+
+    private static string ReadExpressionValue(Func<string?> read)
+    {
+        try
+        {
+            var value = read() ?? string.Empty;
+            return value.Length <= 4096 ? value : value[..4096];
+        }
+        catch { return string.Empty; }
+    }
+
+    private static DebuggerExpressionResponse CreateExpressionError(string code, string message) => new()
+    {
+        Success = false,
+        Code = code,
+        Message = LimitDiagnostic(message),
+        TargetProcessId = _targetProcessId
+    };
+
+    private static string ReadVariableString(Func<string?> read)
+    {
+        var value = ReadBoundedString(read);
+        return value.Length <= 256 ? value : value[..256];
+    }
+
+    private sealed class BreakpointOperationException(string code, string message) : Exception(message)
+    {
+        public string Code { get; } = code;
     }
 }
 
