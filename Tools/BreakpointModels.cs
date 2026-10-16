@@ -231,6 +231,9 @@ public sealed class DebuggerControlResponse
 /// </summary>
 public static class BreakpointRequestValidation
 {
+    /// <summary>Validates a one-based debugger frame index within the exposed stack bound.</summary>
+    public static bool IsValidFrameIndex(int index) => index is >= 1 and <= 128;
+
     /// <summary>Validates explicit authorization and supported debugger control actions.</summary>
     public static (string? Code, string? Message) ValidateDebuggerControl(string? action, bool allowDebuggerControl)
     {

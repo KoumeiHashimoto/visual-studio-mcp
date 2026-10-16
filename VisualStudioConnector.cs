@@ -791,7 +791,7 @@ public static class VisualStudioConnector
         string? expectedModule,
         int expectedFrameCount)
     {
-        if (index < 1 || index > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(index) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
             return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
         try
@@ -844,7 +844,7 @@ public static class VisualStudioConnector
         int maxItems,
         bool allowMemberExpansion)
     {
-        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1 || expectedThreadId <= 0)
             return CreateInspectionError("invalid_frame", "Pass the frame index, function, module, total frame count, and thread ID from the latest debugger snapshot.");
         maxDepth = BreakpointRequestValidation.ClampMemberDepth(maxDepth);
@@ -1136,7 +1136,7 @@ public static class VisualStudioConnector
             expressionText, allowEvaluation, allowSideEffects);
         if (expressionValidation.Code is not null)
             return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
-        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) ||
             expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
             expectedFrameCount < 1 || expectedThreadId <= 0)
             return CreateExpressionError("invalid_frame", "Pass the frame identity from the latest get_call_stack response.");
