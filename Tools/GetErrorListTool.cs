@@ -1,4 +1,4 @@
-using ModelContextProtocol.Server;
+﻿using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 using System.ComponentModel;
 
@@ -16,7 +16,7 @@ public static class GetErrorListTool
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
         string format = "text")
     {
-        var errors = VisualStudioConnector.GetErrorListItems();
+        var errors = StaComDispatcher.Invoke(VisualStudioConnector.GetErrorListItems);
 
         if (errors.Count == 0)
         {
@@ -25,7 +25,7 @@ public static class GetErrorListTool
 
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
         {
-            return JsonConvert.SerializeObject(errors, Formatting.Indented);
+            return McpOutputBounds.Limit(JsonConvert.SerializeObject(errors, Formatting.Indented));
         }
 
         // Text format
@@ -42,6 +42,6 @@ public static class GetErrorListTool
             lines.Add("");
         }
 
-        return string.Join("\n", lines);
+        return McpOutputBounds.Limit(string.Join("\n", lines));
     }
 }

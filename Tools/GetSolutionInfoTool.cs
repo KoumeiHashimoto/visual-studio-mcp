@@ -1,4 +1,4 @@
-using ModelContextProtocol.Server;
+﻿using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 using System.ComponentModel;
 
@@ -17,7 +17,7 @@ public static class GetSolutionInfoTool
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
         string format = "text")
     {
-        var info = VisualStudioConnector.GetSolutionInfo();
+        var info = StaComDispatcher.Invoke(VisualStudioConnector.GetSolutionInfo);
 
         if (info == null)
         {
@@ -26,7 +26,7 @@ public static class GetSolutionInfoTool
 
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
         {
-            return JsonConvert.SerializeObject(info, Formatting.Indented);
+            return McpOutputBounds.Limit(JsonConvert.SerializeObject(info, Formatting.Indented));
         }
 
         // Text format
@@ -44,6 +44,6 @@ public static class GetSolutionInfoTool
             lines.Add($"  - {project}");
         }
 
-        return string.Join("\n", lines);
+        return McpOutputBounds.Limit(string.Join("\n", lines));
     }
 }
