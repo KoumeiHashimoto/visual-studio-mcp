@@ -96,7 +96,8 @@ internal static class Program
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddMcpServer()
             .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
-            .WithTools<ReadOnlyHttpTools>();
+            .WithTools<ReadOnlyHttpTools>()
+            .WithTools<DebuggerHttpTools>();
 
         await using var app = builder.Build();
         app.Use(async (context, next) =>
@@ -246,7 +247,7 @@ internal static class Program
 }
 
 /// <summary>
-/// Allowlist of read-only tools exposed through the HTTP transport.
+/// Explicit allowlist of read-only solution tools exposed through the HTTP transport.
 /// </summary>
 [McpServerToolType]
 public sealed class ReadOnlyHttpTools
@@ -277,4 +278,74 @@ public sealed class ReadOnlyHttpTools
         [System.ComponentModel.Description("The name or partial name of the pane.")] string paneName,
         [System.ComponentModel.Description("Maximum number of lines, capped at 2000.")] int maxLines = 50) =>
         ReadOutputPaneTool.ReadOutputPane(paneName, maxLines);
+}
+
+/// <summary>
+/// Explicit allowlist of debugger tools exposed through authenticated VSIX-managed HTTP.
+/// </summary>
+[McpServerToolType]
+public sealed class DebuggerHttpTools
+{
+    /// <summary>Lists breakpoints in the process bound to this server.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Lists up to 25 breakpoints in the Visual Studio instance bound to this authenticated server.")]
+    public static string ListBreakpoints() => BreakpointManagementTool.ListBreakpoints();
+
+    /// <summary>Adds a breakpoint with explicit mutation authorization.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Adds a source or function breakpoint. Set allowMutation=true; conditions also require allowConditionEvaluation=true.")]
+    public static string SetBreakpoint(string? file = null, int line = 0, string? function = null,
+        string? condition = null, bool allowMutation = false, bool allowConditionEvaluation = false) =>
+        BreakpointManagementTool.SetBreakpoint(file, line, function, condition, allowMutation, allowConditionEvaluation);
+
+    /// <summary>Removes a snapshot-validated breakpoint with explicit mutation authorization.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Removes a breakpoint from the latest list_breakpoints snapshot. Requires expected location/condition fields and allowMutation=true.")]
+    public static string RemoveBreakpoint(int id, string? expectedFile = null, int expectedLine = 0,
+        string? expectedFunction = null, string? expectedCondition = null, bool allowMutation = false) =>
+        BreakpointManagementTool.RemoveBreakpoint(id, expectedFile, expectedLine, expectedFunction, expectedCondition, allowMutation);
+
+    /// <summary>Lists threads in the bound paused debugger.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Lists up to 64 threads in the currently paused, bound Visual Studio debugger.")]
+    public static string ListDebuggerThreads() => DebuggerInspectionTool.ListDebuggerThreads();
+
+    /// <summary>Selects a current thread by its operating system ID.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Selects a thread ID from the latest list_debugger_threads response and revalidates it against the bound paused debugger.")]
+    public static string SelectDebuggerThread(int threadId) => DebuggerInspectionTool.SelectDebuggerThread(threadId);
+
+    /// <summary>Gets a bounded call stack for the current selected thread.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread in the bound paused debugger.")]
+    public static string GetCallStack() => DebugControlTool.GetCallStack("json");
+
+    /// <summary>Selects a current stack frame after snapshot validation.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Selects a frame from the latest get_call_stack response after validating function, module, and total frame count.")]
+    public static string SelectDebuggerFrame(int index, string expectedFunction, string expectedModule, int totalFrameCount) =>
+        DebuggerInspectionTool.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount);
+
+    /// <summary>Reads bounded local values from a validated frame.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Reads up to 40 local/member values at depth 3. Member expansion requires allowMemberExpansion=true.")]
+    public static string GetDebuggerLocals(int frameIndex, string expectedFunction, string expectedModule,
+        int totalFrameCount, int threadId, int maxDepth = 1, int maxItems = 40, bool allowMemberExpansion = false) =>
+        DebuggerInspectionTool.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
+            totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion);
+
+    /// <summary>Evaluates an expression with explicit evaluation and side-effect policy.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Evaluates an expression from a current paused frame. Requires allowEvaluation=true; automatic property/function evaluation additionally requires allowSideEffects=true.")]
+    public static string EvaluateExpression(string expression, int frameIndex, string expectedFunction,
+        string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false) =>
+        DebuggerExpressionTool.EvaluateExpression(expression, frameIndex, expectedFunction, expectedModule,
+            totalFrameCount, threadId, allowEvaluation, allowSideEffects);
+
+    /// <summary>Controls the bound paused or running debugger with explicit authorization.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Pauses, continues, or steps the explicitly bound debugger. Requires allowDebuggerControl=true and waits for a bounded observed state transition.")]
+    public static Task<string> ControlDebugger(string action, bool allowDebuggerControl = false,
+        int timeoutMilliseconds = 5000, CancellationToken cancellationToken = default) =>
+        DebuggerControlTool.ControlDebugger(action, allowDebuggerControl, timeoutMilliseconds, cancellationToken);
 }
