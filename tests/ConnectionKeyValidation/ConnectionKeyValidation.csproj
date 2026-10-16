@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../../ConnectionKeys/ConnectionKeyClock.cs" Link="ConnectionKeys/ConnectionKeyClock.cs" />
+    <Compile Include="../../ConnectionKeys/ConnectionKeyPayload.cs" Link="ConnectionKeys/ConnectionKeyPayload.cs" />
+    <Compile Include="../../ConnectionKeys/ConnectionKeyStore.cs" Link="ConnectionKeys/ConnectionKeyStore.cs" />
+    <Compile Include="../../ConnectionKeys/ConnectionKeyHttpAuthorization.cs" Link="ConnectionKeys/ConnectionKeyHttpAuthorization.cs" />
+  </ItemGroup>
+</Project>
+
+
+

@@ -56,8 +56,9 @@ internal static class StaComDispatcher
     /// <param name="operation">The operation to run on the STA thread.</param>
     /// <param name="timeout">The maximum wait time.</param>
     /// <returns>The operation result.</returns>
-    public static T Invoke<T>(Func<T> operation, TimeSpan? timeout = null)
+    public static T Invoke<T>(Func<T> operation, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Start();
         if (Environment.CurrentManagedThreadId == _threadId) return operation();
 
@@ -71,7 +72,7 @@ internal static class StaComDispatcher
         });
         try
         {
-            return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15)).GetAwaiter().GetResult();
+            return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15), cancellationToken).GetAwaiter().GetResult();
         }
         finally
         {

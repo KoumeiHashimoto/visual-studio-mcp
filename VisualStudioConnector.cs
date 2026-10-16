@@ -20,6 +20,13 @@ public static class VisualStudioConnector
     private static long? _targetProcessStartTicks;
     private static readonly SemaphoreSlim DebuggerControlGate = new(1, 1);
 
+    internal static bool TryGetTargetProcessIdentity(out int processId, out long startTicks)
+    {
+        processId = _targetProcessId.GetValueOrDefault();
+        startTicks = _targetProcessStartTicks.GetValueOrDefault();
+        return _targetProcessId.HasValue && _targetProcessStartTicks.HasValue;
+    }
+
     /// <summary>
     /// Sets the target Visual Studio process ID.
     /// </summary>
@@ -230,37 +237,6 @@ public static class VisualStudioConnector
     }
 
     // ==================== BUILD & DEBUG CONTROL ====================
-
-    /// <summary>
-    /// Builds the solution.
-    /// </summary>
-    /// <param name="waitForBuild">If true, waits for build to complete</param>
-    /// <returns>Build result info</returns>
-    public static BuildResult BuildSolution(bool waitForBuild = true)
-    {
-        var dte = GetActiveVS();
-        if (dte?.Solution == null)
-            return new BuildResult { Success = false, Message = "No solution is open" };
-
-        var solutionBuild = dte.Solution.SolutionBuild;
-
-        // Start the build
-        solutionBuild.Build(waitForBuild);
-
-        if (waitForBuild)
-        {
-            return new BuildResult
-            {
-                Success = solutionBuild.LastBuildInfo == 0,
-                ErrorCount = solutionBuild.LastBuildInfo,
-                Message = solutionBuild.LastBuildInfo == 0 
-                    ? "Build succeeded" 
-                    : $"Build failed with {solutionBuild.LastBuildInfo} error(s)"
-            };
-        }
-
-        return new BuildResult { Success = true, Message = "Build started" };
-    }
 
     /// <summary>
     /// Gets the current debugger state.
@@ -1211,13 +1187,6 @@ public static class VisualStudioConnector
     {
         public string Code { get; } = code;
     }
-}
-
-public class BuildResult
-{
-    public bool Success { get; set; }
-    public int ErrorCount { get; set; }
-    public string Message { get; set; } = "";
 }
 
 public class DebuggerState

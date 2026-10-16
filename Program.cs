@@ -17,6 +17,7 @@ using VisualStudioMcpServer;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Server;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.ConnectionKeys;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -91,13 +92,25 @@ internal static class Program
         StaComDispatcher.Start();
         var tokenBytes = RandomNumberGenerator.GetBytes(32);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        var serverInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16));
+        ConnectionKeyStore? connectionKeys = null;
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.WebHost.ConfigureKestrel(server => server.Limits.MaxRequestBodySize = 1024 * 1024);
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddMcpServer()
-            .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
+#pragma warning disable MCP9006 // Issue #43 pins the legacy stateful session contract for native SDK clients.
+            .WithHttpTransport(options =>
+            {
+                options.SessionMode = HttpServerSessionMode.Stateful;
+                options.IdleTimeout = TimeSpan.FromMinutes(30);
+                options.MaxIdleSessionCount = 16;
+            })
+#pragma warning restore MCP9006
             .WithTools<ReadOnlyHttpTools>()
-            .WithTools<DebuggerHttpTools>();
+            .WithTools<DebuggerHttpTools>()
+            .WithTools<BuildOperationTools>()
+            .WithTools<ProjectInventoryTools>()
+            .WithTools<ProjectFileActionTools>();
 
         await using var app = builder.Build();
         app.Use(async (context, next) =>
@@ -125,21 +138,73 @@ internal static class Program
             }
 
             var authorization = context.Request.Headers.Authorization.ToString();
+            if (context.Request.Headers.Authorization.Count != 1 || authorization.Length > 256 || authorization.Any(character => character > 0x7f))
+            {
+                var containsOwnerCredential = context.Request.Headers.Authorization.Any(value =>
+                    value is not null && value.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) &&
+                    TokenEquals(token, value[7..].Trim()));
+                if (!containsOwnerCredential) connectionKeys?.RecordFailedKeyAuth();
+                var limited = connectionKeys?.IsKeyAuthRateLimited() == true;
+                context.Response.StatusCode = limited ? StatusCodes.Status429TooManyRequests : StatusCodes.Status401Unauthorized;
+                if (limited) context.Response.Headers.RetryAfter = "5";
+                return;
+            }
             var suppliedToken = authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
                 ? authorization[7..].Trim()
                 : string.Empty;
-            if (!TokenEquals(token, suppliedToken))
+            if (connectionKeys is null)
             {
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                 return;
             }
-
-            await next();
+            await ConnectionKeyHttpAuthorization.InvokeAsync(context, connectionKeys,
+                candidate => TokenEquals(token, candidate), _ => next());
         });
         app.MapPost("/_vsix/shutdown", (IHostApplicationLifetime lifetime) =>
         {
             lifetime.StopApplication();
             return Results.Ok();
+        });
+        app.MapPost("/_vsix/connection-key/issue", async (HttpContext context) =>
+        {
+            var store = connectionKeys;
+            if (store is null) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            var issuanceId = await TryReadIssuanceIdAsync(context.Request);
+            if (issuanceId is null) return Results.Json(new { code = "invalid_argument", message = "The issuance identifier is invalid.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            var result = store.Issue(issuanceId.Value);
+            if (result.Result != ConnectionKeyResult.Success || result.Key is null)
+                return result.Result == ConnectionKeyResult.CapacityExceeded
+                    ? Results.Json(new { code = "key_capacity_exceeded", message = "Connection-key capacity is full.", retryable = true, mayHaveChanged = false }, statusCode: StatusCodes.Status429TooManyRequests)
+                    : Results.Json(new { code = "key_issue_failed", message = "The connection key could not be issued.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status409Conflict);
+            return Results.Json(new
+            {
+                issuanceId = result.IssuanceId.ToString("N"),
+                key = result.Key,
+                expiresAt = result.ExpiresAt?.ToUnixTimeSeconds() ?? 0
+            });
+        });
+        app.MapPost("/_vsix/connection-key/cancel", async (HttpContext context) =>
+        {
+            var issuanceId = await TryReadIssuanceIdAsync(context.Request);
+            if (issuanceId is null) return Results.Json(new { code = "invalid_argument", message = "The issuance identifier is invalid.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            var result = connectionKeys?.CancelPending(issuanceId.Value) ?? ConnectionKeyResult.NotFound;
+            return result == ConnectionKeyResult.Success ? Results.NoContent() : Results.NotFound();
+        });
+        app.MapPost("/_vsix/connection-key/revoke-all", () =>
+        {
+            connectionKeys?.RevokeAll();
+            return Results.NoContent();
+        });
+        app.MapPost("/_vsix/connection-key/status", () =>
+        {
+            var status = connectionKeys?.GetStatus();
+            if (status is null) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            return Results.Json(new
+            {
+                pendingCount = status.PendingCount,
+                activeCount = status.ActiveCount,
+                nearestExpiry = status.NearestExpiry?.ToUnixTimeSeconds()
+            });
         });
         app.MapMcp("/mcp");
 
@@ -152,8 +217,12 @@ internal static class Program
             throw new InvalidOperationException("The HTTP listener did not publish its bound loopback address.");
         }
 
-        var endpoint = new ServerEndpoint(options.ParentPid, Environment.ProcessId,
-            new Uri(uri, "/mcp").ToString(), token);
+        var mcpUrl = new Uri(uri, "/mcp").ToString();
+        var keyClock = new SystemConnectionKeyClock();
+        connectionKeys = new ConnectionKeyStore(keyClock, keyClock, options.ParentPid,
+            options.ParentStartTicks, Environment.ProcessId, serverInstanceId, mcpUrl);
+        var endpoint = new ServerEndpoint(2, options.ParentPid, options.ParentStartTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Environment.ProcessId, serverInstanceId, mcpUrl, token);
         var descriptorDirectory = Path.GetDirectoryName(options.EndpointFile)
             ?? throw new InvalidOperationException("Endpoint file directory is missing.");
         Directory.CreateDirectory(descriptorDirectory);
@@ -170,6 +239,8 @@ internal static class Program
         {
             monitorCancellation.Cancel();
             try { await parentMonitor; } catch (OperationCanceledException) { }
+            connectionKeys.RevokeAll();
+            ProjectInventoryTools.SnapshotStore.InvalidateAll();
             try { File.Delete(options.EndpointFile); } catch (IOException) { }
         }
     }
@@ -205,7 +276,23 @@ internal static class Program
         return expectedBytes.Length == actualBytes.Length && CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
     }
 
-    private sealed record ServerEndpoint(int ParentPid, int ServerPid, string Url, string Token);
+    private static async Task<Guid?> TryReadIssuanceIdAsync(HttpRequest request)
+    {
+        try
+        {
+            using var document = await JsonDocument.ParseAsync(request.Body,
+                new JsonDocumentOptions { MaxDepth = 4 }, request.HttpContext.RequestAborted);
+            var root = document.RootElement;
+            return root.ValueKind == JsonValueKind.Object && root.TryGetProperty("issuanceId", out var value) &&
+                value.ValueKind == JsonValueKind.String && Guid.TryParseExact(value.GetString(), "N", out var id)
+                ? id : null;
+        }
+        catch (JsonException) { return null; }
+        catch (IOException) { return null; }
+    }
+
+    private sealed record ServerEndpoint(int SchemaVersion, int ParentPid, string ParentStartTicks,
+        int ServerPid, string ServerInstanceId, string Url, string Token);
 
     private sealed record HttpOptions(int ParentPid, long ParentStartTicks, string EndpointFile)
     {

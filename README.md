@@ -1,6 +1,6 @@
 # Visual Studio MCP Bridge
 
-An MCP server fork for Visual Studio 2022/2026. The v1.0 HTTP mode is intended to be launched and owned by the Visual Studio Debug MCP VSIX. It binds to loopback, authenticates every request, and targets the Visual Studio process ID supplied by its parent. The original stdio mode remains available for direct client launches.
+An MCP server fork for Visual Studio 2022/2026. VSIX-managed HTTP is launched and owned by one Visual Studio Debug MCP VSIX instance. It binds to loopback, authenticates every request, and targets the Visual Studio process identity supplied by its parent. The original stdio mode remains available for direct client launches.
 
 The original upstream is [alon-mini/visual-studio-mcp](https://github.com/alon-mini/visual-studio-mcp). This fork preserves its MIT license and attribution. Changes for HTTP hosting and instance binding belong in this fork.
 
@@ -48,7 +48,7 @@ VisualStudioMcpServer.exe http --parent-pid <PID> --parent-start-ticks <UTC proc
 
 The server verifies both the parent PID and process start time, creates a random 256-bit bearer token, binds Kestrel to an OS-assigned port on `127.0.0.1`, and writes the endpoint URL and token to the protected endpoint descriptor. The MCP endpoint is `/mcp`; the authenticated VSIX shutdown endpoint is `/_vsix/shutdown`. Parent-process exit stops the listener.
 
-Authenticated HTTP exposes the following bounded solution and debugger tools:
+Authenticated stateful HTTP exposes the following bounded solution, debugger, build, inventory, and file-registration tools:
 
 - `get_solution_info`
 - `get_error_list`
@@ -57,10 +57,15 @@ Authenticated HTTP exposes the following bounded solution and debugger tools:
 - `list_breakpoints`, `set_breakpoint`, `remove_breakpoint`
 - `list_debugger_threads`, `get_call_stack`, `select_debugger_thread`, `select_debugger_frame`, `get_debugger_locals`
 - `evaluate_expression`, `control_debugger`
+- `build_solution`, `rebuild_solution`, `clean_solution`, `get_build_status`
+- `list_solution_projects`, `get_project_info`, `list_project_files`
+- `open_project_file`, `add_project_file`, `remove_project_file`
 
-Breakpoint changes, expression evaluation, side-effectful expression evaluation, member expansion, and execution control retain their explicit per-request policy flags over HTTP. Authentication, loopback binding, Host and Origin validation, and the parent-process identity check apply to these tools as well. Legacy `start_debugging`, `stop_debugging`, and build tools remain available only through stdio.
+The VSIX supplies an owner bearer token that is restricted to owner routes and the legacy stdio-compatible HTTP path. The `/mcp` endpoint uses the MCP SDK's stateful HTTP transport. A one-use connection key admits one MCP session; each request must authenticate with that key and its bound `Mcp-Session-Id`. The key is not accepted by owner routes or shutdown. Breakpoint changes, expression evaluation, member expansion, execution control, builds, and project registration retain explicit per-request policy flags. Authentication, loopback binding, Host and Origin validation, and the parent-process PID/start-time identity check apply to the tools. Legacy `start_debugging` and `stop_debugging` remain available only through stdio.
 
-HTTP requests without a valid bearer token receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. The bearer token is not placed in process arguments or logs.
+Build tools require `allowBuild=true`, a matching absolute `expectedSolutionPath`, a live bound Visual Studio process, and design mode. Project registration requires `allowProjectMutation=true`, a matching solution and project path, design mode, no build in progress, and a clean project/source file. `remove_project_file` uses project-system item removal and verifies the physical file remains. Project inventory captures solution registrations only; it never walks arbitrary filesystem paths. Snapshots contain no COM references and are capped by count, size, traversal depth, node count, lifetime, and response length. `open_project_file` opens the captured item in the text editor and does not save or reload an existing dirty buffer.
+
+HTTP requests without a valid owner token or admitted connection key receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. Owner tokens and connection keys are not placed in process arguments or logs. The HTTP allowlist contains 24 unique tool names.
 
 ## Visual Studio binding and COM
 
