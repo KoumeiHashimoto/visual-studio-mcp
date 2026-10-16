@@ -21,7 +21,16 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("current frame snapshot accepted", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Sample.dll").ToString(), null), "True"),
     ("changed frame count rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 6, "Run", "Run", "Sample.dll", "Sample.dll").ToString(), null), "False"),
     ("changed frame function rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Other", "Sample.dll", "Sample.dll").ToString(), null), "False"),
-    ("changed frame module rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Other.dll").ToString(), null), "False")
+    ("changed frame module rejected", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Other.dll").ToString(), null), "False"),
+    ("arithmetic expression accepted for side-effect-free mode", () => (BreakpointRequestValidation.IsConservativeReadOnlyExpression("value + 1").ToString(), null), "True"),
+    ("assignment expression rejected for side-effect-free mode", () => (BreakpointRequestValidation.IsConservativeReadOnlyExpression("value = 1").ToString(), null), "False"),
+    ("function call rejected for side-effect-free mode", () => (BreakpointRequestValidation.IsConservativeReadOnlyExpression("UpdateValue()").ToString(), null), "False"),
+    ("increment rejected for side-effect-free mode", () => (BreakpointRequestValidation.IsConservativeReadOnlyExpression("value++").ToString(), null), "False"),
+    ("equals inside a string literal accepted", () => (BreakpointRequestValidation.IsConservativeReadOnlyExpression("message == \"a=b\"").ToString(), null), "True"),
+    ("expression evaluation denied by default", () => BreakpointRequestValidation.ValidateExpression("value + 1", false, false), "evaluation_policy_required"),
+    ("assignment evaluation requires side-effect policy", () => BreakpointRequestValidation.ValidateExpression("value = 1", true, false), "side_effect_policy_required"),
+    ("read-only expression accepted with evaluation authorization", () => BreakpointRequestValidation.ValidateExpression("value + 1", true, false), null),
+    ("expression size bound enforced", () => BreakpointRequestValidation.ValidateExpression(new string('a', 1025), true, true), "invalid_expression")
 };
 
 foreach (var test in cases)
