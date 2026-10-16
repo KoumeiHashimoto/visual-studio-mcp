@@ -60,10 +60,138 @@ public sealed class BreakpointToolResponse
 }
 
 /// <summary>
+/// Carries a structured result for debugger thread, frame, and local inspection.
+/// </summary>
+public sealed class DebuggerInspectionResponse
+{
+    /// <summary>Gets or sets whether the operation succeeded.</summary>
+    public bool Success { get; set; }
+
+    /// <summary>Gets or sets a stable error code when the operation failed.</summary>
+    public string Code { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets an actionable result message.</summary>
+    public string Message { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the Visual Studio process ID.</summary>
+    public int? TargetProcessId { get; set; }
+
+    /// <summary>Gets or sets the observed debugger mode.</summary>
+    public string? DebuggerMode { get; set; }
+
+    /// <summary>Gets or sets the ID of the current debugger thread, when available.</summary>
+    public int? CurrentThreadId { get; set; }
+
+    /// <summary>Gets or sets the total count before response bounding.</summary>
+    public int? TotalCount { get; set; }
+
+    /// <summary>Gets or sets debugger threads.</summary>
+    public List<DebuggerThreadInfo> Threads { get; set; } = new();
+
+    /// <summary>Gets or sets stack frames.</summary>
+    public List<DebuggerFrameInfo> Frames { get; set; } = new();
+
+    /// <summary>Gets or sets local variables.</summary>
+    public List<DebuggerVariableInfo> Locals { get; set; } = new();
+
+    /// <summary>Gets or sets whether the result list was truncated.</summary>
+    public bool Truncated { get; set; }
+}
+
+/// <summary>
+/// Describes one debugger thread.
+/// </summary>
+public sealed class DebuggerThreadInfo
+{
+    /// <summary>Gets or sets the operating system thread ID.</summary>
+    public int Id { get; set; }
+
+    /// <summary>Gets or sets the debugger thread name.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the number of stack frames.</summary>
+    public int FrameCount { get; set; }
+
+    /// <summary>Gets or sets whether this is the currently selected thread.</summary>
+    public bool IsCurrent { get; set; }
+}
+
+/// <summary>
+/// Describes one stack frame in the current thread.
+/// </summary>
+public sealed class DebuggerFrameInfo
+{
+    /// <summary>Gets or sets the one-based frame index in the current snapshot.</summary>
+    public int Index { get; set; }
+
+    /// <summary>Gets or sets the function name.</summary>
+    public string Function { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the module name.</summary>
+    public string Module { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the source file when the debugger exposes it.</summary>
+    public string File { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the source line when the debugger exposes it.</summary>
+    public int Line { get; set; }
+
+    /// <summary>Gets or sets the source language.</summary>
+    public string Language { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets whether this is the selected frame.</summary>
+    public bool IsCurrent { get; set; }
+}
+
+/// <summary>
+/// Describes one local variable and its bounded child values.
+/// </summary>
+public sealed class DebuggerVariableInfo
+{
+    /// <summary>Gets or sets the local or member name.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the type name.</summary>
+    public string Type { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the displayed value.</summary>
+    public string Value { get; set; } = string.Empty;
+
+    /// <summary>Gets or sets the bounded member values.</summary>
+    public List<DebuggerVariableInfo> Children { get; set; } = new();
+
+    /// <summary>Gets or sets whether member expansion was limited.</summary>
+    public bool Truncated { get; set; }
+}
+
+/// <summary>
 /// Validates breakpoint request arguments before Visual Studio COM is called.
 /// </summary>
 public static class BreakpointRequestValidation
 {
+    /// <summary>Clamps member expansion depth to the supported safe range.</summary>
+    public static int ClampMemberDepth(int depth) => Math.Clamp(depth, 0, 3);
+
+    /// <summary>Clamps total locals and members to the supported response bound.</summary>
+    public static int ClampMemberCount(int count) => Math.Clamp(count, 1, 40);
+
+    /// <summary>
+    /// Validates that a stack-frame reference still identifies the expected snapshot entry.
+    /// </summary>
+    public static bool MatchesFrameSnapshot(
+        int index,
+        int expectedFrameCount,
+        int currentFrameCount,
+        string? expectedFunction,
+        string? currentFunction,
+        string? expectedModule,
+        string? currentModule) =>
+        index >= 1 && expectedFrameCount == currentFrameCount &&
+        !string.IsNullOrWhiteSpace(expectedFunction) &&
+        string.Equals(expectedFunction, currentFunction, StringComparison.Ordinal) &&
+        expectedModule is not null &&
+        string.Equals(expectedModule, currentModule, StringComparison.Ordinal);
+
     /// <summary>
     /// Validates a source or function breakpoint request and its safety policies.
     /// </summary>
