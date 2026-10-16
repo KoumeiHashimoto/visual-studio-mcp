@@ -1079,12 +1079,14 @@ public static class VisualStudioConnector
     /// <summary>Reads frame metadata and source coordinates when the StackFrame2 provider supports them.</summary>
     private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent)
     {
+        var language = ReadBoundedString(() => (string?)frame.Language);
         var result = new DebuggerFrameInfo
         {
             Index = index,
             Function = ReadBoundedString(() => (string?)frame.FunctionName),
             Module = ReadBoundedString(() => (string?)frame.Module),
-            Language = ReadBoundedString(() => (string?)frame.Language),
+            Language = DebuggerMetadata.NormalizeLanguage(language),
+            LanguageDisplayName = language,
             IsCurrent = isCurrent
         };
         try

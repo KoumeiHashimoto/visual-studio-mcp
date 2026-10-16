@@ -144,8 +144,11 @@ public sealed class DebuggerFrameInfo
     /// <summary>Gets or sets the stable reason that source coordinates are unavailable.</summary>
     public string? SourceLocationUnavailableReason { get; set; } = "source_location_interface_unavailable";
 
-    /// <summary>Gets or sets the source language.</summary>
-    public string Language { get; set; } = string.Empty;
+    /// <summary>Gets or sets the locale-independent language identifier.</summary>
+    public string Language { get; set; } = "unknown";
+
+    /// <summary>Gets or sets the original debugger language label for display.</summary>
+    public string LanguageDisplayName { get; set; } = string.Empty;
 
     /// <summary>Gets or sets whether this is the selected frame.</summary>
     public bool IsCurrent { get; set; }
