@@ -402,21 +402,30 @@ public sealed class DebuggerHttpTools
     [System.ComponentModel.Description("Selects a thread ID from the latest list_debugger_threads response and revalidates it against the bound paused debugger.")]
     public static string SelectDebuggerThread(int threadId) => DebuggerInspectionTool.SelectDebuggerThread(threadId);
 
-    /// <summary>Gets a bounded call stack for the current selected thread.</summary>
+    /// <summary>Gets a bounded call stack for the selected or specified thread without changing selection.</summary>
     [McpServerTool]
-    [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread in the bound paused debugger.")]
-    public static string GetCallStack() => DebuggerInspectionTool.GetDebuggerStack();
+    [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread or an explicitly specified paused thread. The optional threadId is read-only and does not alter Visual Studio selection. Locals and expression evaluation remain bound to CurrentThreadId; select another thread before using those tools.")]
+    public static string GetCallStack(
+        [System.ComponentModel.Description("Optional positive thread ID from list_debugger_threads. Omit to inspect the currently selected thread.")]
+        int? threadId = null) =>
+        DebuggerInspectionTool.GetDebuggerStack(threadId);
 
     /// <summary>Selects a current stack frame after snapshot validation.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Selects a frame from the latest get_call_stack response after validating function, module, and total frame count.")]
-    public static string SelectDebuggerFrame(int index, string expectedFunction, string expectedModule, int totalFrameCount) =>
+    public static string SelectDebuggerFrame(
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int index,
+        string expectedFunction, string expectedModule, int totalFrameCount) =>
         DebuggerInspectionTool.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount);
 
     /// <summary>Reads bounded local values from a validated frame.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Reads up to 40 local/member values at depth 3. Member expansion requires allowMemberExpansion=true.")]
-    public static string GetDebuggerLocals(int frameIndex, string expectedFunction, string expectedModule,
+    public static string GetDebuggerLocals(
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
+        string expectedFunction, string expectedModule,
         int totalFrameCount, int threadId, int maxDepth = 1, int maxItems = 40, bool allowMemberExpansion = false) =>
         DebuggerInspectionTool.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
             totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion);
@@ -424,7 +433,10 @@ public sealed class DebuggerHttpTools
     /// <summary>Evaluates an expression with explicit evaluation and side-effect policy.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Evaluates an expression from a current paused frame. Requires allowEvaluation=true; automatic property/function evaluation additionally requires allowSideEffects=true.")]
-    public static string EvaluateExpression(string expression, int frameIndex, string expectedFunction,
+    public static string EvaluateExpression(string expression,
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
+        string expectedFunction,
         string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false) =>
         DebuggerExpressionTool.EvaluateExpression(expression, frameIndex, expectedFunction, expectedModule,
             totalFrameCount, threadId, allowEvaluation, allowSideEffects);

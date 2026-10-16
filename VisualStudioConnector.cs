@@ -678,27 +678,49 @@ public static class VisualStudioConnector
     }
 
     /// <summary>
-    /// Lists stack frames in the current thread while execution is paused.
+    /// Lists stack frames in the current or explicitly requested thread without changing debugger selection.
     /// </summary>
-    public static DebuggerInspectionResponse GetDebuggerStack()
+    public static DebuggerInspectionResponse GetDebuggerStack(int? requestedThreadId = null)
     {
+        if (requestedThreadId is <= 0)
+            return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current paused process, or omit it to inspect the current thread.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
-            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentThreadId = (int)currentThread.ID;
+            dynamic inspectedThread = currentThread;
+            if (requestedThreadId.HasValue && requestedThreadId.Value != currentThreadId)
+            {
+                dynamic threads = dte.Debugger.CurrentProgram.Threads;
+                var threadCount = (int)threads.Count;
+                inspectedThread = null!;
+                for (var threadIndex = 1; threadIndex <= Math.Min(threadCount, 512); threadIndex++)
+                {
+                    dynamic candidate = threads.Item(threadIndex);
+                    if ((int)candidate.ID != requestedThreadId.Value) continue;
+                    inspectedThread = candidate;
+                    break;
+                }
+                if (inspectedThread is null)
+                    return CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
+            }
+
+            dynamic frames = inspectedThread.StackFrames;
             var count = (int)frames.Count;
             var items = new List<DebuggerFrameInfo>();
             var returned = Math.Min(count, 128);
-            dynamic currentFrame = dte.Debugger.CurrentStackFrame;
-            dynamic currentThread = dte.Debugger.CurrentThread;
-            var currentFunction = ReadBoundedString(() => (string?)currentFrame.FunctionName);
-            var currentModule = ReadBoundedString(() => (string?)currentFrame.Module);
+            dynamic currentFrame = null!;
+            if (requestedThreadId is null || requestedThreadId.Value == currentThreadId)
+                currentFrame = dte.Debugger.CurrentStackFrame;
+            var currentFunction = currentFrame is null ? string.Empty : ReadBoundedString(() => (string?)currentFrame.FunctionName);
+            var currentModule = currentFrame is null ? string.Empty : ReadBoundedString(() => (string?)currentFrame.Module);
             var markedCurrent = false;
             for (var index = 1; index <= returned; index++)
             {
                 dynamic frame = frames.Item(index);
                 var frameInfo = ReadDebuggerFrame(index, frame, false);
-                frameInfo.IsCurrent = !markedCurrent &&
+                frameInfo.IsCurrent = (requestedThreadId is null || requestedThreadId.Value == currentThreadId) && !markedCurrent &&
                     string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
                     string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
                 markedCurrent |= frameInfo.IsCurrent;
@@ -709,10 +731,13 @@ public static class VisualStudioConnector
             {
                 Success = true,
                 Code = "ok",
-                Message = $"Listed {items.Count} frame(s) for the current thread.",
+                Message = requestedThreadId.HasValue
+                    ? $"Listed {items.Count} frame(s) for requested thread {requestedThreadId.Value} without changing debugger selection. Locals and expression evaluation remain bound to CurrentThreadId; select the requested thread and get a fresh stack snapshot before using them."
+                    : $"Listed {items.Count} frame(s) for the current thread.",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = mode,
-                CurrentThreadId = ReadInteger(() => (int)currentThread.ID),
+                CurrentThreadId = currentThreadId,
+                RequestedThreadId = requestedThreadId,
                 Frames = items,
                 TotalCount = count,
                 Truncated = count > returned

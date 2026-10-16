@@ -84,6 +84,9 @@ public sealed class DebuggerInspectionResponse
     /// <summary>Gets or sets the ID of the current debugger thread, when available.</summary>
     public int? CurrentThreadId { get; set; }
 
+    /// <summary>Gets or sets the explicitly requested thread ID, when one was supplied.</summary>
+    public int? RequestedThreadId { get; set; }
+
     /// <summary>Gets or sets the total count before response bounding.</summary>
     public int? TotalCount { get; set; }
 
