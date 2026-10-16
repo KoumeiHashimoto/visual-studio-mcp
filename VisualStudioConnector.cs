@@ -582,6 +582,10 @@ public static class VisualStudioConnector
                 throw new BreakpointOperationException("debugger_state_unavailable", "Visual Studio returned no debugger state.");
             return (dte, mode);
         }
+        catch (COMException ex) when (ex.HResult == unchecked((int)0x80010108))
+        {
+            throw new BreakpointOperationException("dte_disconnected", "The bound Visual Studio DTE connection was lost. The request was not sent to another instance.");
+        }
         catch (COMException)
         {
             throw new BreakpointOperationException("debugger_state_unavailable", "Could not read debugger state from the bound Visual Studio instance.");
