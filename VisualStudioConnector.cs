@@ -816,16 +816,7 @@ public static class VisualStudioConnector
                 Message = $"Selected frame {index} ({current.Function}).",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = dte.Debugger.CurrentMode.ToString(),
-                Frames = new List<DebuggerFrameInfo> { new()
-                    {
-                        Index = current.Index,
-                        Function = current.Function,
-                        Module = current.Module,
-                        File = current.File,
-                        Line = current.Line,
-                        Language = current.Language,
-                        IsCurrent = true
-                    } }
+                Frames = new List<DebuggerFrameInfo> { ReadDebuggerFrame(index, frame, true) }
             };
         }
         catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
@@ -1070,17 +1061,40 @@ public static class VisualStudioConnector
         IsCurrent = isCurrent
     };
 
-    /// <summary>Reads supported frame metadata; EnvDTE.StackFrame has no source-coordinate properties.</summary>
-    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent) => new()
+    /// <summary>Reads frame metadata and source coordinates when the StackFrame2 provider supports them.</summary>
+    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent)
     {
-        Index = index,
-        Function = ReadBoundedString(() => (string?)frame.FunctionName),
-        Module = ReadBoundedString(() => (string?)frame.Module),
-        File = string.Empty,
-        Line = 0,
-        Language = ReadBoundedString(() => (string?)frame.Language),
-        IsCurrent = isCurrent
-    };
+        var result = new DebuggerFrameInfo
+        {
+            Index = index,
+            Function = ReadBoundedString(() => (string?)frame.FunctionName),
+            Module = ReadBoundedString(() => (string?)frame.Module),
+            Language = ReadBoundedString(() => (string?)frame.Language),
+            IsCurrent = isCurrent
+        };
+        try
+        {
+            if (frame is EnvDTE90a.StackFrame2 sourceFrame)
+            {
+                var file = sourceFrame.FileName;
+                var line = sourceFrame.LineNumber;
+                if (!string.IsNullOrWhiteSpace(file) && file.Length <= 2048 && line > 0 && line <= int.MaxValue)
+                {
+                    result.File = file;
+                    result.Line = (int)line;
+                    result.SourceLocationUnavailableReason = null;
+                }
+                else
+                    result.SourceLocationUnavailableReason = file?.Length > 2048 || line > int.MaxValue
+                        ? "source_location_exceeds_limit" : "source_location_not_reported";
+            }
+        }
+        catch (COMException)
+        {
+            result.SourceLocationUnavailableReason = "source_location_com_error";
+        }
+        return result;
+    }
 
     private static DebuggerVariableInfo ReadDebuggerVariable(dynamic expression, int depth, bool allowMemberExpansion, ref int remaining)
     {
