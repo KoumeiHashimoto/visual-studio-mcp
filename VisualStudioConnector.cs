@@ -668,6 +668,7 @@ public static class VisualStudioConnector
             var (dte, mode) = GetPausedDebugger();
             dynamic threads = dte.Debugger.CurrentProgram.Threads;
             dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentThreadId = (int)currentThread.ID;
             var count = (int)threads.Count;
             var items = new List<DebuggerThreadInfo>();
             var returned = Math.Min(count, 64);
@@ -680,7 +681,7 @@ public static class VisualStudioConnector
                     Id = id,
                     Name = ReadBoundedString(() => (string?)thread.Name),
                     FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
-                    IsCurrent = id == ReadInteger(() => (int)currentThread.ID)
+                    IsCurrent = id == currentThreadId
                 });
             }
 
@@ -691,6 +692,7 @@ public static class VisualStudioConnector
                 Message = $"Listed {items.Count} thread(s).",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = mode,
+                CurrentThreadId = currentThreadId,
                 Threads = items,
                 TotalCount = count,
                 Truncated = count > returned
@@ -770,6 +772,7 @@ public static class VisualStudioConnector
                     Message = $"Selected thread {threadId}.",
                     TargetProcessId = _targetProcessId,
                     DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                    CurrentThreadId = threadId,
                     Threads = new List<DebuggerThreadInfo> { ReadDebuggerThread(threadId, thread, true) }
                 };
             }
