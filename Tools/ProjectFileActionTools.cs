@@ -9,8 +9,9 @@ namespace VisualStudioMcpServer.Tools;
 
 internal sealed record ProjectFileActionResult(bool Success, string Code, string Message,
     int? TargetProcessId, string? SolutionPath, string? ProjectPath, string? FilePath,
-    bool Opened, bool Activated, bool PositionApplied, bool FilePreserved,
-    bool RegistrationChanged, long ElapsedMilliseconds);
+    bool Opened, bool Activated, bool PositionApplied, bool? FilePreserved,
+    bool? RegistrationChanged, bool? Changed, bool? RegisteredAfter, bool? Persisted,
+    bool MayHaveChanged, bool RefreshRequired, long ElapsedMilliseconds);
 
 /// <summary>Opens and changes only project-file registrations captured by the bounded inventory.</summary>
 [McpServerToolType]
@@ -104,16 +105,16 @@ public sealed class ProjectFileActionTools
         var positionApplied = line == 0 && column == 0;
         if (line > 0 || column > 0)
         {
-            if (line <= 0 || column <= 0) return new ProjectFileActionResult(false, "invalid_position", "Line and column must both be positive when positioning the caret.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, false, false, false, 0);
+            if (line <= 0 || column <= 0) return new ProjectFileActionResult(false, "invalid_position", "Line and column must both be positive when positioning the caret.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, false, null, null, null, null, null, false, false, 0);
             try
             {
                 var selection = (TextSelection)window.Document.Selection;
                 selection.MoveToLineAndOffset(line, column, false);
                 positionApplied = true;
             }
-            catch (COMException) { return new ProjectFileActionResult(false, "invalid_position", "The requested line or column is outside the open editor buffer.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, false, false, false, 0); }
+            catch (COMException) { return new ProjectFileActionResult(false, "invalid_position", "The requested line or column is outside the open editor buffer.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, false, null, null, null, null, null, false, false, 0); }
         }
-        return new ProjectFileActionResult(true, "ok", "The registered project file is open in the text editor.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, positionApplied, false, false, 0);
+        return new ProjectFileActionResult(true, "ok", "The registered project file is open in the text editor.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, positionApplied, null, null, null, null, null, false, false, 0);
     }
 
     private static string Mutate(string? projectSnapshotId, string? projectId, string? fileSnapshotId,
@@ -146,36 +147,78 @@ public sealed class ProjectFileActionTools
         if (fileSnapshotId is null && !SafeLocalFile(selected.ProjectPath, filePath ?? string.Empty)) return Format(Result(false, "invalid_file_path", "The file must be an existing local regular file inside the project directory and outside generated or metadata directories.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
         if (!WorkspaceMutationGate.Shared.TryAcquire()) return Format(Result(false, "workspace_busy", "Another build or project mutation is in progress.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
         var transferLease = false;
+        var mutationStarted = 0;
         try
         {
             var timeout = Math.Clamp(timeoutMilliseconds, 1000, 10000);
             var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeout);
             var result = StaComDispatcher.Invoke(() => MutateOnSta(selected, selectedItem, fileSnapshotId is null ? filePath : null,
-                expectedSolutionPath, expectedProjectPath, pid, ticks, deadline, cancellationToken), TimeSpan.FromMilliseconds(timeout), cancellationToken);
-            if (result.Success || !result.FilePreserved) Snapshots.InvalidateProject(projects.SnapshotId);
+                expectedSolutionPath, expectedProjectPath, pid, ticks, deadline, cancellationToken,
+                () => Interlocked.Exchange(ref mutationStarted, 1)), TimeSpan.FromMilliseconds(timeout), cancellationToken);
+            if (result.RegistrationChanged == true || result.Code is "outcome_unknown" or "registration_failed")
+                Snapshots.InvalidateProject(projects.SnapshotId);
             return Format(result with { ElapsedMilliseconds = Elapsed(started) });
         }
         catch (OperationCanceledException)
         {
             transferLease = true;
-            ReleaseAfterQueuedCleanup();
-            Snapshots.InvalidateProject(projects.SnapshotId);
-            return Format(Result(false, "outcome_unknown", "The request was cancelled while Visual Studio may still be processing it; the workspace remains locked until the queued operation settles. Refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
+            if (Volatile.Read(ref mutationStarted) == 0) ReleaseAfterQueuedCleanup();
+            var mayHaveChanged = Volatile.Read(ref mutationStarted) != 0;
+            if (mayHaveChanged) Snapshots.InvalidateProject(projects.SnapshotId);
+            return Format(Result(false, mayHaveChanged ? "outcome_unknown" : "cancelled",
+                mayHaveChanged ? "The registration call may have changed the project; refresh same-target inventory and restart this companion server before another mutation." : "The request was cancelled before registration dispatch; queued Visual Studio preflight will settle before the workspace is unlocked.",
+                pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: mayHaveChanged ? null : false, changed: mayHaveChanged ? null : false,
+                mayHaveChanged: mayHaveChanged, refreshRequired: mayHaveChanged));
         }
         catch (TimeoutException)
         {
             transferLease = true;
-            ReleaseAfterQueuedCleanup();
-            Snapshots.InvalidateProject(projects.SnapshotId);
-            return Format(Result(false, "outcome_unknown", "The Visual Studio operation exceeded its deadline; the workspace remains locked until the queued operation settles. Refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
+            if (Volatile.Read(ref mutationStarted) == 0) ReleaseAfterQueuedCleanup();
+            var mayHaveChanged = Volatile.Read(ref mutationStarted) != 0;
+            if (mayHaveChanged) Snapshots.InvalidateProject(projects.SnapshotId);
+            return Format(Result(false, mayHaveChanged ? "outcome_unknown" : "operation_failed",
+                mayHaveChanged ? "The registration call exceeded its deadline and may have changed the project; refresh same-target inventory and restart this companion server before another mutation." : "The operation exceeded its deadline before registration dispatch; queued Visual Studio preflight will settle before the workspace is unlocked.",
+                pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: mayHaveChanged ? null : false, changed: mayHaveChanged ? null : false,
+                mayHaveChanged: mayHaveChanged, refreshRequired: mayHaveChanged));
         }
         catch (ProjectWorkspaceException ex)
         {
-            if (ex.Code is "outcome_unknown" or "registration_failed") Snapshots.InvalidateProject(projects.SnapshotId);
-            return Format(Result(false, ex.Code, ex.Message, pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
+            var uncertain = ex.Code == "outcome_unknown" || (ex.Code == "registration_failed" && Volatile.Read(ref mutationStarted) != 0);
+            if (uncertain) Snapshots.InvalidateProject(projects.SnapshotId);
+            if (uncertain) transferLease = true;
+            return Format(Result(false, ex.Code, ex.Message, pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: uncertain ? null : false, changed: uncertain ? null : false, mayHaveChanged: uncertain, refreshRequired: uncertain));
         }
-        catch (COMException ex) { Snapshots.InvalidateProject(projects.SnapshotId); return Format(Result(false, "outcome_unknown", $"Visual Studio returned HRESULT 0x{ex.HResult:X8}; refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started)); }
-        catch (Exception) { Snapshots.InvalidateProject(projects.SnapshotId); return Format(Result(false, "outcome_unknown", "The project-file operation could not be verified; refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started)); }
+        catch (ProjectFileFingerprintException ex)
+        {
+            var uncertain = Volatile.Read(ref mutationStarted) != 0;
+            if (uncertain) { Snapshots.InvalidateProject(projects.SnapshotId); transferLease = true; }
+            return Format(Result(false, uncertain ? "outcome_unknown" : ex.Code, ex.Message, pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: uncertain ? null : false, changed: uncertain ? null : false,
+                mayHaveChanged: uncertain, refreshRequired: uncertain));
+        }
+        catch (COMException ex)
+        {
+            var uncertain = Volatile.Read(ref mutationStarted) != 0;
+            if (uncertain) { Snapshots.InvalidateProject(projects.SnapshotId); transferLease = true; }
+            return Format(Result(false, uncertain ? "outcome_unknown" : "operation_failed",
+                uncertain ? $"Visual Studio returned HRESULT 0x{ex.HResult:X8}; refresh same-target inventory and restart this companion server before another mutation." : $"Visual Studio returned HRESULT 0x{ex.HResult:X8} before registration dispatch.",
+                pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: uncertain ? null : false, changed: uncertain ? null : false,
+                mayHaveChanged: uncertain, refreshRequired: uncertain));
+        }
+        catch (Exception)
+        {
+            var uncertain = Volatile.Read(ref mutationStarted) != 0;
+            if (uncertain) { Snapshots.InvalidateProject(projects.SnapshotId); transferLease = true; }
+            return Format(Result(false, uncertain ? "outcome_unknown" : "operation_failed",
+                uncertain ? "The registration call may have changed the project; refresh same-target inventory and restart this companion server before another mutation." : "The project-file operation failed before registration dispatch.",
+                pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started,
+                filePreserved: uncertain ? null : false, changed: uncertain ? null : false,
+                mayHaveChanged: uncertain, refreshRequired: uncertain));
+        }
         finally { if (!transferLease) WorkspaceMutationGate.Shared.Release(); }
     }
 
@@ -187,7 +230,7 @@ public sealed class ProjectFileActionTools
 
     private static ProjectFileActionResult MutateOnSta(ProjectInfoRecord selected, ProjectFileRecord? selectedItem,
         string? filePath, string expectedSolution, string expectedProject, int pid, long ticks,
-        DateTimeOffset deadline, CancellationToken cancellationToken)
+        DateTimeOffset deadline, CancellationToken cancellationToken, Action mutationDispatchStarting)
     {
         ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
         var traversal = new ProjectTraversalBudget();
@@ -201,6 +244,9 @@ public sealed class ProjectFileActionTools
         var project = ProjectWorkspaceConnector.FindProject(solution.Projects, expectedProject, selected.Kind,
             string.Empty, selected.LogicalPath, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase), traversal, deadline, cancellationToken);
         if (project is null) throw new ProjectWorkspaceException("stale_project", "The project no longer matches its captured path and ancestry.");
+        if (filePath is not null && ContainsFileBeforeMutation(project.ProjectItems, filePath, traversal, deadline, cancellationToken))
+            return new ProjectFileActionResult(true, "already_included", "The file is already registered in the project.", pid,
+                solutionPath, expectedProject, filePath, false, false, false, true, false, false, true, null, false, false, 0);
         try
         {
             if (!project.Saved) throw new ProjectWorkspaceException("project_dirty", "Save or discard project-file changes before changing registration.");
@@ -229,11 +275,13 @@ public sealed class ProjectFileActionTools
         if (documentStateError == "document_dirty") throw new ProjectWorkspaceException("document_dirty", "Save or discard all unsaved editor documents before changing project registration.");
         if (documentStateError is not null) throw new ProjectWorkspaceException("unsupported_state", "Visual Studio could not report the saved state of every open document.");
         bool changed;
+        ProjectFileFingerprint? preservedFile = null;
         if (filePath is not null)
         {
             ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
+            mutationDispatchStarting();
             try { project.ProjectItems.AddFromFile(Path.GetFullPath(filePath)); }
-            catch (COMException ex) { throw new ProjectWorkspaceException("registration_failed", $"The project system rejected file registration (HRESULT 0x{ex.HResult:X8})."); }
+            catch (COMException ex) { throw new ProjectWorkspaceException("outcome_unknown", $"The project system rejected registration after dispatch (HRESULT 0x{ex.HResult:X8}); refresh same-target inventory and restart this companion server before another mutation."); }
             changed = ContainsFileAfterMutation(project.ProjectItems, filePath, traversal, deadline, cancellationToken);
             if (!changed) throw new ProjectWorkspaceException("outcome_unknown", "The add operation returned without verifiable project membership.");
         }
@@ -242,21 +290,53 @@ public sealed class ProjectFileActionTools
             var live = FindItem(project.ProjectItems, selectedItem!.LogicalPath, selected.LogicalPath,
                 selectedItem.FullPath!, 0, traversal, deadline, cancellationToken);
             if (live is null) throw new ProjectWorkspaceException("stale_file", "The captured project item is no longer registered at the expected path.");
+            if (ItemHasChildren(live, traversal, deadline, cancellationToken))
+                throw new ProjectWorkspaceException("unsupported_item", "Only a registered leaf project item without dependent children can be removed.");
+            preservedFile = ProjectFileFingerprint.Read(selectedItem.FullPath!, deadline, cancellationToken);
             ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
+            mutationDispatchStarting();
             live.Remove();
-            changed = !ContainsFileAfterMutation(project.ProjectItems, selectedItem.FullPath!, traversal, deadline, cancellationToken) && File.Exists(selectedItem.FullPath!);
+            changed = !ContainsFileAfterMutation(project.ProjectItems, selectedItem.FullPath!, traversal, deadline, cancellationToken);
             if (!changed) throw new ProjectWorkspaceException("outcome_unknown", "Item removal could not be verified or the physical file is missing.");
         }
         ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
         project.Save(expectedProject);
-        return new ProjectFileActionResult(true, "ok", filePath is null ? "The project item was removed and its physical file was preserved." : "The existing file was registered in the project.", pid, solutionPath, expectedProject, filePath ?? selectedItem?.FullPath, false, false, false, filePath is null && File.Exists(selectedItem!.FullPath!), true, 0);
+        ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
+        var savedSolution = dte.Solution ?? throw new ProjectWorkspaceException("outcome_unknown", "The solution became unavailable after project persistence; refresh inventory before retrying.");
+        var savedSolutionPath = Path.GetFullPath(savedSolution.FullName);
+        if (!ProjectWorkspaceConnector.PathsEqual(savedSolutionPath, expectedSolution))
+            throw new ProjectWorkspaceException("outcome_unknown", "The active solution changed after project persistence; refresh inventory before retrying.");
+        var savedProject = ProjectWorkspaceConnector.FindProject(savedSolution.Projects, expectedProject, selected.Kind,
+            string.Empty, selected.LogicalPath, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase), traversal, deadline, cancellationToken);
+        if (savedProject is null) throw new ProjectWorkspaceException("outcome_unknown", "The saved project could not be re-resolved; refresh inventory before retrying.");
+        var fullPath = filePath ?? selectedItem!.FullPath!;
+        var registeredAfter = ContainsFileAfterMutation(savedProject.ProjectItems, fullPath, traversal, deadline, cancellationToken);
+        if (registeredAfter != (filePath is not null) || !File.Exists(fullPath))
+            throw new ProjectWorkspaceException("outcome_unknown", "Project persistence did not leave the expected registration and physical file state; refresh inventory before retrying.");
+        if (preservedFile is not null && ProjectFileFingerprint.Read(fullPath, deadline, cancellationToken) != preservedFile)
+            throw new ProjectWorkspaceException("outcome_unknown", "Project persistence changed the physical file contents; refresh inventory and inspect the file before retrying.");
+        return new ProjectFileActionResult(true, "ok", filePath is null ? "The project item was removed and its physical file was preserved." : "The existing file was registered in the project.", pid, savedSolutionPath, expectedProject, fullPath, false, false, false, true, true, true, filePath is not null, true, false, true, 0);
     }
 
     private static bool ContainsFileAfterMutation(ProjectItems? items, string path, ProjectTraversalBudget traversal,
         DateTimeOffset deadline, CancellationToken cancellationToken)
     {
         try { return ProjectItemTraversal.ContainsFile(items, path, 0, traversal, deadline, cancellationToken, ItemTraversalSource); }
-        catch (Exception) { throw new ProjectWorkspaceException("outcome_unknown", "The registration changed, but bounded membership verification did not finish; refresh inventory before retrying."); }
+        catch (Exception) { throw new ProjectWorkspaceException("outcome_unknown", "The registration changed, but bounded membership verification did not finish; refresh same-target inventory and restart this companion server before another mutation."); }
+    }
+
+    private static bool ContainsFileBeforeMutation(ProjectItems? items, string path, ProjectTraversalBudget traversal,
+        DateTimeOffset deadline, CancellationToken cancellationToken)
+    {
+        try { return ProjectItemTraversal.ContainsFile(items, path, 0, traversal, deadline, cancellationToken, ItemTraversalSource); }
+        catch (ProjectItemTraversalException ex) { throw new ProjectWorkspaceException(ex.Code, ex.Message); }
+    }
+
+    private static bool ItemHasChildren(ProjectItem item, ProjectTraversalBudget traversal,
+        DateTimeOffset deadline, CancellationToken cancellationToken)
+    {
+        try { return ProjectItemTraversal.HasChildren(item, traversal, deadline, cancellationToken, ItemTraversalSource); }
+        catch (ProjectItemTraversalException ex) { throw new ProjectWorkspaceException(ex.Code, ex.Message); }
     }
 
     private static ProjectItem? FindItem(ProjectItems? items, string logicalPath, string parent, string expectedPath, int depth,
@@ -302,8 +382,11 @@ public sealed class ProjectFileActionTools
     private static bool Absolute(string? path) => !string.IsNullOrWhiteSpace(path) && Path.IsPathFullyQualified(path);
     private static bool ValidFormat(string format) => string.Equals(format, "json", StringComparison.OrdinalIgnoreCase) || string.Equals(format, "text", StringComparison.OrdinalIgnoreCase);
     private static long Elapsed(long start) => (long)(Stopwatch.GetElapsedTime(start).TotalMilliseconds);
-    private static ProjectFileActionResult Result(bool success, string code, string message, int? pid, string? solution, string? project, string? file, long start) =>
-        new(success, code, message, pid, solution, project, file, false, false, false, false, false, Elapsed(start));
+    private static ProjectFileActionResult Result(bool success, string code, string message, int? pid, string? solution, string? project, string? file, long start,
+        bool? filePreserved = null, bool? changed = false, bool? registeredAfter = null, bool? persisted = null,
+        bool mayHaveChanged = false, bool refreshRequired = false) =>
+        new(success, code, message, pid, solution, project, file, false, false, false, filePreserved, changed,
+            changed, registeredAfter, persisted, mayHaveChanged, refreshRequired, Elapsed(start));
     private static string Format(ProjectFileActionResult result)
     {
         if (JsonSerializer.Serialize(result).Length > MaxResponseCharacters) result = result with { Message = "The result exceeded the response size limit." };

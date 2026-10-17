@@ -28,6 +28,14 @@ var selectedActionItem = ProjectItemTraversal.FindItem(projectTree, "Root\\Folde
 Check(ReferenceEquals(selectedActionItem, expectedSameName), "project-file traversal resolves logical ancestry and exact physical identity");
 Check(ProjectItemTraversal.ContainsFile(projectTree, expectedSameName.FilePath!, 0, actionBudget,
     DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource), "membership traversal reuses the action budget");
+Check(ProjectItemTraversal.ContainsFile(projectTree, expectedSameName.FilePath!, 0, new ProjectTraversalBudget(),
+    DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource), "existing-file membership is available for an add no-op check");
+var dependentItem = new FakeProjectItem("Parent.cs", Path.Combine(Path.GetTempPath(), "Parent.cs"),
+    new FakeProjectItems(new[] { new FakeProjectItem("Parent.Designer.cs", Path.Combine(Path.GetTempPath(), "Parent.Designer.cs")) }));
+Check(ProjectItemTraversal.HasChildren(dependentItem, new ProjectTraversalBudget(), DateTimeOffset.UtcNow.AddSeconds(2),
+    CancellationToken.None, actionSource), "project-file removal preflight detects dependent child items");
+Check(!ProjectItemTraversal.HasChildren(expectedSameName, new ProjectTraversalBudget(), DateTimeOffset.UtcNow.AddSeconds(2),
+    CancellationToken.None, actionSource), "project-file removal preflight accepts a leaf item");
 
 var exhaustedActionBudget = new ProjectTraversalBudget();
 for (var i = 0; i < ProjectTraversalBudget.MaxNodes - 1; i++) exhaustedActionBudget.TryVisit();
@@ -116,6 +124,23 @@ var unknownStateError = ProjectMutationPreflight.GetError(new bool?[] { true, nu
 Check(unknownStateError == "unsupported_state", "unavailable document state fails closed");
 
 Check(ProjectMutationPreflight.GetError(new bool?[] { true, true }) is null, "clean open documents allow project registration preflight");
+
+var fingerprintPath = Path.Combine(Path.GetTempPath(), "project-file-fingerprint-validation-" + Guid.NewGuid().ToString("N") + ".bin");
+try
+{
+    File.WriteAllBytes(fingerprintPath, new byte[] { 0, 1, 2, 3, 255 });
+    var fingerprint = ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None);
+    Check(fingerprint.Length == 5 && fingerprint.Sha256 == "FF5D8507B6A72BEE2DEBCE2C0054798DEACCDC5D8A1B945B6280CE8AA9CBA52E",
+        "physical file preservation fingerprint includes content and length");
+    File.WriteAllBytes(fingerprintPath, new byte[] { 0, 1, 2, 3, 254 });
+    Check(ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None) != fingerprint,
+        "physical file fingerprint detects changed content");
+    var expiredFingerprint = false;
+    try { ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddMilliseconds(-1), CancellationToken.None); }
+    catch (TimeoutException) { expiredFingerprint = true; }
+    Check(expiredFingerprint, "physical file fingerprint honors the caller deadline");
+}
+finally { File.Delete(fingerprintPath); }
 
 Console.WriteLine($"PASS {checkCount} ProjectWorkspaceValidation checks");
 

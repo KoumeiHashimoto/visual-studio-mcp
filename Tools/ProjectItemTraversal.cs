@@ -47,6 +47,24 @@ internal interface IProjectItemTraversalSource<TCollection, TItem>
 internal static class ProjectItemTraversal
 {
     /**
+      項目が子項目を持つか期限内に確認します。
+    */
+    internal static bool HasChildren<TCollection, TItem>(TItem item, ProjectTraversalBudget traversal,
+        DateTimeOffset deadline, CancellationToken cancellationToken,
+        IProjectItemTraversalSource<TCollection, TItem> source)
+        where TCollection : class
+        where TItem : class
+    {
+        ProjectTraversalBudget.CheckDeadline(deadline, cancellationToken);
+        var children = source.GetChildren(item);
+        ProjectTraversalBudget.CheckDeadline(deadline, cancellationToken);
+        if (children is null) return false;
+        var count = source.GetCount(children);
+        ProjectTraversalBudget.CheckDeadline(deadline, cancellationToken);
+        return count > 0;
+    }
+
+    /**
       論理パスと物理パスが一致する項目を、共有予算と期限内で探します。
     */
     internal static TItem? FindItem<TCollection, TItem>(TCollection? items, string logicalPath, string parent,
