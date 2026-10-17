@@ -78,6 +78,25 @@ dotnet run --project .\tests\BreakpointValidation\BreakpointValidation.csproj
 
 The 38 policy, bounds, and event-completion checks also run without Visual Studio. On Windows, 5 additional STA dispatcher checks cover apartment selection, exception preservation, expired queued work, and guaranteed cleanup. These dispatcher checks do not exercise live Visual Studio COM calls or replace the required native C++ and C# Visual Studio 2026 sessions.
 
+## v1.2 report corrections
+
+The four legacy read-only tools preserve their successful output formats. Dispatch failures now return JSON with `Success=false`, a stable `Code`, and an actionable `Message`. Codes include `dte_unavailable`, `no_solution` (solution information only), `dte_disconnected`, `com_busy`, `com_timeout`, `com_error`, and `operation_failed`. Exception diagnostics include only the tool identifier, exception type and HRESULT; exception text and stacks are deliberately omitted to avoid leaking credentials or user data. This improves diagnosis; it does not establish the cause of a historical failure that stopped reproducing after an IDE restart.
+
+Thread listing now includes `CurrentThreadId`, using the same observed ID for every `IsCurrent` flag. Locals and expression evaluation reject missing thread IDs with `thread_not_found` and existing non-current IDs with `thread_not_current`, including selection guidance. At most 512 threads are searched; an inconclusive capped search returns `thread_lookup_incomplete`. These checks do not select a thread or evaluate an expression.
+
+The frame provider reads `EnvDTE90a.StackFrame2.FileName` and `LineNumber` without selecting a frame. Complete, bounded coordinates return `SourceLocationAvailable=true` with a null reason. Other frames return `File=null`, `Line=null`, `SourceLocationAvailable=false`, and a stable `SourceLocationUnavailableReason`: `source_location_interface_unavailable`, `source_location_not_reported`, `source_location_com_error`, or `source_location_exceeds_limit`. Missing coordinates do not by themselves imply missing symbols. Source paths are capped at 2048 characters and line numbers must fit a positive Int32. See the [StackFrame2 API](https://learn.microsoft.com/en-us/dotnet/api/envdte90a.stackframe2?view=visualstudiosdk-2022).
+
+Frame `Language` is a stable identifier: `cpp`, `csharp`, `basic`, `fsharp`, `javascript`, `typescript`, `python`, `sql`, or `unknown`. `LanguageDisplayName` retains the original IDE label. Unsupported/localized labels normalize to `unknown`. Clients that consumed empty strings/zero coordinates or raw language labels should use the explicit availability fields and display label instead.
+
+Additional regression harnesses:
+
+```powershell
+dotnet run --project .\tests\DebuggerMetadataValidation -c Release
+dotnet run --project .\tests\ReadOnlyToolValidation -c Release
+```
+
+The metadata harness checks three cultures and serialized null coordinates. The read-only harness injects failures into the actual tool entry points and Windows STA dispatcher with a fake connector; it does not reproduce a physical DTE disconnection.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

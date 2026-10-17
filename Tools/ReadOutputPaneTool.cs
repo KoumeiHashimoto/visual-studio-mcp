@@ -24,18 +24,21 @@ public static class ReadOutputPaneTool
             return "Error: paneName is required. Use ListOutputPanes to see available panes.";
         }
 
-        var content = StaComDispatcher.Invoke(() => VisualStudioConnector.ReadOutputPane(paneName, maxLines));
-
-        if (content == null)
+        return ReadOnlyToolInvocation.Invoke("read_output_pane", () =>
         {
-            return $"Error: Could not find output pane matching '{paneName}'. Use ListOutputPanes to see available panes.";
-        }
+            var content = VisualStudioConnector.ReadOutputPane(paneName, maxLines);
 
-        if (string.IsNullOrWhiteSpace(content))
-        {
-            return $"Output pane '{paneName}' is empty.";
-        }
+            if (content == null)
+            {
+                return $"Error: Could not find output pane matching '{paneName}'. Use ListOutputPanes to see available panes.";
+            }
 
-        return McpOutputBounds.Limit(content);
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return $"Output pane '{paneName}' is empty.";
+            }
+
+            return McpOutputBounds.Limit(content);
+        });
     }
 }
