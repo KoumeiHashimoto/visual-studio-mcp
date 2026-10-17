@@ -43,7 +43,7 @@ internal interface IBuildOperationAdapter
     BuildTargetSnapshot ReadTargetSnapshot();
     IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone);
     void Dispatch(BuildAction action, int correlationWindowMilliseconds);
-    void DisposeSubscription(IDisposable subscription);
+    Task DisposeSubscriptionAsync(IDisposable subscription);
 }
 
 internal sealed record BuildOperationResult(
@@ -166,6 +166,7 @@ internal sealed class BuildOperationCoordinator
             }
             catch (Exception ex)
             {
+                lock (_sync) active.SubscriptionCleanupUncertain = true;
                 Finish(active, "unknown", ExceptionCode(ex), Limit(ex.Message), null, null, false);
                 return active.Current;
             }
@@ -371,18 +372,33 @@ internal sealed class BuildOperationCoordinator
     {
         lock (_sync)
         {
+            if (!op.Terminal || op.GateReleased || op.CleanupScheduled) return;
+            if (op.SubscriptionCleanupUncertain) return;
+            op.CleanupScheduled = true;
+        }
+
+        Task cleanup;
+        try
+        {
+            cleanup = subscription is null ? Task.CompletedTask : _adapter.DisposeSubscriptionAsync(subscription);
+        }
+        catch { return; }
+
+        _ = ReleaseAfterCleanupAsync(op, cleanup);
+    }
+
+    private async Task ReleaseAfterCleanupAsync(ActiveOperation op, Task cleanup)
+    {
+        try { await cleanup.ConfigureAwait(false); }
+        catch { return; }
+
+        lock (_sync)
+        {
             if (!op.Terminal || op.GateReleased) return;
             op.GateReleased = true;
+            if (ReferenceEquals(_active, op)) _active = null;
         }
-        try { if (subscription is not null) _adapter.DisposeSubscription(subscription); }
-        finally
-        {
-            lock (_sync)
-            {
-                if (ReferenceEquals(_active, op)) _active = null;
-            }
-            _workspaceGate.Release();
-        }
+        _workspaceGate.Release();
     }
 
     private static string? ValidateTarget(BuildTargetSnapshot target, string expectedPath, int pid, long ticks)
@@ -438,7 +454,7 @@ internal sealed class BuildOperationCoordinator
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public BuildOperationResult Current { get; set; } = null!;
         public IDisposable? Subscription { get; set; }
-        public bool Dispatching, Dispatched, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, GateReleased;
+        public bool Dispatching, Dispatched, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, SubscriptionCleanupUncertain, CleanupScheduled, GateReleased;
         public string? ForeignActivityReason { get; set; }
         public BuildEventSnapshot? DoneEvent { get; set; }
     }

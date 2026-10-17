@@ -228,6 +228,39 @@ foreach (var action in Enum.GetValues<BuildAction>())
 }
 
 {
+    var gate = new WorkspaceMutationGate();
+    var cleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, CleanupBarrier = cleanup };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true);
+    Check(result.Outcome == "succeeded" && adapter.DetachCount == 0,
+        "terminal build waits for queued STA event-subscription cleanup");
+    Check(!gate.TryAcquire(), "build keeps project mutations blocked while event cleanup is pending");
+    cleanup.SetResult();
+    Check(SpinWait.SpinUntil(() => gate.TryAcquire(), TimeSpan.FromSeconds(1)),
+        "successful event-subscription cleanup releases the shared gate");
+    gate.Release();
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, FailCleanup = true };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true);
+    Check(result.Outcome == "succeeded", "build result remains queryable when event cleanup fails");
+    Check(!gate.TryAcquire(), "failed event-subscription cleanup retains the shared gate fail-safe");
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget) { FailSubscribeAfterAttach = true };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true);
+    Check(result.Outcome == "unknown", "partial event subscription failure reports an uncertain operation");
+    Check(!gate.TryAcquire(), "partial event subscription failure retains the shared gate fail-safe");
+}
+
+{
     var coordinator = new BuildOperationCoordinator(new FakeAdapter(validTarget) { CompleteDuringDispatch = true });
     var ids = new List<string>();
     for (var i = 0; i < 35; i++)
@@ -254,6 +287,9 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
     public bool HasBuildResult { get; init; } = true;
     public bool BeginOnSubscribe { get; init; }
     public bool BeginDuringDispatch { get; init; } = true;
+    public TaskCompletionSource? CleanupBarrier { get; init; }
+    public bool FailCleanup { get; init; }
+    public bool FailSubscribeAfterAttach { get; init; }
     public string? EventSolutionPath { get; init; }
     public int DispatchCount { get; private set; }
     public int DetachCount { get; private set; }
@@ -266,6 +302,7 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
         _begin = onBegin;
         _done = onDone;
         if (BeginOnSubscribe) _begin(new BuildEventSnapshot(snapshot.SolutionPath, true, false, null, false));
+        if (FailSubscribeAfterAttach) throw new InvalidOperationException("subscription attach failed after a partial registration");
         return new Detach(this);
     }
     public void Dispatch(BuildAction action, int correlationWindowMilliseconds)
@@ -279,7 +316,17 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
         if (BeginDuringDispatch) _begin?.Invoke(new BuildEventSnapshot(path, true, false, null, true));
         _done?.Invoke(new BuildEventSnapshot(path, DoneStillInProgress, false, FailedCount, true) { IsTerminalState = TerminalState, HasBuildResult = HasBuildResult });
     }
-    public void DisposeSubscription(IDisposable subscription) => subscription.Dispose();
+    public Task DisposeSubscriptionAsync(IDisposable subscription)
+    {
+        if (FailCleanup) return Task.FromException(new InvalidOperationException("cleanup failed"));
+        return DisposeAsync();
+
+        async Task DisposeAsync()
+        {
+            if (CleanupBarrier is not null) await CleanupBarrier.Task.ConfigureAwait(false);
+            subscription.Dispose();
+        }
+    }
     public void RaiseBegin(BuildEventSnapshot evt) => _begin?.Invoke(evt);
     public void RaiseDone(BuildEventSnapshot evt) => _done?.Invoke(evt);
     private sealed class Detach(FakeAdapter adapter) : IDisposable

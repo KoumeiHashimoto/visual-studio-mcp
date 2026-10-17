@@ -103,11 +103,7 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
         finally { _dispatching = false; }
     }, TimeSpan.FromSeconds(10));
 
-    public void DisposeSubscription(IDisposable subscription) => _ = StaComDispatcher.Invoke(() =>
-    {
-        subscription.Dispose();
-        return true;
-    }, TimeSpan.FromSeconds(5));
+    public Task DisposeSubscriptionAsync(IDisposable subscription) => StaComDispatcher.Post(subscription.Dispose);
 
     private void OnBuildBegin(vsBuildScope scope, vsBuildAction action)
     {
