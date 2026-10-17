@@ -3,6 +3,11 @@ using VisualStudioMcpServer.Tools;
 
 var now = DateTimeOffset.UnixEpoch;
 var checkCount = 0;
+var traversalBudget = new ProjectTraversalBudget();
+for (var i = 0; i < ProjectTraversalBudget.MaxNodes; i++)
+    if (!traversalBudget.TryVisit()) throw new InvalidOperationException("Project traversal rejected a node before its limit.");
+Check(traversalBudget.VisitedCount == ProjectTraversalBudget.MaxNodes, "project traversal counts each accepted node");
+Check(!traversalBudget.TryVisit(), "project traversal rejects the first node beyond its limit");
 var store = new ProjectSnapshotStore(() => now);
 var project = CreateProject("project-a", new string('A', 8));
 Check(store.TryPut(project), "project snapshot stored");

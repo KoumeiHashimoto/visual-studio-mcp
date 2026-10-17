@@ -11,7 +11,7 @@ internal sealed class ProjectWorkspaceConnector
 {
     private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
     private const int MaxDepth = 32;
-    private const int MaxNodes = 10000;
+    private const int MaxNodes = ProjectTraversalBudget.MaxNodes;
     private readonly ProjectSnapshotStore _store;
 
     internal ProjectWorkspaceConnector(ProjectSnapshotStore store) => _store = store;
@@ -246,12 +246,22 @@ internal sealed class ProjectWorkspaceConnector
         string parentLogical, string wantedLogicalPath, int depth, HashSet<string> visited,
         DateTimeOffset deadline, CancellationToken cancellationToken)
     {
+        var traversal = new ProjectTraversalBudget();
+        return FindProject(projects, wantedPath, wantedKind, parentLogical, wantedLogicalPath,
+            depth, visited, traversal, deadline, cancellationToken);
+    }
+
+    private static Project? FindProject(Projects projects, string? wantedPath, string? wantedKind,
+        string parentLogical, string wantedLogicalPath, int depth, HashSet<string> visited,
+        ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
+    {
         CheckDeadline(deadline, cancellationToken);
         if (depth > MaxDepth) return null;
         var count = TryRead(() => projects.Count, 0, null);
-        for (var index = 1; index <= count && index <= MaxNodes; index++)
+        for (var index = 1; index <= count; index++)
         {
             CheckDeadline(deadline, cancellationToken);
+            if (!traversal.TryVisit()) throw TraversalLimitExceeded();
             Project? project;
             try { project = projects.Item(index); }
             catch (COMException) { continue; }
@@ -281,7 +291,7 @@ internal sealed class ProjectWorkspaceConnector
                     if (subproject is not null)
                     {
                         var found = FindProjectInFolder(subproject, wantedPath, wantedKind, wantedLogicalPath,
-                            name ?? string.Empty, depth + 1, visited, deadline, cancellationToken);
+                            name ?? string.Empty, depth + 1, visited, traversal, deadline, cancellationToken);
                         if (found is not null) return found;
                     }
                 }
@@ -293,7 +303,7 @@ internal sealed class ProjectWorkspaceConnector
 
     private static Project? FindProjectInFolder(Project project, string? wantedPath, string? wantedKind,
         string wantedLogicalPath, string parentLogical, int depth, HashSet<string> visited,
-        DateTimeOffset deadline, CancellationToken cancellationToken)
+        ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
     {
         CheckDeadline(deadline, cancellationToken);
         if (depth > MaxDepth) return null;
@@ -309,6 +319,8 @@ internal sealed class ProjectWorkspaceConnector
         var count = TryRead(() => items.Count, 0, null);
         for (var i = 1; i <= count; i++)
         {
+            CheckDeadline(deadline, cancellationToken);
+            if (!traversal.TryVisit()) throw TraversalLimitExceeded();
             try
             {
                 var child = items.Item(i)?.SubProject;
@@ -316,13 +328,16 @@ internal sealed class ProjectWorkspaceConnector
                 var key = child.FullName + "|" + child.Kind + "|" + child.Name;
                 if (!visited.Add(key)) continue;
                 var found = FindProjectInFolder(child, wantedPath, wantedKind, wantedLogicalPath,
-                    logical, depth + 1, visited, deadline, cancellationToken);
+                    logical, depth + 1, visited, traversal, deadline, cancellationToken);
                 if (found is not null) return found;
             }
             catch (COMException) { }
         }
         return null;
     }
+
+    private static ProjectWorkspaceException TraversalLimitExceeded() =>
+        new("unsupported_state", "Project re-resolution exceeded the 10000-node traversal limit.");
 
     internal DTE2 GetBoundDte(int processId, long startTicks)
     {
