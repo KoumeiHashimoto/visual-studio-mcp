@@ -10,7 +10,7 @@ public class BuildOperationTools
 {
     private static readonly object Sync = new();
     private static BuildOperationCoordinator? _coordinator;
-    private static readonly SemaphoreSlim WorkspaceGate = WorkspaceMutationGate.Shared;
+    private static readonly WorkspaceMutationGate WorkspaceGate = WorkspaceMutationGate.Shared;
 
     [McpServerTool]
     [Description("Builds the solution for this registered Visual Studio instance. Explicitly set allowBuild=true and expectedSolutionPath. Open Folder workspaces require expectedWorkspaceRoot and return unsupported unless a public active build action can be verified.")]

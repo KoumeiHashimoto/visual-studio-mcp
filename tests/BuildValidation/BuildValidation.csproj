@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../BuildOperationCoordinator.cs" Link="BuildOperationCoordinator.cs" />
+    <Compile Include="../../WorkspaceMutationGate.cs" Link="WorkspaceMutationGate.cs" />
     <Compile Include="../../BuildEventOwnership.cs" Link="BuildEventOwnership.cs" />
     <Compile Include="../../Workspace/ActiveWorkspaceSnapshot.cs" Link="ActiveWorkspaceSnapshot.cs" />
     <Compile Include="../../Workspace/OpenFolderBuildPolicy.cs" Link="OpenFolderBuildPolicy.cs" />

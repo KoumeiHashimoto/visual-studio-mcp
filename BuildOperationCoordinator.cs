@@ -88,15 +88,15 @@ internal sealed class BuildOperationCoordinator
     private const int RetainedTerminalCount = 32;
     private const int MaxMessageLength = 1024;
     private readonly IBuildOperationAdapter _adapter;
-    private readonly SemaphoreSlim _workspaceGate;
+    private readonly WorkspaceMutationGate _workspaceGate;
     private readonly object _sync = new();
     private readonly LinkedList<BuildOperationResult> _terminal = new();
     private ActiveOperation? _active;
 
-    public BuildOperationCoordinator(IBuildOperationAdapter adapter, SemaphoreSlim? processWorkspaceGate = null)
+    public BuildOperationCoordinator(IBuildOperationAdapter adapter, WorkspaceMutationGate? processWorkspaceGate = null)
     {
         _adapter = adapter;
-        _workspaceGate = processWorkspaceGate ?? new SemaphoreSlim(1, 1);
+        _workspaceGate = processWorkspaceGate ?? new WorkspaceMutationGate();
     }
 
     public async Task<BuildOperationResult> ExecuteAsync(
@@ -127,7 +127,7 @@ internal sealed class BuildOperationCoordinator
 
         try
         {
-            if (!await _workspaceGate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            if (!await _workspaceGate.TryAcquireAsync(cancellationToken).ConfigureAwait(false))
                 return Result(false, "build_busy", "Another workspace mutation or build is active.");
         }
         catch (OperationCanceledException) { return Result(false, "cancelled", "The caller cancelled before dispatch."); }

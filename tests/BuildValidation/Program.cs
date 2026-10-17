@@ -135,7 +135,7 @@ foreach (var action in Enum.GetValues<BuildAction>())
 }
 
 {
-    var gate = new SemaphoreSlim(1, 1);
+    var gate = new WorkspaceMutationGate();
     var adapter = new FakeAdapter(validTarget);
     var coordinator = new BuildOperationCoordinator(adapter, gate);
     var first = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
@@ -145,12 +145,12 @@ foreach (var action in Enum.GetValues<BuildAction>())
     Check(blocked.Code == "build_busy", "concurrent workspace mutation is rejected");
     adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
     Check(coordinator.GetStatus(first.OperationId).Outcome == "succeeded", "late completion releases and records operation");
-    Check(gate.Wait(0), "gate released only after terminal event");
+    Check(gate.TryAcquire(), "gate released only after terminal event");
     gate.Release();
 }
 
 {
-    var gate = new SemaphoreSlim(1, 1);
+    var gate = new WorkspaceMutationGate();
     var adapter = new FakeAdapter(validTarget);
     var coordinator = new BuildOperationCoordinator(adapter, gate);
     var initial = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
@@ -159,12 +159,12 @@ foreach (var action in Enum.GetValues<BuildAction>())
     Check(coordinator.GetStatus(initial.OperationId).State == "running", "owned begin delivered after dispatch is accepted");
     adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
     Check(coordinator.GetStatus(initial.OperationId).Outcome == "succeeded", "delayed begin and completion finish the correlated operation");
-    Check(gate.Wait(0), "delayed correlated completion releases the gate");
+    Check(gate.TryAcquire(), "delayed correlated completion releases the gate");
     gate.Release();
 }
 
 {
-    var gate = new SemaphoreSlim(1, 1);
+    var gate = new WorkspaceMutationGate();
     var adapter = new FakeAdapter(validTarget);
     var coordinator = new BuildOperationCoordinator(adapter, gate);
     using var cts = new CancellationTokenSource();
@@ -173,11 +173,58 @@ foreach (var action in Enum.GetValues<BuildAction>())
     cts.Cancel();
     var cancelled = await operation;
     Check(cancelled.Code == "cancelled" && !cancelled.Success, "caller cancellation stops only the wait");
-    Check(!gate.Wait(0), "cancellation after dispatch retains the workspace gate");
+    Check(!gate.TryAcquire(), "cancellation after dispatch retains the workspace gate");
     adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
     Check(coordinator.GetStatus(cancelled.OperationId).Outcome == "succeeded", "operation still completes after caller cancellation");
-    Check(gate.Wait(0), "terminal event releases the gate after caller cancellation");
+    Check(gate.TryAcquire(), "terminal event releases the gate after caller cancellation");
     gate.Release();
+}
+
+foreach (var action in Enum.GetValues<BuildAction>())
+{
+    var gate = new WorkspaceMutationGate();
+    Check(gate.TryAcquire(), $"project registration acquires shared gate before {action}");
+    var adapter = new FakeAdapter(validTarget);
+    var result = await new BuildOperationCoordinator(adapter, gate).ExecuteAsync(
+        action, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Code == "build_busy" && adapter.DispatchCount == 0,
+        $"{action} is blocked while a project registration holds the shared gate");
+    gate.Release();
+}
+
+foreach (var action in Enum.GetValues<BuildAction>())
+{
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget);
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var pending = await coordinator.ExecuteAsync(action, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(pending.Code == "build_wait_timeout" && !gate.TryAcquire(),
+        $"{action} keeps project mutations blocked while build outcome is pending");
+    adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
+    Check(gate.TryAcquire(), $"{action} releases project mutations after correlated completion");
+    gate.Release();
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var cleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    Check(gate.TryAcquire(), "project mutation acquires the gate before uncertain cleanup");
+    var release = gate.ReleaseAfter(cleanup.Task);
+    Check(!gate.TryAcquire(), "uncertain project mutation retains the gate until queued cleanup settles");
+    cleanup.SetResult();
+    await release.WaitAsync(TimeSpan.FromSeconds(1));
+    Check(gate.TryAcquire(), "successful queued cleanup releases the project mutation gate");
+    gate.Release();
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var cleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    Check(gate.TryAcquire(), "project mutation acquires the gate before failed cleanup");
+    var release = gate.ReleaseAfter(cleanup.Task);
+    cleanup.SetException(new InvalidOperationException("cleanup marker failed"));
+    await release.WaitAsync(TimeSpan.FromSeconds(1));
+    Check(!gate.TryAcquire(), "failed cleanup keeps the shared gate closed fail-safe");
 }
 
 {

@@ -165,7 +165,7 @@ public sealed class ProjectFileActionTools
         if (projects!.TargetProcessId != pid || projects.TargetProcessStartUtcTicks != ticks || (files is not null && (files.TargetProcessId != pid || files.TargetProcessStartUtcTicks != ticks))) return Format(Result(false, "stale_target", "The snapshot belongs to another Visual Studio process identity.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
         if (fileSnapshotId is not null && (selectedItem?.FullPath is null || selectedItem.IsFolder || selectedItem.FileCount != 1)) return Format(Result(false, "ambiguous_file", "Only an unambiguous single-file project item can be removed.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
         if (fileSnapshotId is null && !SafeLocalFile(selected.ProjectPath, filePath ?? string.Empty)) return Format(Result(false, "invalid_file_path", "The file must be an existing local regular file inside the project directory and outside generated or metadata directories.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
-        if (!WorkspaceMutationGate.Shared.Wait(0)) return Format(Result(false, "workspace_busy", "Another build or project mutation is in progress.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
+        if (!WorkspaceMutationGate.Shared.TryAcquire()) return Format(Result(false, "workspace_busy", "Another build or project mutation is in progress.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
         var transferLease = false;
         try
         {
@@ -178,14 +178,14 @@ public sealed class ProjectFileActionTools
         catch (OperationCanceledException)
         {
             transferLease = true;
-            _ = StaComDispatcher.Post(() => WorkspaceMutationGate.Shared.Release());
+            ReleaseAfterQueuedCleanup();
             Snapshots.InvalidateProject(projects.SnapshotId);
             return Format(Result(false, "outcome_unknown", "The request was cancelled while Visual Studio may still be processing it; the workspace remains locked until the queued operation settles. Refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
         }
         catch (TimeoutException)
         {
             transferLease = true;
-            _ = StaComDispatcher.Post(() => WorkspaceMutationGate.Shared.Release());
+            ReleaseAfterQueuedCleanup();
             Snapshots.InvalidateProject(projects.SnapshotId);
             return Format(Result(false, "outcome_unknown", "The Visual Studio operation exceeded its deadline; the workspace remains locked until the queued operation settles. Refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started));
         }
@@ -197,6 +197,12 @@ public sealed class ProjectFileActionTools
         catch (COMException ex) { Snapshots.InvalidateProject(projects.SnapshotId); return Format(Result(false, "outcome_unknown", $"Visual Studio returned HRESULT 0x{ex.HResult:X8}; refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started)); }
         catch (Exception) { Snapshots.InvalidateProject(projects.SnapshotId); return Format(Result(false, "outcome_unknown", "The project-file operation could not be verified; refresh inventory before retrying.", pid, expectedSolutionPath, expectedProjectPath, filePath ?? selectedItem?.FullPath, started)); }
         finally { if (!transferLease) WorkspaceMutationGate.Shared.Release(); }
+    }
+
+    private static void ReleaseAfterQueuedCleanup()
+    {
+        try { WorkspaceMutationGate.Shared.ReleaseAfter(StaComDispatcher.Post(static () => { })); }
+        catch { /* Keep the lease closed if the STA cannot accept its cleanup marker. */ }
     }
 
     private static ProjectFileActionResult MutateOnSta(ProjectInfoRecord selected, ProjectFileRecord? selectedItem,
