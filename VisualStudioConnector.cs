@@ -730,7 +730,9 @@ public static class VisualStudioConnector
                     break;
                 }
                 if (inspectedThread is null)
-                    return CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
+                    return threadCount > 512
+                        ? CreateInspectionError("thread_lookup_incomplete", "Thread lookup is limited to the first 512 threads. List threads again and retry with a thread ID from the returned range.")
+                        : CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
             }
 
             dynamic frames = inspectedThread.StackFrames;
