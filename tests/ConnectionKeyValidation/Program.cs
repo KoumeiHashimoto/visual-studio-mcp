@@ -52,13 +52,17 @@ static string B64(string text) => ConnectionKeyCodec.Base64UrlEncode(Encoding.UT
 static void StateTransitions()
 {
     var f = new Fixture(); var issued = f.Store.Issue(); Assert(issued.Result == ConnectionKeyResult.Success, "issue");
+    Assert(issued.ExpiresAt == f.Clock.UtcNow.AddSeconds(300), "pending expiry is 300s after issue");
     Assert(ConnectionKeyCodec.TryDecode(issued.Key, out var key), "decode issued");
     var reservation = f.Store.Reserve(key!.ToBearerValue(), f.Store.Identity); Assert(reservation.Result == ConnectionKeyResult.Success, "reserve");
     Assert(f.Store.FailClosed(reservation.ReservationId) == ConnectionKeyResult.Success, "fail closed");
     Assert(f.Store.Reserve(key.ToBearerValue(), f.Store.Identity).Result == ConnectionKeyResult.AlreadyUsed, "failed init stays closed");
-    var expiring = f.Store.Issue(); ConnectionKeyCodec.TryDecode(expiring.Key, out var expPayload);
-    f.Clock.Advance(TimeSpan.FromSeconds(120));
-    Assert(f.Store.Reserve(expPayload!.ToBearerValue(), f.Store.Identity).Result == ConnectionKeyResult.Expired, "expires at 120s");
+    var withinWindow = new Fixture(); var valid = withinWindow.Store.Issue(); ConnectionKeyCodec.TryDecode(valid.Key, out var validPayload);
+    withinWindow.Clock.Advance(TimeSpan.FromSeconds(299));
+    Assert(withinWindow.Store.Reserve(validPayload!.ToBearerValue(), withinWindow.Store.Identity).Result == ConnectionKeyResult.Success, "usable at 299s");
+    var atDeadline = new Fixture(); var expiring = atDeadline.Store.Issue(); ConnectionKeyCodec.TryDecode(expiring.Key, out var expPayload);
+    atDeadline.Clock.Advance(TimeSpan.FromSeconds(300));
+    Assert(atDeadline.Store.Reserve(expPayload!.ToBearerValue(), atDeadline.Store.Identity).Result == ConnectionKeyResult.Expired, "expires at 300s");
 }
 static void Reissue()
 {
