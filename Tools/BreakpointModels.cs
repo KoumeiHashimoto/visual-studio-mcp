@@ -84,6 +84,9 @@ public sealed class DebuggerInspectionResponse
     /// <summary>Gets or sets the ID of the current debugger thread, when available.</summary>
     public int? CurrentThreadId { get; set; }
 
+    /// <summary>Gets or sets the explicitly requested thread ID, when one was supplied.</summary>
+    public int? RequestedThreadId { get; set; }
+
     /// <summary>Gets or sets the total count before response bounding.</summary>
     public int? TotalCount { get; set; }
 
@@ -237,6 +240,9 @@ public sealed class DebuggerControlResponse
 /// </summary>
 public static class BreakpointRequestValidation
 {
+    /// <summary>Validates a one-based debugger frame index within the exposed stack bound.</summary>
+    public static bool IsValidFrameIndex(int index) => index is >= 1 and <= 128;
+
     /// <summary>Validates explicit authorization and supported debugger control actions.</summary>
     public static (string? Code, string? Message) ValidateDebuggerControl(string? action, bool allowDebuggerControl)
     {

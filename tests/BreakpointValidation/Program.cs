@@ -16,6 +16,10 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("source removal snapshot accepted", () => BreakpointRequestValidation.ValidateRemoval(1, "sample.cpp", 12, null, "", true), null),
     ("member depth lower bound", () => (BreakpointRequestValidation.ClampMemberDepth(-1).ToString(), null), "0"),
     ("member depth upper bound", () => (BreakpointRequestValidation.ClampMemberDepth(10).ToString(), null), "3"),
+    ("frame index 0 rejected", () => (BreakpointRequestValidation.IsValidFrameIndex(0).ToString(), null), "False"),
+    ("frame index 1 accepted", () => (BreakpointRequestValidation.IsValidFrameIndex(1).ToString(), null), "True"),
+    ("frame index 128 accepted", () => (BreakpointRequestValidation.IsValidFrameIndex(128).ToString(), null), "True"),
+    ("frame index 129 rejected", () => (BreakpointRequestValidation.IsValidFrameIndex(129).ToString(), null), "False"),
     ("member count lower bound", () => (BreakpointRequestValidation.ClampMemberCount(0).ToString(), null), "1"),
     ("member count upper bound", () => (BreakpointRequestValidation.ClampMemberCount(100).ToString(), null), "40"),
     ("current frame snapshot accepted", () => (BreakpointRequestValidation.MatchesFrameSnapshot(2, 5, 5, "Run", "Run", "Sample.dll", "Sample.dll").ToString(), null), "True"),
@@ -73,6 +77,15 @@ if (OperatingSystem.IsWindows())
     }
     catch (System.Runtime.InteropServices.COMException actual) when (ReferenceEquals(actual, expectedCom)) { }
 
+    var expectedTimeout = new TimeoutException("operation timeout probe");
+    try
+    {
+        VisualStudioMcpServer.StaComDispatcher.Invoke<int>(() => throw expectedTimeout);
+        throw new Exception("The dispatcher did not report a timeout thrown by the operation.");
+    }
+    catch (VisualStudioMcpServer.StaComInvocationTimeoutException actual)
+        when (actual.ExecutionStarted && ReferenceEquals(actual.InnerException, expectedTimeout)) { }
+
     using var entered = new ManualResetEventSlim();
     using var release = new ManualResetEventSlim();
     var blocker = Task.Run(() => VisualStudioMcpServer.StaComDispatcher.Invoke(() =>
@@ -92,7 +105,7 @@ if (OperatingSystem.IsWindows())
             VisualStudioMcpServer.StaComDispatcher.Invoke(() => expiredOperationRan = true, TimeSpan.FromMilliseconds(50));
             throw new Exception("The queued operation did not time out.");
         }
-        catch (TimeoutException) { }
+        catch (VisualStudioMcpServer.StaComInvocationTimeoutException ex) when (!ex.ExecutionStarted) { }
         cleanup = VisualStudioMcpServer.StaComDispatcher.Post(() => cleanupRan = true);
         try
         {
@@ -107,5 +120,27 @@ if (OperatingSystem.IsWindows())
     VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
     if (expiredOperationRan) throw new InvalidOperationException("An expired queued operation executed after its caller timed out.");
     if (!cleanupRan) throw new InvalidOperationException("Required cleanup was discarded when its caller stopped waiting.");
-    Console.WriteLine("Passed 5 Windows STA dispatcher checks.");
+
+    using var startedCallEntered = new ManualResetEventSlim();
+    using var startedCallRelease = new ManualResetEventSlim();
+    var executionStarted = false;
+    var startedCaller = Task.Run(() =>
+    {
+        try
+        {
+            VisualStudioMcpServer.StaComDispatcher.Invoke(() =>
+            {
+                startedCallEntered.Set();
+                if (!startedCallRelease.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Started-call blocker was not released.");
+                return true;
+            }, TimeSpan.FromMilliseconds(50));
+        }
+        catch (VisualStudioMcpServer.StaComInvocationTimeoutException ex) { executionStarted = ex.ExecutionStarted; }
+    });
+    if (!startedCallEntered.Wait(TimeSpan.FromSeconds(2))) throw new TimeoutException("Started-call blocker did not start.");
+    startedCaller.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+    startedCallRelease.Set();
+    VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
+    if (!executionStarted) throw new InvalidOperationException("The dispatcher did not report that the timed-out COM operation had started.");
+    Console.WriteLine("Passed 8 Windows STA dispatcher checks.");
 }

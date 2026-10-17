@@ -78,6 +78,37 @@ foreach (var tool in tools)
 var solutionJson = JObject.Parse(GetSolutionInfoTool.GetSolutionInfo("json"));
 Check(solutionJson.Value<string>("SolutionName") == "Sample.sln" && solutionJson["Success"] == null, "Successful solution JSON shape must remain unchanged.");
 Check(GetSolutionInfoTool.GetSolutionInfo().StartsWith("Current Solution:\n"), "Successful solution text must remain unchanged.");
+VisualStudioConnector.Solution = new SolutionInfo
+{
+    SolutionName = "OpenFolderFixture",
+    SolutionPath = string.Empty,
+    Projects = new List<string>(),
+    WorkspaceKind = "openFolder",
+    WorkspaceRoot = "C:\\fixtures\\open-folder",
+    CMakeMetadataStatus = "unsupported",
+    CMakeMetadataReason = "fixture CMake metadata reason",
+    ActiveConfigurationStatus = "unsupported",
+    ActiveConfigurationReason = "fixture active configuration reason",
+    StartupTargetStatus = "unsupported",
+    StartupTargetReason = "fixture startup target reason"
+};
+var workspaceText = GetSolutionInfoTool.GetSolutionInfo();
+Check(workspaceText.Contains("Current Open Folder Workspace:") && workspaceText.Contains("Workspace kind: openFolder") &&
+    workspaceText.Contains("Workspace root: C:\\fixtures\\open-folder") &&
+    workspaceText.Contains("CMake metadata: unsupported (fixture CMake metadata reason)") &&
+    workspaceText.Contains("Active configuration: unsupported (fixture active configuration reason)") &&
+    workspaceText.Contains("Startup target: unsupported (fixture startup target reason)"),
+    "Open Folder text must preserve workspace and unsupported metadata.");
+var workspaceJson = JObject.Parse(GetSolutionInfoTool.GetSolutionInfo("json"));
+Check(workspaceJson.Value<string>("WorkspaceKind") == "openFolder" &&
+    workspaceJson.Value<string>("WorkspaceRoot") == "C:\\fixtures\\open-folder" &&
+    workspaceJson.Value<string>("CMakeMetadataStatus") == "unsupported" &&
+    workspaceJson.Value<string>("CMakeMetadataReason") == "fixture CMake metadata reason" &&
+    workspaceJson.Value<string>("ActiveConfigurationStatus") == "unsupported" &&
+    workspaceJson.Value<string>("ActiveConfigurationReason") == "fixture active configuration reason" &&
+    workspaceJson.Value<string>("StartupTargetStatus") == "unsupported" &&
+    workspaceJson.Value<string>("StartupTargetReason") == "fixture startup target reason",
+    "Open Folder JSON must preserve workspace and unsupported metadata.");
 VisualStudioConnector.Solution = null;
 Error(GetSolutionInfoTool.GetSolutionInfo(), "no_solution");
 Check(GetErrorListTool.GetErrorList() == "No errors or warnings in the Error List.", "Empty error list text must remain unchanged.");

@@ -17,6 +17,8 @@ using VisualStudioMcpServer;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Server;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.ConnectionKeys;
+using VisualStudioMcpServer.Workspace;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -91,13 +93,26 @@ internal static class Program
         StaComDispatcher.Start();
         var tokenBytes = RandomNumberGenerator.GetBytes(32);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        var serverInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16));
+        ConnectionKeyStore? connectionKeys = null;
+        var workspaceSnapshots = new ActiveWorkspaceSnapshotStore(options.ParentPid, options.ParentStartTicks);
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.WebHost.ConfigureKestrel(server => server.Limits.MaxRequestBodySize = 1024 * 1024);
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddMcpServer()
-            .WithHttpTransport(options => options.SessionMode = HttpServerSessionMode.Stateless)
+#pragma warning disable MCP9006 // Issue #43 pins the legacy stateful session contract for native SDK clients.
+            .WithHttpTransport(options =>
+            {
+                options.SessionMode = HttpServerSessionMode.Stateful;
+                options.IdleTimeout = TimeSpan.FromMinutes(30);
+                options.MaxIdleSessionCount = 16;
+            })
+#pragma warning restore MCP9006
             .WithTools<ReadOnlyHttpTools>()
-            .WithTools<DebuggerHttpTools>();
+            .WithTools<DebuggerHttpTools>()
+            .WithTools<BuildOperationTools>()
+            .WithTools<ProjectInventoryTools>()
+            .WithTools<ProjectFileActionTools>();
 
         await using var app = builder.Build();
         app.Use(async (context, next) =>
@@ -125,21 +140,79 @@ internal static class Program
             }
 
             var authorization = context.Request.Headers.Authorization.ToString();
-            var suppliedToken = authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                ? authorization[7..].Trim()
-                : string.Empty;
-            if (!TokenEquals(token, suppliedToken))
+            if (!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed(authorization,
+                    context.Request.Headers.Authorization.Count))
             {
-                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                var containsOwnerCredential = context.Request.Headers.Authorization.Any(value =>
+                    value is not null && value.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) &&
+                    TokenEquals(token, value[7..].Trim()));
+                if (!containsOwnerCredential) connectionKeys?.RecordFailedKeyAuth();
+                var limited = connectionKeys?.IsKeyAuthRateLimited() == true;
+                context.Response.StatusCode = limited ? StatusCodes.Status429TooManyRequests : StatusCodes.Status401Unauthorized;
+                if (limited) context.Response.Headers.RetryAfter = "5";
                 return;
             }
-
-            await next();
+            if (connectionKeys is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                return;
+            }
+            await ConnectionKeyHttpAuthorization.InvokeAsync(context, connectionKeys,
+                candidate => TokenEquals(token, candidate), _ => next());
         });
         app.MapPost("/_vsix/shutdown", (IHostApplicationLifetime lifetime) =>
         {
             lifetime.StopApplication();
             return Results.Ok();
+        });
+        app.MapPost("/_vsix/connection-key/issue", async (HttpContext context) =>
+        {
+            var store = connectionKeys;
+            if (store is null) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            var issuanceId = await TryReadIssuanceIdAsync(context.Request);
+            if (issuanceId is null) return Results.Json(new { code = "invalid_argument", message = "The issuance identifier is invalid.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            var result = store.Issue(issuanceId.Value);
+            if (result.Result != ConnectionKeyResult.Success || result.Key is null)
+                return result.Result == ConnectionKeyResult.CapacityExceeded
+                    ? Results.Json(new { code = "key_capacity_exceeded", message = "Connection-key capacity is full.", retryable = true, mayHaveChanged = false }, statusCode: StatusCodes.Status429TooManyRequests)
+                    : Results.Json(new { code = "key_issue_failed", message = "The connection key could not be issued.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status409Conflict);
+            return Results.Json(new
+            {
+                issuanceId = result.IssuanceId.ToString("N"),
+                key = result.Key,
+                expiresAt = result.ExpiresAt?.ToUnixTimeSeconds() ?? 0
+            });
+        });
+        app.MapPost("/_vsix/connection-key/cancel", async (HttpContext context) =>
+        {
+            var issuanceId = await TryReadIssuanceIdAsync(context.Request);
+            if (issuanceId is null) return Results.Json(new { code = "invalid_argument", message = "The issuance identifier is invalid.", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            var result = connectionKeys?.CancelPending(issuanceId.Value) ?? ConnectionKeyResult.NotFound;
+            return result == ConnectionKeyResult.Success ? Results.NoContent() : Results.NotFound();
+        });
+        app.MapPost("/_vsix/connection-key/revoke-all", () =>
+        {
+            connectionKeys?.RevokeAll();
+            return Results.NoContent();
+        });
+        app.MapPost("/_vsix/connection-key/status", () =>
+        {
+            var status = connectionKeys?.GetStatus();
+            if (status is null) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+            return Results.Json(new
+            {
+                pendingCount = status.PendingCount,
+                activeCount = status.ActiveCount,
+                nearestExpiry = status.NearestExpiry?.ToUnixTimeSeconds()
+            });
+        });
+        app.MapPost("/_vsix/workspace/snapshot", async (HttpContext context) =>
+        {
+            var update = await TryReadWorkspaceSnapshotAsync(context.Request);
+            if (update is null) return Results.Json(new { code = "invalid_workspace_snapshot", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            if (!workspaceSnapshots.TryUpdate(update.ToSnapshot()))
+                return Results.Json(new { code = "workspace_identity_mismatch", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status409Conflict);
+            return Results.NoContent();
         });
         app.MapMcp("/mcp");
 
@@ -152,8 +225,13 @@ internal static class Program
             throw new InvalidOperationException("The HTTP listener did not publish its bound loopback address.");
         }
 
-        var endpoint = new ServerEndpoint(options.ParentPid, Environment.ProcessId,
-            new Uri(uri, "/mcp").ToString(), token);
+        var mcpUrl = new Uri(uri, "/mcp").ToString();
+        var keyClock = new SystemConnectionKeyClock();
+        connectionKeys = new ConnectionKeyStore(keyClock, keyClock, options.ParentPid,
+            options.ParentStartTicks, Environment.ProcessId, serverInstanceId, mcpUrl);
+        ActiveWorkspaceSnapshotStoreAccessor.Set(workspaceSnapshots);
+        var endpoint = new ServerEndpoint(2, options.ParentPid, options.ParentStartTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Environment.ProcessId, serverInstanceId, mcpUrl, token);
         var descriptorDirectory = Path.GetDirectoryName(options.EndpointFile)
             ?? throw new InvalidOperationException("Endpoint file directory is missing.");
         Directory.CreateDirectory(descriptorDirectory);
@@ -170,6 +248,9 @@ internal static class Program
         {
             monitorCancellation.Cancel();
             try { await parentMonitor; } catch (OperationCanceledException) { }
+            connectionKeys.RevokeAll();
+            ProjectInventoryTools.SnapshotStore.InvalidateAll();
+            ActiveWorkspaceSnapshotStoreAccessor.Clear(workspaceSnapshots);
             try { File.Delete(options.EndpointFile); } catch (IOException) { }
         }
     }
@@ -205,7 +286,63 @@ internal static class Program
         return expectedBytes.Length == actualBytes.Length && CryptographicOperations.FixedTimeEquals(expectedBytes, actualBytes);
     }
 
-    private sealed record ServerEndpoint(int ParentPid, int ServerPid, string Url, string Token);
+    private static async Task<Guid?> TryReadIssuanceIdAsync(HttpRequest request)
+    {
+        try
+        {
+            using var document = await JsonDocument.ParseAsync(request.Body,
+                new JsonDocumentOptions { MaxDepth = 4 }, request.HttpContext.RequestAborted);
+            var root = document.RootElement;
+            return root.ValueKind == JsonValueKind.Object && root.TryGetProperty("issuanceId", out var value) &&
+                value.ValueKind == JsonValueKind.String && Guid.TryParseExact(value.GetString(), "N", out var id)
+                ? id : null;
+        }
+        catch (JsonException) { return null; }
+        catch (IOException) { return null; }
+    }
+
+    private static async Task<WorkspaceSnapshotUpdate?> TryReadWorkspaceSnapshotAsync(HttpRequest request)
+    {
+        if (request.ContentLength is > 4096) return null;
+        request.EnableBuffering(4096, 4096);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[1024];
+        try
+        {
+            while (buffer.Length <= 4096)
+            {
+                var count = await request.Body.ReadAsync(chunk.AsMemory(0,
+                    Math.Min(chunk.Length, 4097 - (int)buffer.Length)), request.HttpContext.RequestAborted);
+                if (count == 0) break;
+                buffer.Write(chunk, 0, count);
+            }
+            if (buffer.Length > 4096) return null;
+            request.Body.Position = 0;
+            return JsonSerializer.Deserialize<WorkspaceSnapshotUpdate>(buffer.ToArray(),
+                new JsonSerializerOptions { MaxDepth = 8, PropertyNameCaseInsensitive = true });
+        }
+        catch (JsonException) { return null; }
+        catch (IOException) { return null; }
+        finally { if (request.Body.CanSeek) request.Body.Position = 0; }
+    }
+
+    private sealed class WorkspaceSnapshotUpdate
+    {
+        public bool Active { get; set; }
+        public int VisualStudioPid { get; set; }
+        public long VisualStudioStartTicks { get; set; }
+        public long Generation { get; set; }
+        public string Root { get; set; } = string.Empty;
+        public string WorkspaceKind { get; set; } = string.Empty;
+        public string CMakeMetadataStatus { get; set; } = string.Empty;
+        public string CMakeMetadataReason { get; set; } = string.Empty;
+
+        public ActiveWorkspaceSnapshot ToSnapshot() => new(Active, VisualStudioPid, VisualStudioStartTicks,
+            Generation, Root, WorkspaceKind, CMakeMetadataStatus, CMakeMetadataReason);
+    }
+
+    private sealed record ServerEndpoint(int SchemaVersion, int ParentPid, string ParentStartTicks,
+        int ServerPid, string ServerInstanceId, string Url, string Token);
 
     private sealed record HttpOptions(int ParentPid, long ParentStartTicks, string EndpointFile)
     {
@@ -315,21 +452,30 @@ public sealed class DebuggerHttpTools
     [System.ComponentModel.Description("Selects a thread ID from the latest list_debugger_threads response and revalidates it against the bound paused debugger.")]
     public static string SelectDebuggerThread(int threadId) => DebuggerInspectionTool.SelectDebuggerThread(threadId);
 
-    /// <summary>Gets a bounded call stack for the current selected thread.</summary>
+    /// <summary>Gets a bounded call stack for the selected or specified thread without changing selection.</summary>
     [McpServerTool]
-    [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread in the bound paused debugger.")]
-    public static string GetCallStack() => DebuggerInspectionTool.GetDebuggerStack();
+    [System.ComponentModel.Description("Returns up to 128 stack frames for the current thread or an explicitly specified paused thread. The optional threadId is read-only and does not alter Visual Studio selection. Locals and expression evaluation remain bound to CurrentThreadId; select another thread before using those tools.")]
+    public static string GetCallStack(
+        [System.ComponentModel.Description("Optional positive thread ID from list_debugger_threads. Omit to inspect the currently selected thread.")]
+        int? threadId = null) =>
+        DebuggerInspectionTool.GetDebuggerStack(threadId);
 
     /// <summary>Selects a current stack frame after snapshot validation.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Selects a frame from the latest get_call_stack response after validating function, module, and total frame count.")]
-    public static string SelectDebuggerFrame(int index, string expectedFunction, string expectedModule, int totalFrameCount) =>
+    public static string SelectDebuggerFrame(
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int index,
+        string expectedFunction, string expectedModule, int totalFrameCount) =>
         DebuggerInspectionTool.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount);
 
     /// <summary>Reads bounded local values from a validated frame.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Reads up to 40 local/member values at depth 3. Member expansion requires allowMemberExpansion=true.")]
-    public static string GetDebuggerLocals(int frameIndex, string expectedFunction, string expectedModule,
+    public static string GetDebuggerLocals(
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
+        string expectedFunction, string expectedModule,
         int totalFrameCount, int threadId, int maxDepth = 1, int maxItems = 40, bool allowMemberExpansion = false) =>
         DebuggerInspectionTool.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
             totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion);
@@ -337,7 +483,10 @@ public sealed class DebuggerHttpTools
     /// <summary>Evaluates an expression with explicit evaluation and side-effect policy.</summary>
     [McpServerTool]
     [System.ComponentModel.Description("Evaluates an expression from a current paused frame. Requires allowEvaluation=true; automatic property/function evaluation additionally requires allowSideEffects=true.")]
-    public static string EvaluateExpression(string expression, int frameIndex, string expectedFunction,
+    public static string EvaluateExpression(string expression,
+        [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
+        [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
+        string expectedFunction,
         string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false) =>
         DebuggerExpressionTool.EvaluateExpression(expression, frameIndex, expectedFunction, expectedModule,
             totalFrameCount, threadId, allowEvaluation, allowSideEffects);

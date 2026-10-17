@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../ProjectSnapshotStore.cs" Link="ProjectSnapshotStore.cs" />
+    <Compile Include="../../ProjectTraversalBudget.cs" Link="ProjectTraversalBudget.cs" />
+    <Compile Include="../../Tools/ProjectItemTraversal.cs" Link="ProjectItemTraversal.cs" />
+    <Compile Include="../../ProjectFileFingerprint.cs" Link="ProjectFileFingerprint.cs" />
+    <Compile Include="../../ProjectMutationPreflight.cs" Link="ProjectMutationPreflight.cs" />
+    <Compile Include="../../Tools/ProjectWorkspaceModels.cs" Link="ProjectWorkspaceModels.cs" />
+  </ItemGroup>
+</Project>

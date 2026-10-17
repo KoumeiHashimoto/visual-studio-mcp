@@ -1,5 +1,6 @@
 ﻿using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.ComponentModel.DataAnnotations;
 using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 
@@ -17,7 +18,7 @@ public static class DebuggerInspectionTool
     public static string ListDebuggerThreads() => Invoke(VisualStudioConnector.ListDebuggerThreads);
 
     /// <summary>Lists stack frames in the bound paused debugger.</summary>
-    public static string GetDebuggerStack() => Invoke(VisualStudioConnector.GetDebuggerStack);
+    public static string GetDebuggerStack(int? threadId = null) => Invoke(() => VisualStudioConnector.GetDebuggerStack(threadId));
 
     /// <summary>Selects a thread by its current operating system thread ID.</summary>
     [McpServerTool]
@@ -30,7 +31,8 @@ public static class DebuggerInspectionTool
     [McpServerTool]
     [Description("Selects a stack frame from the latest get_call_stack response. The frame function is checked again to reject a stale index.")]
     public static string SelectDebuggerFrame(
-        [Description("One-based frame index from the latest get_call_stack response.")] int index,
+        [Description("One-based frame index from the latest get_call_stack response (1-128).")]
+        [Range(1, 128)] int index,
         [Description("Expected function name from that frame.")] string expectedFunction,
         [Description("Expected module name from that frame; pass an empty string when the debugger reports no module.")] string expectedModule,
         [Description("TotalCount from the latest get_call_stack response.")] int totalFrameCount) =>
@@ -40,7 +42,8 @@ public static class DebuggerInspectionTool
     [McpServerTool]
     [Description("Reads locals for a frame from the latest get_call_stack response. Results are bounded to 40 values, depth 3, and 256 characters per field. Member expansion is disabled by default because Natvis or data members can invoke debugger evaluation; opt in with allowMemberExpansion=true. Returns structured JSON.")]
     public static string GetDebuggerLocals(
-        [Description("One-based frame index from the latest get_call_stack response.")] int frameIndex,
+        [Description("One-based frame index from the latest get_call_stack response (1-128).")]
+        [Range(1, 128)] int frameIndex,
         [Description("Expected function name from that frame.")] string expectedFunction,
         [Description("Expected module name from that frame; pass an empty string when the debugger reports no module.")] string expectedModule,
         [Description("TotalCount from the latest get_call_stack response.")] int totalFrameCount,

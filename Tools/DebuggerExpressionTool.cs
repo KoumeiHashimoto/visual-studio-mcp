@@ -1,5 +1,6 @@
 ﻿using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.ComponentModel.DataAnnotations;
 using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 
@@ -16,7 +17,8 @@ public static class DebuggerExpressionTool
     [Description("Evaluates an expression on a frame from the latest get_call_stack response. Requires allowEvaluation=true. Automatic property/function evaluation is disabled unless allowSideEffects=true. Output and evaluation time are bounded; returns structured JSON.")]
     public static string EvaluateExpression(
         [Description("Expression text, limited to 1024 characters.")] string expression,
-        [Description("One-based frame index from the latest get_call_stack response.")] int frameIndex,
+        [Description("One-based frame index from the latest get_call_stack response (1-128).")]
+        [Range(1, 128)] int frameIndex,
         [Description("Expected function name from that frame.")] string expectedFunction,
         [Description("Expected module name from that frame; pass an empty string when the debugger reports no module.")] string expectedModule,
         [Description("TotalCount from the latest get_call_stack response.")] int totalFrameCount,

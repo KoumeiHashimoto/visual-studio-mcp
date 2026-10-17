@@ -5,6 +5,8 @@ using System.Text.RegularExpressions;
 using EnvDTE;
 using EnvDTE80;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.Workspace;
+using Newtonsoft.Json;
 
 namespace VisualStudioMcpServer;
 
@@ -19,6 +21,13 @@ public static class VisualStudioConnector
     private static int? _cachedProcessId;
     private static long? _targetProcessStartTicks;
     private static readonly SemaphoreSlim DebuggerControlGate = new(1, 1);
+
+    internal static bool TryGetTargetProcessIdentity(out int processId, out long startTicks)
+    {
+        processId = _targetProcessId.GetValueOrDefault();
+        startTicks = _targetProcessStartTicks.GetValueOrDefault();
+        return _targetProcessId.HasValue && _targetProcessStartTicks.HasValue;
+    }
 
     /// <summary>
     /// Sets the target Visual Studio process ID.
@@ -206,61 +215,55 @@ public static class VisualStudioConnector
     /// </summary>
     public static SolutionInfo? GetSolutionInfo()
     {
-        var dte = GetActiveVS();
-        if (dte?.Solution == null || string.IsNullOrEmpty(dte.Solution.FullName))
-            return null;
-
-        var info = new SolutionInfo
+        if (TryGetTargetProcessIdentity(out var processId, out var startTicks))
         {
-            SolutionPath = dte.Solution.FullName,
-            SolutionName = Path.GetFileName(dte.Solution.FullName),
-            Projects = new List<string>()
-        };
-
-        foreach (Project project in dte.Solution.Projects)
-        {
-            if (!string.IsNullOrEmpty(project.Name))
+            var workspace = ActiveWorkspaceSnapshotStoreAccessor.Get()?.GetCurrent();
+            if (workspace is not null && workspace.VisualStudioPid == processId &&
+                workspace.VisualStudioStartTicks == startTicks)
             {
-                info.Projects.Add(project.Name);
-                if (info.Projects.Count >= 100) break;
+                var root = Path.TrimEndingDirectorySeparator(workspace.Root);
+                return new SolutionInfo
+                {
+                    SolutionPath = string.Empty,
+                    SolutionName = Path.GetFileName(root),
+                    Projects = new List<string>(),
+                    WorkspaceKind = workspace.WorkspaceKind,
+                    WorkspaceRoot = root,
+                    CMakeMetadataStatus = workspace.CMakeMetadataStatus,
+                    CMakeMetadataReason = workspace.CMakeMetadataReason,
+                    ActiveConfigurationStatus = "unsupported",
+                    ActiveConfigurationReason = "The public Visual Studio Workspace API does not expose the active CMake configuration.",
+                    StartupTargetStatus = "unsupported",
+                    StartupTargetReason = "The public Visual Studio Workspace API does not expose the active CMake startup or debug target."
+                };
             }
         }
 
-        return info;
+        var dte = GetActiveVS();
+        if (dte?.Solution != null && !string.IsNullOrEmpty(dte.Solution.FullName))
+        {
+            var solutionInfo = new SolutionInfo
+            {
+                SolutionPath = dte.Solution.FullName,
+                SolutionName = Path.GetFileName(dte.Solution.FullName),
+                Projects = new List<string>()
+            };
+
+            foreach (Project project in dte.Solution.Projects)
+            {
+                if (!string.IsNullOrEmpty(project.Name))
+                {
+                    solutionInfo.Projects.Add(project.Name);
+                    if (solutionInfo.Projects.Count >= 100) break;
+                }
+            }
+
+            return solutionInfo;
+        }
+        return null;
     }
 
     // ==================== BUILD & DEBUG CONTROL ====================
-
-    /// <summary>
-    /// Builds the solution.
-    /// </summary>
-    /// <param name="waitForBuild">If true, waits for build to complete</param>
-    /// <returns>Build result info</returns>
-    public static BuildResult BuildSolution(bool waitForBuild = true)
-    {
-        var dte = GetActiveVS();
-        if (dte?.Solution == null)
-            return new BuildResult { Success = false, Message = "No solution is open" };
-
-        var solutionBuild = dte.Solution.SolutionBuild;
-
-        // Start the build
-        solutionBuild.Build(waitForBuild);
-
-        if (waitForBuild)
-        {
-            return new BuildResult
-            {
-                Success = solutionBuild.LastBuildInfo == 0,
-                ErrorCount = solutionBuild.LastBuildInfo,
-                Message = solutionBuild.LastBuildInfo == 0 
-                    ? "Build succeeded" 
-                    : $"Build failed with {solutionBuild.LastBuildInfo} error(s)"
-            };
-        }
-
-        return new BuildResult { Success = true, Message = "Build started" };
-    }
 
     /// <summary>
     /// Gets the current debugger state.
@@ -704,27 +707,51 @@ public static class VisualStudioConnector
     }
 
     /// <summary>
-    /// Lists stack frames in the current thread while execution is paused.
+    /// Lists stack frames in the current or explicitly requested thread without changing debugger selection.
     /// </summary>
-    public static DebuggerInspectionResponse GetDebuggerStack()
+    public static DebuggerInspectionResponse GetDebuggerStack(int? requestedThreadId = null)
     {
+        if (requestedThreadId is <= 0)
+            return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current paused process, or omit it to inspect the current thread.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
-            dynamic frames = dte.Debugger.CurrentThread.StackFrames;
+            dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentThreadId = (int)currentThread.ID;
+            dynamic inspectedThread = currentThread;
+            if (requestedThreadId.HasValue && requestedThreadId.Value != currentThreadId)
+            {
+                dynamic threads = dte.Debugger.CurrentProgram.Threads;
+                var threadCount = (int)threads.Count;
+                inspectedThread = null!;
+                for (var threadIndex = 1; threadIndex <= Math.Min(threadCount, 512); threadIndex++)
+                {
+                    dynamic candidate = threads.Item(threadIndex);
+                    if ((int)candidate.ID != requestedThreadId.Value) continue;
+                    inspectedThread = candidate;
+                    break;
+                }
+                if (inspectedThread is null)
+                    return threadCount > 512
+                        ? CreateInspectionError("thread_lookup_incomplete", "Thread lookup is limited to the first 512 threads. List threads again and retry with a thread ID from the returned range.")
+                        : CreateInspectionError("stale_thread_id", "Thread ID is not present in the current paused process. List threads again.");
+            }
+
+            dynamic frames = inspectedThread.StackFrames;
             var count = (int)frames.Count;
             var items = new List<DebuggerFrameInfo>();
             var returned = Math.Min(count, 128);
-            dynamic currentFrame = dte.Debugger.CurrentStackFrame;
-            dynamic currentThread = dte.Debugger.CurrentThread;
-            var currentFunction = ReadBoundedString(() => (string?)currentFrame.FunctionName);
-            var currentModule = ReadBoundedString(() => (string?)currentFrame.Module);
+            dynamic currentFrame = null!;
+            if (requestedThreadId is null || requestedThreadId.Value == currentThreadId)
+                currentFrame = dte.Debugger.CurrentStackFrame;
+            var currentFunction = currentFrame is null ? string.Empty : ReadBoundedString(() => (string?)currentFrame.FunctionName);
+            var currentModule = currentFrame is null ? string.Empty : ReadBoundedString(() => (string?)currentFrame.Module);
             var markedCurrent = false;
             for (var index = 1; index <= returned; index++)
             {
                 dynamic frame = frames.Item(index);
                 var frameInfo = ReadDebuggerFrame(index, frame, false);
-                frameInfo.IsCurrent = !markedCurrent &&
+                frameInfo.IsCurrent = (requestedThreadId is null || requestedThreadId.Value == currentThreadId) && !markedCurrent &&
                     string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
                     string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
                 markedCurrent |= frameInfo.IsCurrent;
@@ -735,10 +762,13 @@ public static class VisualStudioConnector
             {
                 Success = true,
                 Code = "ok",
-                Message = $"Listed {items.Count} frame(s) for the current thread.",
+                Message = requestedThreadId.HasValue
+                    ? $"Listed {items.Count} frame(s) for requested thread {requestedThreadId.Value} without changing debugger selection. Locals and expression evaluation remain bound to CurrentThreadId; select the requested thread and get a fresh stack snapshot before using them."
+                    : $"Listed {items.Count} frame(s) for the current thread.",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = mode,
-                CurrentThreadId = ReadInteger(() => (int)currentThread.ID),
+                CurrentThreadId = currentThreadId,
+                RequestedThreadId = requestedThreadId,
                 Frames = items,
                 TotalCount = count,
                 Truncated = count > returned
@@ -793,7 +823,7 @@ public static class VisualStudioConnector
         string? expectedModule,
         int expectedFrameCount)
     {
-        if (index < 1 || index > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(index) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
             return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
         try
@@ -837,7 +867,7 @@ public static class VisualStudioConnector
         int maxItems,
         bool allowMemberExpansion)
     {
-        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1 || expectedThreadId <= 0)
             return CreateInspectionError("invalid_frame", "Pass the frame index, function, module, total frame count, and thread ID from the latest debugger snapshot.");
         maxDepth = BreakpointRequestValidation.ClampMemberDepth(maxDepth);
@@ -1169,7 +1199,7 @@ public static class VisualStudioConnector
             expressionText, allowEvaluation, allowSideEffects);
         if (expressionValidation.Code is not null)
             return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
-        if (frameIndex < 1 || frameIndex > 128 || string.IsNullOrWhiteSpace(expectedFunction) ||
+        if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) ||
             expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
             expectedFrameCount < 1 || expectedThreadId <= 0)
             return CreateExpressionError("invalid_frame", "Pass the frame identity from the latest get_call_stack response.");
@@ -1246,13 +1276,6 @@ public static class VisualStudioConnector
     }
 }
 
-public class BuildResult
-{
-    public bool Success { get; set; }
-    public int ErrorCount { get; set; }
-    public string Message { get; set; } = "";
-}
-
 public class DebuggerState
 {
     public string Mode { get; set; } = "";
@@ -1293,4 +1316,21 @@ public class SolutionInfo
     public string SolutionPath { get; set; } = "";
     public string SolutionName { get; set; } = "";
     public List<string> Projects { get; set; } = new();
+
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? WorkspaceKind { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? WorkspaceRoot { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? CMakeMetadataStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? CMakeMetadataReason { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? ActiveConfigurationStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? ActiveConfigurationReason { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? StartupTargetStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? StartupTargetReason { get; set; }
 }

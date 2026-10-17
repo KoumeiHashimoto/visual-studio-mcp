@@ -4,6 +4,12 @@ using System.Runtime.InteropServices;
 
 namespace VisualStudioMcpServer;
 
+internal sealed class StaComInvocationTimeoutException(string message, bool executionStarted, Exception innerException)
+    : TimeoutException(message, innerException)
+{
+    public bool ExecutionStarted { get; } = executionStarted;
+}
+
 /// <summary>
 /// Marshals Visual Studio COM calls to a dedicated STA thread.
 /// </summary>
@@ -56,8 +62,9 @@ internal static class StaComDispatcher
     /// <param name="operation">The operation to run on the STA thread.</param>
     /// <param name="timeout">The maximum wait time.</param>
     /// <returns>The operation result.</returns>
-    public static T Invoke<T>(Func<T> operation, TimeSpan? timeout = null)
+    public static T Invoke<T>(Func<T> operation, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Start();
         if (Environment.CurrentManagedThreadId == _threadId) return operation();
 
@@ -68,10 +75,21 @@ internal static class StaComDispatcher
             if (Interlocked.CompareExchange(ref state, 1, 0) != 0) return;
             try { completion.TrySetResult(operation()); }
             catch (Exception ex) { completion.TrySetException(ex); }
+            finally { Interlocked.CompareExchange(ref state, 3, 1); }
         });
         try
         {
-            return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15)).GetAwaiter().GetResult();
+            return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15), cancellationToken).GetAwaiter().GetResult();
+        }
+        catch (TimeoutException ex)
+        {
+            if (completion.Task.IsFaulted && completion.Task.Exception?.InnerException is TimeoutException operationTimeout &&
+                ReferenceEquals(operationTimeout, ex))
+                throw new StaComInvocationTimeoutException(ex.Message, true, ex);
+
+            var executionStarted = Volatile.Read(ref state) is 1 or 3;
+            if (!executionStarted) Interlocked.CompareExchange(ref state, 2, 0);
+            throw new StaComInvocationTimeoutException(ex.Message, executionStarted, ex);
         }
         finally
         {

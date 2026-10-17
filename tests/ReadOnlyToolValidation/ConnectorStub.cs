@@ -41,6 +41,14 @@ internal sealed class SolutionInfo
     public string SolutionName { get; set; } = "Sample.sln";
     public string SolutionPath { get; set; } = "Sample.sln";
     public List<string> Projects { get; set; } = new() { "Sample" };
+    public string? WorkspaceKind { get; set; }
+    public string? WorkspaceRoot { get; set; }
+    public string? CMakeMetadataStatus { get; set; }
+    public string? CMakeMetadataReason { get; set; }
+    public string? ActiveConfigurationStatus { get; set; }
+    public string? ActiveConfigurationReason { get; set; }
+    public string? StartupTargetStatus { get; set; }
+    public string? StartupTargetReason { get; set; }
 }
 
 /// <summary>Represents error fields used by the production formatter.</summary>
