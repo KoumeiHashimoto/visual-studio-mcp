@@ -77,6 +77,15 @@ if (OperatingSystem.IsWindows())
     }
     catch (System.Runtime.InteropServices.COMException actual) when (ReferenceEquals(actual, expectedCom)) { }
 
+    var expectedTimeout = new TimeoutException("operation timeout probe");
+    try
+    {
+        VisualStudioMcpServer.StaComDispatcher.Invoke<int>(() => throw expectedTimeout);
+        throw new Exception("The dispatcher did not report a timeout thrown by the operation.");
+    }
+    catch (VisualStudioMcpServer.StaComInvocationTimeoutException actual)
+        when (actual.ExecutionStarted && ReferenceEquals(actual.InnerException, expectedTimeout)) { }
+
     using var entered = new ManualResetEventSlim();
     using var release = new ManualResetEventSlim();
     var blocker = Task.Run(() => VisualStudioMcpServer.StaComDispatcher.Invoke(() =>
@@ -133,5 +142,5 @@ if (OperatingSystem.IsWindows())
     startedCallRelease.Set();
     VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
     if (!executionStarted) throw new InvalidOperationException("The dispatcher did not report that the timed-out COM operation had started.");
-    Console.WriteLine("Passed 7 Windows STA dispatcher checks.");
+    Console.WriteLine("Passed 8 Windows STA dispatcher checks.");
 }

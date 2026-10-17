@@ -75,6 +75,7 @@ internal static class StaComDispatcher
             if (Interlocked.CompareExchange(ref state, 1, 0) != 0) return;
             try { completion.TrySetResult(operation()); }
             catch (Exception ex) { completion.TrySetException(ex); }
+            finally { Interlocked.CompareExchange(ref state, 3, 1); }
         });
         try
         {
@@ -82,7 +83,11 @@ internal static class StaComDispatcher
         }
         catch (TimeoutException ex)
         {
-            var executionStarted = Volatile.Read(ref state) == 1;
+            if (completion.Task.IsFaulted && completion.Task.Exception?.InnerException is TimeoutException operationTimeout &&
+                ReferenceEquals(operationTimeout, ex))
+                throw new StaComInvocationTimeoutException(ex.Message, true, ex);
+
+            var executionStarted = Volatile.Read(ref state) is 1 or 3;
             if (!executionStarted) Interlocked.CompareExchange(ref state, 2, 0);
             throw new StaComInvocationTimeoutException(ex.Message, executionStarted, ex);
         }
