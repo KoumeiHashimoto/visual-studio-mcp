@@ -139,6 +139,20 @@ try
     try { ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddMilliseconds(-1), CancellationToken.None); }
     catch (TimeoutException) { expiredFingerprint = true; }
     Check(expiredFingerprint, "physical file fingerprint honors the caller deadline");
+    using (var cancelledFingerprint = new CancellationTokenSource())
+    {
+        cancelledFingerprint.Cancel();
+        var cancellationObserved = false;
+        try { ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddSeconds(2), cancelledFingerprint.Token); }
+        catch (OperationCanceledException) { cancellationObserved = true; }
+        Check(cancellationObserved, "physical file fingerprint honors caller cancellation");
+    }
+    using (var oversizedFile = new FileStream(fingerprintPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        oversizedFile.SetLength(ProjectFileFingerprint.MaxVerifiedFileBytes + 1);
+    var oversizedFingerprintRejected = false;
+    try { ProjectFileFingerprint.Read(fingerprintPath, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None); }
+    catch (ProjectFileFingerprintException ex) { oversizedFingerprintRejected = ex.Code == "unsupported_item"; }
+    Check(oversizedFingerprintRejected, "physical file fingerprint rejects oversized files before reading");
 }
 finally { File.Delete(fingerprintPath); }
 
