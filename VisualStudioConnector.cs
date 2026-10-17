@@ -215,6 +215,30 @@ public static class VisualStudioConnector
     /// </summary>
     public static SolutionInfo? GetSolutionInfo()
     {
+        if (TryGetTargetProcessIdentity(out var processId, out var startTicks))
+        {
+            var workspace = ActiveWorkspaceSnapshotStoreAccessor.Get()?.GetCurrent();
+            if (workspace is not null && workspace.VisualStudioPid == processId &&
+                workspace.VisualStudioStartTicks == startTicks)
+            {
+                var root = Path.TrimEndingDirectorySeparator(workspace.Root);
+                return new SolutionInfo
+                {
+                    SolutionPath = string.Empty,
+                    SolutionName = Path.GetFileName(root),
+                    Projects = new List<string>(),
+                    WorkspaceKind = workspace.WorkspaceKind,
+                    WorkspaceRoot = root,
+                    CMakeMetadataStatus = workspace.CMakeMetadataStatus,
+                    CMakeMetadataReason = workspace.CMakeMetadataReason,
+                    ActiveConfigurationStatus = "unsupported",
+                    ActiveConfigurationReason = "The public Visual Studio Workspace API does not expose the active CMake configuration.",
+                    StartupTargetStatus = "unsupported",
+                    StartupTargetReason = "The public Visual Studio Workspace API does not expose the active CMake startup or debug target."
+                };
+            }
+        }
+
         var dte = GetActiveVS();
         if (dte?.Solution != null && !string.IsNullOrEmpty(dte.Solution.FullName))
         {
@@ -236,27 +260,7 @@ public static class VisualStudioConnector
 
             return solutionInfo;
         }
-
-        var workspace = ActiveWorkspaceSnapshotStoreAccessor.Get()?.GetCurrent();
-        if (workspace is null || workspace.VisualStudioPid != _targetProcessId ||
-            workspace.VisualStudioStartTicks != _targetProcessStartTicks)
-            return null;
-
-        var root = Path.TrimEndingDirectorySeparator(workspace.Root);
-        return new SolutionInfo
-        {
-            SolutionPath = string.Empty,
-            SolutionName = Path.GetFileName(root),
-            Projects = new List<string>(),
-            WorkspaceKind = workspace.WorkspaceKind,
-            WorkspaceRoot = root,
-            CMakeMetadataStatus = workspace.CMakeMetadataStatus,
-            CMakeMetadataReason = workspace.CMakeMetadataReason,
-            ActiveConfigurationStatus = "unsupported",
-            ActiveConfigurationReason = "The public Visual Studio Workspace API does not expose the active CMake configuration.",
-            StartupTargetStatus = "unsupported",
-            StartupTargetReason = "The public Visual Studio Workspace API does not expose the active CMake startup or debug target."
-        };
+        return null;
     }
 
     // ==================== BUILD & DEBUG CONTROL ====================
