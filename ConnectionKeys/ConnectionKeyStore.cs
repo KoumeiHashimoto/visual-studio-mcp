@@ -27,7 +27,7 @@ public sealed record ConnectionKeyIssueResult(Guid IssuanceId, ConnectionKeyResu
 /// </summary>
 public sealed class ConnectionKeyStore
 {
-    private static readonly TimeSpan PendingLifetime = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan PendingLifetime = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan IdleLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan AbsoluteLifetime = TimeSpan.FromHours(8);
     private static readonly TimeSpan TombstoneLifetime = TimeSpan.FromSeconds(120);
