@@ -1,4 +1,7 @@
-﻿using VisualStudioMcpServer;
+﻿/**
+  プロジェクトスナップショットと項目探索の境界を検証します。
+*/
+using VisualStudioMcpServer;
 using VisualStudioMcpServer.Tools;
 
 var now = DateTimeOffset.UnixEpoch;
@@ -14,6 +17,51 @@ for (var i = 0; i < ProjectTraversalBudget.MaxNodes - 2; i++)
 Check(sharedActionBudget.TryVisit(), "project-file action can share one budget across project and item lookup");
 Check(sharedActionBudget.TryVisit(), "project-file action can account for document or postcondition traversal in the same budget");
 Check(!sharedActionBudget.TryVisit(), "project-file action rejects aggregate traversal beyond the shared limit");
+var actionSource = new FakeProjectItemSource();
+var wrongSameName = new FakeProjectItem("same.cs", Path.Combine(Path.GetTempPath(), "wrong", "same.cs"));
+var expectedSameName = new FakeProjectItem("same.cs", Path.Combine(Path.GetTempPath(), "expected", "same.cs"));
+var projectTree = new FakeProjectItems(new[] { new FakeProjectItem("Folder", null,
+    new FakeProjectItems(new[] { wrongSameName, expectedSameName })) });
+var actionBudget = new ProjectTraversalBudget();
+var selectedActionItem = ProjectItemTraversal.FindItem(projectTree, "Root\\Folder\\same.cs", "Root",
+    expectedSameName.FilePath!, 0, actionBudget, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource);
+Check(ReferenceEquals(selectedActionItem, expectedSameName), "project-file traversal resolves logical ancestry and exact physical identity");
+Check(ProjectItemTraversal.ContainsFile(projectTree, expectedSameName.FilePath!, 0, actionBudget,
+    DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource), "membership traversal reuses the action budget");
+
+var exhaustedActionBudget = new ProjectTraversalBudget();
+for (var i = 0; i < ProjectTraversalBudget.MaxNodes - 1; i++) exhaustedActionBudget.TryVisit();
+var finalNode = new FakeProjectItems(new[] { new FakeProjectItem("target.cs", Path.Combine(Path.GetTempPath(), "target.cs")) });
+Check(ProjectItemTraversal.FindItem(finalNode, "Root\\target.cs", "Root", Path.Combine(Path.GetTempPath(), "target.cs"),
+    0, exhaustedActionBudget, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource) is not null,
+    "project-file lookup can consume the final shared node");
+var aggregateLimit = false;
+try { ProjectItemTraversal.ContainsFile(finalNode, Path.Combine(Path.GetTempPath(), "missing.cs"), 0,
+    exhaustedActionBudget, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource); }
+catch (ProjectItemTraversalException ex) { aggregateLimit = ex.Code == "operation_failed"; }
+Check(aggregateLimit, "postcondition traversal fails when earlier action phases used the shared limit");
+
+var expiredActionDeadline = false;
+try { ProjectItemTraversal.FindItem(finalNode, "Root\\target.cs", "Root", Path.Combine(Path.GetTempPath(), "target.cs"),
+    0, new ProjectTraversalBudget(), DateTimeOffset.UtcNow.AddMilliseconds(-1), CancellationToken.None, actionSource); }
+catch (TimeoutException) { expiredActionDeadline = true; }
+Check(expiredActionDeadline, "project-file traversal honors the caller deadline before enumeration");
+using (var cancelledAction = new CancellationTokenSource())
+{
+    cancelledAction.Cancel();
+    var cancelledActionTraversal = false;
+    try { ProjectItemTraversal.FindItem(finalNode, "Root\\target.cs", "Root", Path.Combine(Path.GetTempPath(), "target.cs"),
+        0, new ProjectTraversalBudget(), DateTimeOffset.UtcNow.AddSeconds(2), cancelledAction.Token, actionSource); }
+    catch (OperationCanceledException) { cancelledActionTraversal = true; }
+    Check(cancelledActionTraversal, "project-file traversal honors caller cancellation before enumeration");
+}
+var depthTree = new FakeProjectItems(new[] { new FakeProjectItem("leaf.cs", Path.Combine(Path.GetTempPath(), "leaf.cs")) });
+for (var i = 0; i <= ProjectTraversalBudget.MaxDepth; i++) depthTree = new FakeProjectItems(new[] { new FakeProjectItem("nested", null, depthTree) });
+var depthLimit = false;
+try { ProjectItemTraversal.ContainsFile(depthTree, "missing.cs", 0, new ProjectTraversalBudget(),
+    DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None, actionSource); }
+catch (ProjectItemTraversalException ex) { depthLimit = ex.Code == "operation_failed"; }
+Check(depthLimit, "project-file traversal fails explicitly beyond the shared depth limit");
 var store = new ProjectSnapshotStore(() => now);
 var project = CreateProject("project-a", new string('A', 8));
 Check(store.TryPut(project), "project snapshot stored");
@@ -84,4 +132,77 @@ void Check(bool value, string message)
     if (!value) throw new InvalidOperationException(message);
     Console.WriteLine("PASS " + message);
     checkCount++;
+}
+
+/**
+  決定的な偽プロジェクト項目コレクションです。
+*/
+sealed class FakeProjectItems(IReadOnlyList<FakeProjectItem> items)
+{
+    /**
+      コレクション件数を返します。
+    */
+    internal int Count => items.Count;
+
+    /**
+      1始まりの位置で項目を返します。
+    */
+    internal FakeProjectItem Item(int oneBasedIndex) => items[oneBasedIndex - 1];
+}
+
+/**
+  決定的な偽プロジェクト項目を保持します。
+*/
+sealed class FakeProjectItem(string name, string? filePath, FakeProjectItems? children = null)
+{
+    /**
+      項目名を取得します。
+    */
+    internal string Name { get; } = name;
+
+    /**
+      物理ファイルパスを取得します。
+    */
+    internal string? FilePath { get; } = filePath;
+
+    /**
+      子項目コレクションを取得します。
+    */
+    internal FakeProjectItems? Children { get; } = children;
+}
+
+/**
+  偽プロジェクト項目を探索アルゴリズムへ公開します。
+*/
+sealed class FakeProjectItemSource : IProjectItemTraversalSource<FakeProjectItems, FakeProjectItem>
+{
+    /**
+      コレクション件数を返します。
+    */
+    public int GetCount(FakeProjectItems collection) => collection.Count;
+
+    /**
+      1始まりの位置で項目を返します。
+    */
+    public FakeProjectItem? GetItem(FakeProjectItems collection, int oneBasedIndex) => collection.Item(oneBasedIndex);
+
+    /**
+      項目名を返します。
+    */
+    public string GetName(FakeProjectItem item) => item.Name;
+
+    /**
+      項目の物理ファイル数を返します。
+    */
+    public int GetFileCount(FakeProjectItem item) => item.FilePath is null ? 0 : 1;
+
+    /**
+      指定位置の物理ファイル名を返します。
+    */
+    public string GetFileName(FakeProjectItem item, int oneBasedIndex) => oneBasedIndex == 1 ? item.FilePath ?? string.Empty : throw new ArgumentOutOfRangeException(nameof(oneBasedIndex));
+
+    /**
+      子項目コレクションを返します。
+    */
+    public FakeProjectItems? GetChildren(FakeProjectItem item) => item.Children;
 }

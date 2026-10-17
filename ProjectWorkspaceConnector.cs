@@ -1,4 +1,7 @@
-﻿using System.Diagnostics;
+﻿/**
+  Visual Studioのプロジェクトとワークスペース情報を管理します。
+*/
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using EnvDTE;
 using EnvDTE80;
@@ -10,7 +13,7 @@ namespace VisualStudioMcpServer;
 internal sealed class ProjectWorkspaceConnector
 {
     private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
-    internal const int MaxDepth = 32;
+    internal const int MaxDepth = ProjectTraversalBudget.MaxDepth;
     private const int MaxNodes = ProjectTraversalBudget.MaxNodes;
     private readonly ProjectSnapshotStore _store;
 
@@ -250,6 +253,9 @@ internal sealed class ProjectWorkspaceConnector
             depth, visited, new ProjectTraversalBudget(), deadline, cancellationToken);
     }
 
+    /**
+      共有探索予算と要求期限を使って対象プロジェクトを再解決します。
+    */
     internal static Project? FindProject(Projects projects, string? wantedPath, string? wantedKind,
         string parentLogical, string wantedLogicalPath, int depth, HashSet<string> visited,
         ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
@@ -403,8 +409,7 @@ internal sealed class ProjectWorkspaceConnector
 
     internal static void CheckDeadline(DateTimeOffset deadline, CancellationToken token)
     {
-        token.ThrowIfCancellationRequested();
-        if (DateTimeOffset.UtcNow >= deadline) throw new TimeoutException("The project inventory deadline expired.");
+        ProjectTraversalBudget.CheckDeadline(deadline, token);
     }
 }
 

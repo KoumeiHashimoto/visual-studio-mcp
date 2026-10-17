@@ -19,6 +19,7 @@ public sealed class ProjectFileActionTools
     private const int MaxResponseCharacters = 65536;
     private static readonly ProjectSnapshotStore Snapshots = ProjectInventoryTools.SnapshotStore;
     private static readonly ProjectWorkspaceConnector Connector = new(Snapshots);
+    private static readonly EnvDteProjectItemTraversalSource ItemTraversalSource = new();
 
     [McpServerTool]
     [System.ComponentModel.Description("Opens one registered project item selected by its file snapshot ID. Expected solution and file paths are required to prevent stale or ambiguous targets. Existing editor buffers are preserved.")]
@@ -92,7 +93,8 @@ public sealed class ProjectFileActionTools
         var project = ProjectWorkspaceConnector.FindProject(solution.Projects, selectedProject.ProjectPath, selectedProject.Kind,
             string.Empty, selectedProject.LogicalPath, 0, new HashSet<string>(StringComparer.OrdinalIgnoreCase), traversal, deadline, cancellationToken);
         if (project is null) throw new ProjectWorkspaceException("stale_project", "The project is no longer registered at its captured path.");
-        var item = FindItem(project.ProjectItems, captured.LogicalPath, selectedProject.LogicalPath, expectedFile, 0, traversal, deadline, cancellationToken);
+        var item = FindItem(project.ProjectItems, captured.LogicalPath, selectedProject.LogicalPath,
+            expectedFile, 0, traversal, deadline, cancellationToken);
         if (item is null) throw new ProjectWorkspaceException("stale_file", "The registered project item no longer matches its captured logical path and file path.");
         ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
         var window = item.Open(Constants.vsViewKindTextView);
@@ -112,48 +114,6 @@ public sealed class ProjectFileActionTools
             catch (COMException) { return new ProjectFileActionResult(false, "invalid_position", "The requested line or column is outside the open editor buffer.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, false, false, false, 0); }
         }
         return new ProjectFileActionResult(true, "ok", "The registered project file is open in the text editor.", pid, solutionPath, snapshot.ProjectPath, expectedFile, true, activated, positionApplied, false, false, 0);
-    }
-
-    private static ProjectItem? FindItem(ProjectItems? items, string logicalPath, string parent, string expectedPath, int depth,
-        ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
-    {
-        ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-        if (items is null) return null;
-        if (depth > ProjectWorkspaceConnector.MaxDepth) throw TraversalLimitExceeded();
-        var count = items.Count;
-        for (var index = 1; index <= count; index++)
-        {
-            VisitTraversalNode(traversal, deadline, cancellationToken);
-            ProjectItem? item;
-            try { item = items.Item(index); } catch (COMException) { throw TraversalReadFailed(); }
-            ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-            if (item is null) throw TraversalReadFailed();
-            string name;
-            try { name = item.Name; } catch (COMException) { throw TraversalReadFailed(); }
-            ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-            var current = parent + "\\" + name;
-            if (string.Equals(current, logicalPath, StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    var fileCount = item.FileCount;
-                    ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-                    if (fileCount == 1)
-                    {
-                        var fileName = item.FileNames[1];
-                        ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-                        if (ProjectWorkspaceConnector.PathsEqual(fileName, expectedPath)) return item;
-                    }
-                }
-                catch (COMException) { throw TraversalReadFailed(); }
-            }
-            ProjectItems? children;
-            try { children = item.ProjectItems; } catch (COMException) { throw TraversalReadFailed(); }
-            ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-            var found = FindItem(children, logicalPath, current, expectedPath, depth + 1, traversal, deadline, cancellationToken);
-            if (found is not null) return found;
-        }
-        return null;
     }
 
     private static string Mutate(string? projectSnapshotId, string? projectId, string? fileSnapshotId,
@@ -256,7 +216,7 @@ public sealed class ProjectFileActionTools
             if (documentCount > 10000) throw new ProjectWorkspaceException("unsupported_state", "The open document list is too large to verify safely.");
             for (var index = 1; index <= documentCount; index++)
             {
-                VisitTraversalNode(traversal, deadline, cancellationToken);
+                ProjectItemTraversal.VisitTraversalNode(traversal, deadline, cancellationToken);
                 try { documentStates.Add(documents.Item(index).Saved); }
                 catch (COMException) { documentStates.Add(null); }
                 ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
@@ -279,7 +239,8 @@ public sealed class ProjectFileActionTools
         }
         else
         {
-            var live = FindItem(project.ProjectItems, selectedItem!.LogicalPath, selected.LogicalPath, selectedItem.FullPath!, 0, traversal, deadline, cancellationToken);
+            var live = FindItem(project.ProjectItems, selectedItem!.LogicalPath, selected.LogicalPath,
+                selectedItem.FullPath!, 0, traversal, deadline, cancellationToken);
             if (live is null) throw new ProjectWorkspaceException("stale_file", "The captured project item is no longer registered at the expected path.");
             ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
             live.Remove();
@@ -294,55 +255,16 @@ public sealed class ProjectFileActionTools
     private static bool ContainsFileAfterMutation(ProjectItems? items, string path, ProjectTraversalBudget traversal,
         DateTimeOffset deadline, CancellationToken cancellationToken)
     {
-        try { return ContainsFile(items, path, 0, traversal, deadline, cancellationToken); }
+        try { return ProjectItemTraversal.ContainsFile(items, path, 0, traversal, deadline, cancellationToken, ItemTraversalSource); }
         catch (Exception) { throw new ProjectWorkspaceException("outcome_unknown", "The registration changed, but bounded membership verification did not finish; refresh inventory before retrying."); }
     }
 
-    private static bool ContainsFile(ProjectItems? items, string path, int depth, ProjectTraversalBudget traversal,
-        DateTimeOffset deadline, CancellationToken cancellationToken)
+    private static ProjectItem? FindItem(ProjectItems? items, string logicalPath, string parent, string expectedPath, int depth,
+        ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
     {
-        ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-        if (items is null) return false;
-        if (depth > ProjectWorkspaceConnector.MaxDepth) throw TraversalLimitExceeded();
-        var count = items.Count;
-        for (var i = 1; i <= count; i++)
-        {
-            VisitTraversalNode(traversal, deadline, cancellationToken);
-            ProjectItem? item;
-            try { item = items.Item(i); } catch (COMException) { throw TraversalReadFailed(); }
-            ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-            if (item is null) throw TraversalReadFailed();
-            try
-            {
-                var fileCount = item.FileCount;
-                ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-                if (fileCount == 1)
-                {
-                    var fileName = item.FileNames[1];
-                    ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-                    if (ProjectWorkspaceConnector.PathsEqual(fileName, path)) return true;
-                }
-            }
-            catch (COMException) { throw TraversalReadFailed(); }
-            ProjectItems? children;
-            try { children = item.ProjectItems; } catch (COMException) { throw TraversalReadFailed(); }
-            ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-            if (ContainsFile(children, path, depth + 1, traversal, deadline, cancellationToken)) return true;
-        }
-        return false;
+        try { return ProjectItemTraversal.FindItem(items, logicalPath, parent, expectedPath, depth, traversal, deadline, cancellationToken, ItemTraversalSource); }
+        catch (ProjectItemTraversalException ex) { throw new ProjectWorkspaceException(ex.Code, ex.Message); }
     }
-
-    private static void VisitTraversalNode(ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
-    {
-        ProjectWorkspaceConnector.CheckDeadline(deadline, cancellationToken);
-        if (!traversal.TryVisit()) throw TraversalLimitExceeded();
-    }
-
-    private static ProjectWorkspaceException TraversalLimitExceeded() =>
-        new("operation_failed", "Project-file operation exceeded the 10000-node traversal limit or depth limit.");
-
-    private static ProjectWorkspaceException TraversalReadFailed() =>
-        new("operation_failed", "Visual Studio could not complete the bounded project-file traversal.");
 
     private static bool SafeLocalFile(string projectPath, string input)
     {
