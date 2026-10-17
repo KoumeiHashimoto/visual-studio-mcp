@@ -1,6 +1,8 @@
 ﻿using System.Text.Json;
 using VisualStudioMcpServer;
 
+using VisualStudioMcpServer.Workspace;
+
 var validTarget = new BuildTargetSnapshot(41, 1001, 41, 1001, true, @"C:\repo\app.sln", "Debug", "Any CPU", true, false, false);
 var checks = 0;
 void Check(bool condition, string name)
@@ -27,6 +29,30 @@ void Check(bool condition, string name)
     Check(!ownership.OnBuildDone(false, true, now.AddMilliseconds(2)), "mismatched event clears pending correlation");
     ownership.BeginDispatch(1000, now);
     Check(!ownership.OnBuildBegin(false, true, now.AddMilliseconds(1001)), "expired correlation window does not adopt a manual build");
+}
+
+{
+    var workspace = new ActiveWorkspaceSnapshot(true, 41, 1001, 1, @"C:\repo\folder", "openFolder",
+        "unsupported", "CMake metadata is not exposed by a documented public API.");
+    var dispatchCount = 0;
+    var unsupported = OpenFolderBuildPolicy.Check(workspace, 41, 1001, "build", true, @"C:\repo\folder", 10000);
+    if (unsupported is null) dispatchCount++;
+    Check(unsupported is { Code: "unsupported", WorkspaceRoot: @"C:\repo\folder" } && dispatchCount == 0,
+        "Open Folder without a public action returns unsupported before dispatch");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, "rebuild", false, @"C:\repo\folder", 10000)?.Code == "build_policy_required",
+        "Open Folder rebuild still requires explicit build permission");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, "clean", true, null, 10000)?.Code == "expected_workspace_required",
+        "Open Folder clean requires an expected workspace root");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, "build", true, @"C:\repo\other", 10000)?.Code == "workspace_mismatch",
+        "Open Folder build rejects a different workspace root");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, "build", true, "relative", 10000)?.Code == "invalid_argument",
+        "Open Folder build rejects a relative workspace root");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, null, true, null, 10000)?.Code == "expected_workspace_required",
+        "Open Folder status requires an expected workspace root");
+    Check(OpenFolderBuildPolicy.Check(workspace, 41, 1001, null, true, @"C:\repo\folder", 10000) is { Code: "unsupported", Action: null },
+        "Open Folder status reports unsupported without claiming an operation");
+    Check(OpenFolderBuildPolicy.Check(workspace, 42, 1001, "build", true, @"C:\repo\folder", 10000) is null,
+        "Open Folder metadata cannot bind to a different Visual Studio process");
 }
 
 var guards = new (string Code, BuildTargetSnapshot Target, string? ExpectedPath, int? Pid, long? Ticks, bool Allowed)[]

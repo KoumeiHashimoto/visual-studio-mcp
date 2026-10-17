@@ -65,6 +65,8 @@ internal sealed record BuildOperationResult(
     long ElapsedMilliseconds,
     int TimeoutMilliseconds)
 {
+    public string? WorkspaceRoot { get; init; }
+
     public static string ToBoundedJson(BuildOperationResult result)
     {
         const int maxBytes = 64 * 1024;

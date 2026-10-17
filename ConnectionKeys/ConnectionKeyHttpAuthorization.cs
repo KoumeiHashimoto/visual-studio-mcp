@@ -18,7 +18,8 @@ internal static class ConnectionKeyHttpAuthorization
         {
             "/_vsix/shutdown" => HttpMethods.IsPost(context.Request.Method),
             "/_vsix/connection-key/issue" or "/_vsix/connection-key/cancel" or
-            "/_vsix/connection-key/revoke-all" or "/_vsix/connection-key/status" => HttpMethods.IsPost(context.Request.Method),
+            "/_vsix/connection-key/revoke-all" or "/_vsix/connection-key/status" or
+            "/_vsix/workspace/snapshot" => HttpMethods.IsPost(context.Request.Method),
             _ => false
         };
         if (isOwnerCredential(bearer))

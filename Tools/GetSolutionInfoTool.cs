@@ -21,7 +21,7 @@ public static class GetSolutionInfoTool
 
         if (info == null)
         {
-            return "No solution is currently open in Visual Studio, or Visual Studio is not running.";
+            return "No solution or supported Open Folder workspace is currently available in Visual Studio.";
         }
 
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
@@ -32,12 +32,21 @@ public static class GetSolutionInfoTool
         // Text format
         var lines = new List<string>
         {
-            "Current Solution:",
+            info.WorkspaceKind is null ? "Current Solution:" : "Current Open Folder Workspace:",
             $"  Name: {info.SolutionName}",
             $"  Path: {info.SolutionPath}",
             "",
             $"Projects ({info.Projects.Count}):"
         };
+
+        if (info.WorkspaceKind is not null)
+        {
+            lines.Add($"  Workspace kind: {info.WorkspaceKind}");
+            lines.Add($"  Workspace root: {info.WorkspaceRoot}");
+            lines.Add($"  CMake metadata: {info.CMakeMetadataStatus} ({info.CMakeMetadataReason})");
+            lines.Add($"  Active configuration: {info.ActiveConfigurationStatus} ({info.ActiveConfigurationReason})");
+            lines.Add($"  Startup target: {info.StartupTargetStatus} ({info.StartupTargetReason})");
+        }
 
         foreach (var project in info.Projects)
         {

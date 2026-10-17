@@ -18,6 +18,7 @@ using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Server;
 using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.ConnectionKeys;
+using VisualStudioMcpServer.Workspace;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -94,6 +95,7 @@ internal static class Program
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         var serverInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16));
         ConnectionKeyStore? connectionKeys = null;
+        var workspaceSnapshots = new ActiveWorkspaceSnapshotStore(options.ParentPid, options.ParentStartTicks);
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.WebHost.ConfigureKestrel(server => server.Limits.MaxRequestBodySize = 1024 * 1024);
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -206,6 +208,14 @@ internal static class Program
                 nearestExpiry = status.NearestExpiry?.ToUnixTimeSeconds()
             });
         });
+        app.MapPost("/_vsix/workspace/snapshot", async (HttpContext context) =>
+        {
+            var update = await TryReadWorkspaceSnapshotAsync(context.Request);
+            if (update is null) return Results.Json(new { code = "invalid_workspace_snapshot", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status400BadRequest);
+            if (!workspaceSnapshots.TryUpdate(update.ToSnapshot()))
+                return Results.Json(new { code = "workspace_identity_mismatch", retryable = false, mayHaveChanged = false }, statusCode: StatusCodes.Status409Conflict);
+            return Results.NoContent();
+        });
         app.MapMcp("/mcp");
 
         await app.StartAsync();
@@ -221,6 +231,7 @@ internal static class Program
         var keyClock = new SystemConnectionKeyClock();
         connectionKeys = new ConnectionKeyStore(keyClock, keyClock, options.ParentPid,
             options.ParentStartTicks, Environment.ProcessId, serverInstanceId, mcpUrl);
+        ActiveWorkspaceSnapshotStoreAccessor.Set(workspaceSnapshots);
         var endpoint = new ServerEndpoint(2, options.ParentPid, options.ParentStartTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Environment.ProcessId, serverInstanceId, mcpUrl, token);
         var descriptorDirectory = Path.GetDirectoryName(options.EndpointFile)
@@ -241,6 +252,7 @@ internal static class Program
             try { await parentMonitor; } catch (OperationCanceledException) { }
             connectionKeys.RevokeAll();
             ProjectInventoryTools.SnapshotStore.InvalidateAll();
+            ActiveWorkspaceSnapshotStoreAccessor.Clear(workspaceSnapshots);
             try { File.Delete(options.EndpointFile); } catch (IOException) { }
         }
     }
@@ -289,6 +301,46 @@ internal static class Program
         }
         catch (JsonException) { return null; }
         catch (IOException) { return null; }
+    }
+
+    private static async Task<WorkspaceSnapshotUpdate?> TryReadWorkspaceSnapshotAsync(HttpRequest request)
+    {
+        if (request.ContentLength is > 4096) return null;
+        request.EnableBuffering(4096, 4096);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[1024];
+        try
+        {
+            while (buffer.Length <= 4096)
+            {
+                var count = await request.Body.ReadAsync(chunk.AsMemory(0,
+                    Math.Min(chunk.Length, 4097 - (int)buffer.Length)), request.HttpContext.RequestAborted);
+                if (count == 0) break;
+                buffer.Write(chunk, 0, count);
+            }
+            if (buffer.Length > 4096) return null;
+            request.Body.Position = 0;
+            return JsonSerializer.Deserialize<WorkspaceSnapshotUpdate>(buffer.ToArray(),
+                new JsonSerializerOptions { MaxDepth = 8, PropertyNameCaseInsensitive = true });
+        }
+        catch (JsonException) { return null; }
+        catch (IOException) { return null; }
+        finally { if (request.Body.CanSeek) request.Body.Position = 0; }
+    }
+
+    private sealed class WorkspaceSnapshotUpdate
+    {
+        public bool Active { get; set; }
+        public int VisualStudioPid { get; set; }
+        public long VisualStudioStartTicks { get; set; }
+        public long Generation { get; set; }
+        public string Root { get; set; } = string.Empty;
+        public string WorkspaceKind { get; set; } = string.Empty;
+        public string CMakeMetadataStatus { get; set; } = string.Empty;
+        public string CMakeMetadataReason { get; set; } = string.Empty;
+
+        public ActiveWorkspaceSnapshot ToSnapshot() => new(Active, VisualStudioPid, VisualStudioStartTicks,
+            Generation, Root, WorkspaceKind, CMakeMetadataStatus, CMakeMetadataReason);
     }
 
     private sealed record ServerEndpoint(int SchemaVersion, int ParentPid, string ParentStartTicks,

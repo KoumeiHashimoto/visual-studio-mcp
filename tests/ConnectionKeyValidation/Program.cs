@@ -19,6 +19,7 @@ var tests = new (string Name, Action Run)[]
     ("HTTP key admission binds a stateful session", HttpAdmission),
     ("HTTP replay and wrong credentials execute no tools", HttpRejectsReplay),
     ("owner credential cannot select a keyed session", HttpCredentialIsolation),
+    ("workspace snapshot route remains owner-only", HttpWorkspaceSnapshotRoute),
     ("DELETE revokes admission before SDK dispatch", HttpDeleteClosesFirst),
     ("newer protocol probe does not consume the pending key", HttpProtocolProbe)
 };
@@ -174,6 +175,23 @@ static void HttpDeleteClosesFirst()
     ConnectionKeyHttpAuthorization.InvokeAsync(context,f.Store,_=>false,_=>
     { sawClosed=f.Store.AuthenticateSession(p.ToBearerValue(),"delete-session",f.Store.Identity)!=ConnectionKeyResult.Success; return Task.CompletedTask; }).GetAwaiter().GetResult();
     Assert(sawClosed,"further admission closed before SDK DELETE");
+}
+static void HttpWorkspaceSnapshotRoute()
+{
+    var f = new Fixture();
+    var owner = HttpRequest("POST", "trusted-owner", "", null);
+    owner.Request.Path = "/_vsix/workspace/snapshot";
+    var ownerCalled = false;
+    ConnectionKeyHttpAuthorization.InvokeAsync(owner, f.Store, value => value == "trusted-owner",
+        _ => { ownerCalled = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(ownerCalled, "owner credential may publish workspace snapshot");
+
+    var key = HttpRequest("POST", "wrong", "", null);
+    key.Request.Path = "/_vsix/workspace/snapshot";
+    var keyCalled = false;
+    ConnectionKeyHttpAuthorization.InvokeAsync(key, f.Store, _ => false,
+        _ => { keyCalled = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(key.Response.StatusCode == 401 && !keyCalled, "connection-key credential cannot publish workspace snapshot");
 }
 static void HttpProtocolProbe()
 {

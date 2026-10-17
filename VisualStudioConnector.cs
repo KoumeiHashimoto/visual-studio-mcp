@@ -5,6 +5,8 @@ using System.Text.RegularExpressions;
 using EnvDTE;
 using EnvDTE80;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.Workspace;
+using Newtonsoft.Json;
 
 namespace VisualStudioMcpServer;
 
@@ -214,26 +216,47 @@ public static class VisualStudioConnector
     public static SolutionInfo? GetSolutionInfo()
     {
         var dte = GetActiveVS();
-        if (dte?.Solution == null || string.IsNullOrEmpty(dte.Solution.FullName))
-            return null;
-
-        var info = new SolutionInfo
+        if (dte?.Solution != null && !string.IsNullOrEmpty(dte.Solution.FullName))
         {
-            SolutionPath = dte.Solution.FullName,
-            SolutionName = Path.GetFileName(dte.Solution.FullName),
-            Projects = new List<string>()
-        };
-
-        foreach (Project project in dte.Solution.Projects)
-        {
-            if (!string.IsNullOrEmpty(project.Name))
+            var solutionInfo = new SolutionInfo
             {
-                info.Projects.Add(project.Name);
-                if (info.Projects.Count >= 100) break;
+                SolutionPath = dte.Solution.FullName,
+                SolutionName = Path.GetFileName(dte.Solution.FullName),
+                Projects = new List<string>()
+            };
+
+            foreach (Project project in dte.Solution.Projects)
+            {
+                if (!string.IsNullOrEmpty(project.Name))
+                {
+                    solutionInfo.Projects.Add(project.Name);
+                    if (solutionInfo.Projects.Count >= 100) break;
+                }
             }
+
+            return solutionInfo;
         }
 
-        return info;
+        var workspace = ActiveWorkspaceSnapshotStoreAccessor.Get()?.GetCurrent();
+        if (workspace is null || workspace.VisualStudioPid != _targetProcessId ||
+            workspace.VisualStudioStartTicks != _targetProcessStartTicks)
+            return null;
+
+        var root = Path.TrimEndingDirectorySeparator(workspace.Root);
+        return new SolutionInfo
+        {
+            SolutionPath = string.Empty,
+            SolutionName = Path.GetFileName(root),
+            Projects = new List<string>(),
+            WorkspaceKind = workspace.WorkspaceKind,
+            WorkspaceRoot = root,
+            CMakeMetadataStatus = workspace.CMakeMetadataStatus,
+            CMakeMetadataReason = workspace.CMakeMetadataReason,
+            ActiveConfigurationStatus = "unsupported",
+            ActiveConfigurationReason = "The public Visual Studio Workspace API does not expose the active CMake configuration.",
+            StartupTargetStatus = "unsupported",
+            StartupTargetReason = "The public Visual Studio Workspace API does not expose the active CMake startup or debug target."
+        };
     }
 
     // ==================== BUILD & DEBUG CONTROL ====================
@@ -1254,4 +1277,21 @@ public class SolutionInfo
     public string SolutionPath { get; set; } = "";
     public string SolutionName { get; set; } = "";
     public List<string> Projects { get; set; } = new();
+
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? WorkspaceKind { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? WorkspaceRoot { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? CMakeMetadataStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? CMakeMetadataReason { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? ActiveConfigurationStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? ActiveConfigurationReason { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? StartupTargetStatus { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public string? StartupTargetReason { get; set; }
 }
