@@ -51,7 +51,7 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
         var debuggerMode = dte.Debugger?.CurrentMode.ToString() ?? "Design";
         return new BuildTargetSnapshot(_targetPid, _targetStartTicks, _targetPid, _targetStartTicks,
             true, string.IsNullOrWhiteSpace(fullName) ? null : fullName,
-            configuration?.Name, null,
+            configuration?.Name, (configuration as SolutionConfiguration2)?.PlatformName,
             debuggerMode.Contains("Design", StringComparison.OrdinalIgnoreCase),
             state == vsBuildState.vsBuildStateInProgress, false);
     }, timeout);
