@@ -140,7 +140,8 @@ internal static class Program
             }
 
             var authorization = context.Request.Headers.Authorization.ToString();
-            if (context.Request.Headers.Authorization.Count != 1 || authorization.Length > 256 || authorization.Any(character => character > 0x7f))
+            if (!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed(authorization,
+                    context.Request.Headers.Authorization.Count))
             {
                 var containsOwnerCredential = context.Request.Headers.Authorization.Any(value =>
                     value is not null && value.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) &&
@@ -151,9 +152,6 @@ internal static class Program
                 if (limited) context.Response.Headers.RetryAfter = "5";
                 return;
             }
-            var suppliedToken = authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                ? authorization[7..].Trim()
-                : string.Empty;
             if (connectionKeys is null)
             {
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;

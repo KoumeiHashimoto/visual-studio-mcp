@@ -6,6 +6,13 @@ namespace VisualStudioMcpServer.ConnectionKeys;
 /// <summary>Authorizes connection-key clients and binds them to one stateful MCP session.</summary>
 internal static class ConnectionKeyHttpAuthorization
 {
+    internal static bool IsAuthorizationHeaderAllowed(string authorization, int valueCount)
+    {
+        if (valueCount != 1 || authorization.Any(character => character > 0x7f)) return false;
+        if (authorization.Length <= 256) return true;
+        return authorization.StartsWith("Bearer VSDMCP-KEY1:", StringComparison.OrdinalIgnoreCase) && authorization.Length <= 7 + 8192;
+    }
+
     internal static async Task InvokeAsync(HttpContext context, ConnectionKeyStore store,
         Func<string, bool> isOwnerCredential, RequestDelegate next)
     {
@@ -60,6 +67,30 @@ internal static class ConnectionKeyHttpAuthorization
         {
             context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
             return;
+        }
+
+        if (bearer.StartsWith("VSDMCP-KEY1:", StringComparison.Ordinal))
+        {
+            if (store.IsKeyAuthRateLimited())
+            {
+                await RejectAuthAsync(context, ConnectionKeyResult.RateLimited);
+                return;
+            }
+            if (!ConnectionKeyCodec.TryDecode(bearer, out var payload) || payload is null)
+            {
+                store.RecordFailedKeyAuth();
+                await RejectAuthAsync(context, store.IsKeyAuthRateLimited()
+                    ? ConnectionKeyResult.RateLimited
+                    : ConnectionKeyResult.Invalid);
+                return;
+            }
+            var envelopeResult = store.ValidateEnvelope(payload, store.Identity);
+            if (envelopeResult != ConnectionKeyResult.Success)
+            {
+                await RejectAuthAsync(context, envelopeResult);
+                return;
+            }
+            bearer = payload.ToBearerValue();
         }
 
         var sessionId = context.Request.Headers["Mcp-Session-Id"].ToString();

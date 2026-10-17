@@ -82,6 +82,39 @@ public sealed class ConnectionKeyStore
     /// <summary>Checks owner-supplied instance identity against the store.</summary>
     public bool MatchesIdentity(ConnectionKeyIdentity identity) => Identity == identity;
 
+    /// <summary>Validates that an encoded key exactly describes this store's pending or active grant.</summary>
+    internal ConnectionKeyResult ValidateEnvelope(ConnectionKeyPayload payload, ConnectionKeyIdentity identity)
+    {
+        lock (_gate)
+        {
+            SweepLocked();
+            if (IsRateLimitedLocked()) return ConnectionKeyResult.RateLimited;
+            if (!Identity.Equals(identity) || payload.VisualStudioPid != Identity.VisualStudioPid ||
+                payload.VisualStudioStartTicks != Identity.VisualStudioStartTicks || payload.ServerPid != Identity.ServerPid ||
+                payload.ServerInstanceId != Identity.ServerInstanceId || payload.Url != Identity.Url)
+                return FailResult(ConnectionKeyResult.IdentityMismatch);
+            if (!_grants.TryGetValue(payload.KeyId, out var grant) ||
+                payload.ExpiresAt != grant.PendingExpiry.ToUnixTimeSeconds() ||
+                !FixedTimeMatch(grant.BearerHash, payload.ToBearerValue()))
+                return FailResult(ConnectionKeyResult.Invalid);
+            return grant.State switch
+            {
+                ConnectionKeyState.Pending when IsPendingExpired(grant) => ExpireAndFail(grant),
+                ConnectionKeyState.Pending => ConnectionKeyResult.Success,
+                ConnectionKeyState.Active when IsActiveExpired(grant) => ExpireAndFail(grant),
+                ConnectionKeyState.Active => ConnectionKeyResult.Success,
+                ConnectionKeyState.Expired or ConnectionKeyState.Revoked => FailResult(ConnectionKeyResult.Expired),
+                _ => FailResult(ConnectionKeyResult.AlreadyUsed)
+            };
+        }
+    }
+
+    private ConnectionKeyResult ExpireAndFail(Grant grant)
+    {
+        Terminalize(grant, ConnectionKeyState.Expired);
+        return FailResult(ConnectionKeyResult.Expired);
+    }
+
     /// <summary>Checks whether a session ID has belonged to a key grant, including retained terminal IDs.</summary>
     public bool IsKeyedSession(string sessionId)
     {
