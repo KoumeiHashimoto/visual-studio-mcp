@@ -53,9 +53,11 @@ public class BuildOperationTools
             return Format(new BuildOperationResult(false, "target_identity_required", "The registered Visual Studio process identity is required.", null, operationId, null, null, null, null, "idle", null, null, null, null, null, 0, 10000), format);
         BuildOperationCoordinator? coordinator;
         lock (Sync) coordinator = _coordinator;
-        var result = coordinator is null
-            ? Idle() with { TargetProcessId = processId }
-            : await coordinator.GetStatusAsync(operationId).ConfigureAwait(false);
+        var result = coordinator is not null
+            ? await coordinator.GetStatusAsync(operationId).ConfigureAwait(false)
+            : operationId is null
+                ? Idle() with { TargetProcessId = processId }
+                : NotRetained(operationId) with { TargetProcessId = processId };
         if (result.Code == "operation_not_found" || result.OperationId is not null || result.State != "idle")
             return Format(result, format);
         var workspaceResult = OpenFolderBuildPolicy.Check(
@@ -100,4 +102,8 @@ public class BuildOperationTools
 
     private static BuildOperationResult Idle() => new(true, "ok", "No build operation has been recorded.", null,
         null, null, null, null, null, "idle", null, null, null, null, false, 0, 10000);
+
+    // A server that has not started a build retains no IDs, including IDs issued by a previous server process.
+    private static BuildOperationResult NotRetained(string operationId) => new(false, "operation_not_found",
+        "The operation ID is not retained.", null, operationId, null, null, null, null, "idle", null, null, null, null, null, 0, 10000);
 }
