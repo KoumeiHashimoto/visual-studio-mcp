@@ -17,6 +17,12 @@ var tests = new (string Name, Action Run)[]
     ("credentials are not retained or formatted", Redaction),
     ("revocation cancels linked request tokens", RevocationCancellation),
     ("HTTP key admission binds a stateful session", HttpAdmission),
+    ("copied key envelope initializes and continues a bound session", HttpCopiedEnvelope),
+    ("copied key envelope metadata and expiry are bound to the grant", HttpEnvelopeTampering),
+    ("copied key envelope remains valid for active session after pending expiry", HttpEnvelopeActiveLifetime),
+    ("copied key envelope observes active idle and absolute expiry", HttpEnvelopeActiveExpiry),
+    ("authorization bounds admit only bounded ASCII envelopes", AuthorizationHeaderBounds),
+    ("malformed copied envelopes reach the key-auth rate limit", HttpEnvelopeRateLimit),
     ("HTTP replay and wrong credentials execute no tools", HttpRejectsReplay),
     ("owner credential cannot select a keyed session", HttpCredentialIsolation),
     ("workspace snapshot route remains owner-only", HttpWorkspaceSnapshotRoute),
@@ -141,6 +147,121 @@ static void HttpAdmission()
     var authenticated = f.Store.AuthenticateSession(p.ToBearerValue(), "sdk-session", f.Store.Identity);
     Assert(authenticated == ConnectionKeyResult.Success, $"session activated before response flush ({authenticated}; {f.Store.GetStatus().ActiveCount}; {context.Response.Headers["Mcp-Session-Id"]})");
 }
+static void HttpCopiedEnvelope()
+{
+    var f = new Fixture(); var issued = f.Store.Issue(); ConnectionKeyCodec.TryDecode(issued.Key, out var p);
+    var calls = 0;
+    var initial = HttpRequest("POST", issued.Key!, "initialize", null);
+    ConnectionKeyHttpAuthorization.InvokeAsync(initial, f.Store, _ => false, async ctx =>
+    { calls++; ctx.Response.Headers["Mcp-Session-Id"] = "copied-session"; await ctx.Response.WriteAsync("{}"); }).GetAwaiter().GetResult();
+    Assert(calls == 1 && initial.Response.StatusCode == 200, "copied envelope initializes");
+    var continuation = HttpRequest("POST", issued.Key!, "tools/list", "copied-session");
+    ConnectionKeyHttpAuthorization.InvokeAsync(continuation, f.Store, _ => false, _ => { calls++; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(calls == 2 && continuation.Response.StatusCode == 200, "copied envelope continues bound session");
+
+    var compound = HttpRequest("POST", p!.ToBearerValue(), "tools/list", "copied-session");
+    ConnectionKeyHttpAuthorization.InvokeAsync(compound, f.Store, _ => false, _ => { calls++; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(calls == 3 && compound.Response.StatusCode == 200, "compound bearer remains compatible for same grant");
+
+    var replay = HttpRequest("POST", issued.Key!, "initialize", null);
+    ConnectionKeyHttpAuthorization.InvokeAsync(replay, f.Store, _ => false, _ => { calls++; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(replay.Response.StatusCode == 401 && calls == 3, "copied envelope replay rejected");
+}
+static void HttpEnvelopeTampering()
+{
+    var f = new Fixture(); var issued = f.Store.Issue(); ConnectionKeyCodec.TryDecode(issued.Key, out var p);
+    var changed = new[]
+    {
+        p! with { VisualStudioPid = p.VisualStudioPid + 1 },
+        p! with { VisualStudioStartTicks = p.VisualStudioStartTicks + 1 },
+        p! with { ServerPid = p.ServerPid + 1 },
+        p! with { ServerInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16)) },
+        p! with { Url = "http://127.0.0.1:4321/mcp" },
+        p! with { ExpiresAt = p.ExpiresAt + 1 },
+        p! with { Token = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(32)) }
+    };
+    foreach (var tampered in changed)
+    {
+        var request = HttpRequest("POST", ConnectionKeyCodec.Encode(tampered), "initialize", null);
+        var called = false;
+        ConnectionKeyHttpAuthorization.InvokeAsync(request, f.Store, _ => false, _ => { called = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+        Assert(request.Response.StatusCode is 401 or 403 && !called, "tampered envelope rejected before SDK");
+    }
+}
+static void HttpEnvelopeActiveLifetime()
+{
+    var f = new Fixture(); var issued = f.Store.Issue(); ConnectionKeyCodec.TryDecode(issued.Key, out var p);
+    var initialize = HttpRequest("POST", issued.Key!, "initialize", null);
+    ConnectionKeyHttpAuthorization.InvokeAsync(initialize, f.Store, _ => false, async ctx =>
+    { ctx.Response.Headers["Mcp-Session-Id"] = "long-session"; await ctx.Response.WriteAsync("{}"); }).GetAwaiter().GetResult();
+    f.Clock.Advance(TimeSpan.FromSeconds(121));
+    var continuation = HttpRequest("POST", issued.Key!, "tools/list", "long-session"); var called = false;
+    ConnectionKeyHttpAuthorization.InvokeAsync(continuation, f.Store, _ => false, _ => { called = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(called && continuation.Response.StatusCode == 200, "active envelope not cut off by pending wall-clock expiry");
+}
+static void HttpEnvelopeActiveExpiry()
+{
+    static (Fixture Fixture, string Key) StartSession(string sessionId)
+    {
+        var f = new Fixture(); var issued = f.Store.Issue();
+        var initialize = HttpRequest("POST", issued.Key!, "initialize", null);
+        ConnectionKeyHttpAuthorization.InvokeAsync(initialize, f.Store, _ => false, async ctx =>
+        { ctx.Response.Headers["Mcp-Session-Id"] = sessionId; await ctx.Response.WriteAsync("{}"); }).GetAwaiter().GetResult();
+        return (f, issued.Key!);
+    }
+
+    var idle = StartSession("idle-session");
+    idle.Fixture.Clock.Advance(TimeSpan.FromMinutes(30));
+    var idleRequest = HttpRequest("POST", idle.Key, "tools/list", "idle-session"); var idleCalled = false;
+    ConnectionKeyHttpAuthorization.InvokeAsync(idleRequest, idle.Fixture.Store, _ => false,
+        _ => { idleCalled = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(!idleCalled && idleRequest.Response.StatusCode == 401, "active envelope expires at idle limit");
+
+    var absolute = StartSession("absolute-session");
+    var elapsed = TimeSpan.Zero;
+    var beforeAbsoluteLimit = TimeSpan.FromHours(7) + TimeSpan.FromMinutes(59);
+    while (elapsed < beforeAbsoluteLimit)
+    {
+        var step = TimeSpan.FromMinutes(29);
+        if (step > beforeAbsoluteLimit - elapsed) step = beforeAbsoluteLimit - elapsed;
+        absolute.Fixture.Clock.Advance(step);
+        elapsed += step;
+        var refresh = HttpRequest("POST", absolute.Key, "tools/list", "absolute-session"); var refreshCalled = false;
+        ConnectionKeyHttpAuthorization.InvokeAsync(refresh, absolute.Fixture.Store, _ => false,
+            _ => { refreshCalled = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+        Assert(refreshCalled && refresh.Response.StatusCode == 200, "active session continues before absolute limit");
+    }
+    absolute.Fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+    var absoluteRequest = HttpRequest("POST", absolute.Key, "tools/list", "absolute-session"); var absoluteCalled = false;
+    ConnectionKeyHttpAuthorization.InvokeAsync(absoluteRequest, absolute.Fixture.Store, _ => false,
+        _ => { absoluteCalled = true; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(!absoluteCalled && absoluteRequest.Response.StatusCode == 401, "active envelope expires at absolute limit");
+}
+static void HttpEnvelopeRateLimit()
+{
+    var f = new Fixture(); var calls = 0;
+    for (var i = 0; i < 10; i++)
+    {
+        var request = HttpRequest("POST", "VSDMCP-KEY1:malformed", "initialize", null);
+        ConnectionKeyHttpAuthorization.InvokeAsync(request, f.Store, _ => false,
+            _ => { calls++; return Task.CompletedTask; }).GetAwaiter().GetResult();
+        if (i < 9) Assert(request.Response.StatusCode == 401, "malformed envelope rejected before rate limit");
+        else Assert(request.Response.StatusCode == 429 && request.Response.Headers.RetryAfter == "5", "malformed envelope receives rate-limit response");
+    }
+    var limited = HttpRequest("POST", "VSDMCP-KEY1:malformed", "initialize", null);
+    ConnectionKeyHttpAuthorization.InvokeAsync(limited, f.Store, _ => false,
+        _ => { calls++; return Task.CompletedTask; }).GetAwaiter().GetResult();
+    Assert(limited.Response.StatusCode == 429 && limited.Response.Headers.RetryAfter == "5" && calls == 0,
+        "rate limit checked before parsing subsequent malformed envelope");
+}
+static void AuthorizationHeaderBounds()
+{
+    Assert(ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed("Bearer vsc1.short.token.otp", 1), "short legacy header admitted to auth parser");
+    Assert(!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed("Bearer VSDMCP-KEY1:" + new string('A', 8193), 1), "oversized envelope rejected");
+    Assert(!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed("Bearer VSDMCP-KEY1:" + "abc\u0100", 1), "non-ASCII header rejected");
+    Assert(!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed("Bearer VSDMCP-KEY1:abc", 2), "duplicate headers rejected");
+    Assert(!ConnectionKeyHttpAuthorization.IsAuthorizationHeaderAllowed("Bearer " + new string('x', 257), 1), "oversized short credential rejected");
+}
 static void HttpRejectsReplay()
 {
     var f = new Fixture(); var issued=f.Store.Issue(); ConnectionKeyCodec.TryDecode(issued.Key,out var p);
@@ -166,6 +287,10 @@ static void HttpCredentialIsolation()
     keyOnOwner.Request.Path="/_vsix/connection-key/status";
     ConnectionKeyHttpAuthorization.InvokeAsync(keyOnOwner,f.Store,_=>false,_=>{called=true;return Task.CompletedTask;}).GetAwaiter().GetResult();
     Assert(keyOnOwner.Response.StatusCode==401 && !called,"compound credential rejected on owner route");
+    var envelopeOnOwner=HttpRequest("POST",issued.Key!,"issue",null);
+    envelopeOnOwner.Request.Path="/_vsix/connection-key/status";
+    ConnectionKeyHttpAuthorization.InvokeAsync(envelopeOnOwner,f.Store,_=>false,_=>{called=true;return Task.CompletedTask;}).GetAwaiter().GetResult();
+    Assert(envelopeOnOwner.Response.StatusCode==401 && !called,"copied envelope rejected on owner route");
 }
 static void HttpDeleteClosesFirst()
 {
