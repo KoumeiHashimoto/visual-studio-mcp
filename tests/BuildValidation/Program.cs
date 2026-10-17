@@ -261,6 +261,81 @@ foreach (var action in Enum.GetValues<BuildAction>())
 }
 
 {
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget)
+    {
+        DispatchFailure = new BuildDispatchException("STA dispatch wait expired after execution started.", true,
+            new TimeoutException("dispatch wait expired"))
+    };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Code == "result_unknown" && result.State == "unknown" && result.Outcome == "unknown",
+        "started STA dispatch timeout remains an unknown active operation");
+    Check(!gate.TryAcquire(), "started STA dispatch timeout retains the shared mutation gate");
+    adapter.TargetOverride = validTarget with { TargetProcessId = 42, RegisteredProcessId = 42 };
+    var wrongTarget = await coordinator.GetStatusAsync(result.OperationId);
+    Check(wrongTarget.Code == "result_unknown" && !gate.TryAcquire(),
+        "status recovery refuses an idle snapshot from another Visual Studio process");
+    adapter.TargetOverride = validTarget with { IsBuildInProgress = true };
+    var running = await coordinator.GetStatusAsync(result.OperationId);
+    Check(running.Code == "result_unknown" && !gate.TryAcquire(),
+        "same-target status recovery keeps the gate while Visual Studio is still building");
+    adapter.TargetOverride = validTarget;
+    var recovered = await coordinator.GetStatusAsync(result.OperationId);
+    Check(recovered.Code == "result_unknown" && recovered.Outcome == "unknown" && recovered.IsBuildInProgress == false,
+        "same-target idle recheck resolves ownership without inventing a build result");
+    Check(gate.TryAcquire(), "same-target idle recovery releases the gate after subscription cleanup");
+    gate.Release();
+}
+
+{
+    var adapter = new FakeAdapter(validTarget)
+    {
+        CompleteDuringDispatch = true,
+        TargetReadDelayMilliseconds = 150,
+        SubscribeDelayMilliseconds = 150
+    };
+    var result = await new BuildOperationCoordinator(adapter).ExecuteAsync(
+        BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Outcome == "succeeded", "request deadline permits a build after bounded target and subscription work");
+    Check(adapter.LastDispatchTimeout > TimeSpan.Zero && adapter.LastDispatchTimeout < TimeSpan.FromMilliseconds(850),
+        "STA dispatch receives only the remaining caller deadline");
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget)
+    {
+        DispatchFailure = new BuildDispatchException("STA dispatch wait expired after execution started.", true,
+            new TimeoutException("dispatch wait expired"))
+    };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Code == "result_unknown" && !gate.TryAcquire(), "uncertain dispatch waits for a correlated terminal event");
+    adapter.RaiseBegin(new BuildEventSnapshot(validTarget.SolutionPath, true, false, null, true));
+    adapter.RaiseDone(new BuildEventSnapshot(validTarget.SolutionPath, false, false, 0, true));
+    Check(coordinator.GetStatus(result.OperationId).Outcome == "succeeded",
+        "a later correlated completion resolves a timed-out STA dispatch");
+    Check(gate.TryAcquire(), "correlated completion releases the timed-out dispatch gate");
+    gate.Release();
+}
+
+{
+    var gate = new WorkspaceMutationGate();
+    var adapter = new FakeAdapter(validTarget)
+    {
+        DispatchFailure = new BuildDispatchException("STA dispatch timed out before execution started.", false,
+            new TimeoutException("queue wait expired"))
+    };
+    var coordinator = new BuildOperationCoordinator(adapter, gate);
+    var result = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 1000);
+    Check(result.Code == "com_timeout" && result.Outcome == "unknown",
+        "pre-dispatch STA timeout reports no completed build result");
+    Check(gate.TryAcquire(), "pre-dispatch timeout releases the gate after subscription cleanup");
+    gate.Release();
+}
+
+{
     var coordinator = new BuildOperationCoordinator(new FakeAdapter(validTarget) { CompleteDuringDispatch = true });
     var ids = new List<string>();
     for (var i = 0; i < 35; i++)
@@ -290,27 +365,43 @@ sealed class FakeAdapter(BuildTargetSnapshot snapshot) : IBuildOperationAdapter
     public TaskCompletionSource? CleanupBarrier { get; init; }
     public bool FailCleanup { get; init; }
     public bool FailSubscribeAfterAttach { get; init; }
+    public BuildDispatchException? DispatchFailure { get; init; }
+    public BuildTargetSnapshot? TargetOverride { get; set; }
+    public int TargetReadDelayMilliseconds { get; init; }
+    public int SubscribeDelayMilliseconds { get; init; }
+    public TimeSpan LastReadTimeout { get; private set; }
+    public TimeSpan LastSubscribeTimeout { get; private set; }
+    public TimeSpan LastDispatchTimeout { get; private set; }
     public string? EventSolutionPath { get; init; }
     public int DispatchCount { get; private set; }
     public int DetachCount { get; private set; }
     public BuildAction? LastAction { get; private set; }
     public bool SubscribedBeforeDispatch { get; private set; }
     public TaskCompletionSource Dispatched { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    public BuildTargetSnapshot ReadTargetSnapshot() => snapshot;
-    public IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone)
+    public BuildTargetSnapshot ReadTargetSnapshot(TimeSpan timeout)
     {
+        LastReadTimeout = timeout;
+        if (TargetReadDelayMilliseconds > 0) Thread.Sleep(TargetReadDelayMilliseconds);
+        return TargetOverride ?? snapshot;
+    }
+    public IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone, TimeSpan timeout)
+    {
+        LastSubscribeTimeout = timeout;
+        if (SubscribeDelayMilliseconds > 0) Thread.Sleep(SubscribeDelayMilliseconds);
         _begin = onBegin;
         _done = onDone;
         if (BeginOnSubscribe) _begin(new BuildEventSnapshot(snapshot.SolutionPath, true, false, null, false));
         if (FailSubscribeAfterAttach) throw new InvalidOperationException("subscription attach failed after a partial registration");
         return new Detach(this);
     }
-    public void Dispatch(BuildAction action, int correlationWindowMilliseconds)
+    public void Dispatch(BuildAction action, int correlationWindowMilliseconds, TimeSpan timeout)
     {
+        LastDispatchTimeout = timeout;
         DispatchCount++;
         SubscribedBeforeDispatch = _begin is not null && _done is not null;
         Dispatched.TrySetResult();
         LastAction = action;
+        if (DispatchFailure is not null) throw DispatchFailure;
         if (!CompleteDuringDispatch) return;
         var path = EventSolutionPath ?? snapshot.SolutionPath;
         if (BeginDuringDispatch) _begin?.Invoke(new BuildEventSnapshot(path, true, false, null, true));

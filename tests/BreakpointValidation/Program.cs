@@ -96,7 +96,7 @@ if (OperatingSystem.IsWindows())
             VisualStudioMcpServer.StaComDispatcher.Invoke(() => expiredOperationRan = true, TimeSpan.FromMilliseconds(50));
             throw new Exception("The queued operation did not time out.");
         }
-        catch (TimeoutException) { }
+        catch (VisualStudioMcpServer.StaComInvocationTimeoutException ex) when (!ex.ExecutionStarted) { }
         cleanup = VisualStudioMcpServer.StaComDispatcher.Post(() => cleanupRan = true);
         try
         {
@@ -111,5 +111,27 @@ if (OperatingSystem.IsWindows())
     VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
     if (expiredOperationRan) throw new InvalidOperationException("An expired queued operation executed after its caller timed out.");
     if (!cleanupRan) throw new InvalidOperationException("Required cleanup was discarded when its caller stopped waiting.");
-    Console.WriteLine("Passed 5 Windows STA dispatcher checks.");
+
+    using var startedCallEntered = new ManualResetEventSlim();
+    using var startedCallRelease = new ManualResetEventSlim();
+    var executionStarted = false;
+    var startedCaller = Task.Run(() =>
+    {
+        try
+        {
+            VisualStudioMcpServer.StaComDispatcher.Invoke(() =>
+            {
+                startedCallEntered.Set();
+                if (!startedCallRelease.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Started-call blocker was not released.");
+                return true;
+            }, TimeSpan.FromMilliseconds(50));
+        }
+        catch (VisualStudioMcpServer.StaComInvocationTimeoutException ex) { executionStarted = ex.ExecutionStarted; }
+    });
+    if (!startedCallEntered.Wait(TimeSpan.FromSeconds(2))) throw new TimeoutException("Started-call blocker did not start.");
+    startedCaller.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+    startedCallRelease.Set();
+    VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
+    if (!executionStarted) throw new InvalidOperationException("The dispatcher did not report that the timed-out COM operation had started.");
+    Console.WriteLine("Passed 7 Windows STA dispatcher checks.");
 }

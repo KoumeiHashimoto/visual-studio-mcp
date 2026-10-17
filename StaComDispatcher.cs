@@ -4,6 +4,12 @@ using System.Runtime.InteropServices;
 
 namespace VisualStudioMcpServer;
 
+internal sealed class StaComInvocationTimeoutException(string message, bool executionStarted, Exception innerException)
+    : TimeoutException(message, innerException)
+{
+    public bool ExecutionStarted { get; } = executionStarted;
+}
+
 /// <summary>
 /// Marshals Visual Studio COM calls to a dedicated STA thread.
 /// </summary>
@@ -73,6 +79,12 @@ internal static class StaComDispatcher
         try
         {
             return completion.Task.WaitAsync(timeout ?? TimeSpan.FromSeconds(15), cancellationToken).GetAwaiter().GetResult();
+        }
+        catch (TimeoutException ex)
+        {
+            var executionStarted = Volatile.Read(ref state) == 1;
+            if (!executionStarted) Interlocked.CompareExchange(ref state, 2, 0);
+            throw new StaComInvocationTimeoutException(ex.Message, executionStarted, ex);
         }
         finally
         {

@@ -22,7 +22,7 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
         _targetStartTicks = targetStartTicks;
     }
 
-    public BuildTargetSnapshot ReadTargetSnapshot() => StaComDispatcher.Invoke(() =>
+    public BuildTargetSnapshot ReadTargetSnapshot(TimeSpan timeout) => StaComDispatcher.Invoke(() =>
     {
         var alive = false;
         try
@@ -54,9 +54,9 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
             configuration?.Name, null,
             debuggerMode.Contains("Design", StringComparison.OrdinalIgnoreCase),
             state == vsBuildState.vsBuildStateInProgress, false);
-    }, TimeSpan.FromSeconds(5));
+    }, timeout);
 
-    public IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone) =>
+    public IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone, TimeSpan timeout) =>
         StaComDispatcher.Invoke(() =>
         {
             var dte = _dte ?? VisualStudioConnector.GetActiveVS()
@@ -69,39 +69,55 @@ internal sealed class DteBuildOperationAdapter : IBuildOperationAdapter
             _buildEvents.OnBuildBegin += OnBuildBegin;
             _buildEvents.OnBuildDone += OnBuildDone;
             return (IDisposable)new Subscription(this);
-        }, TimeSpan.FromSeconds(5));
+        }, timeout);
 
     private BuildEvents? _buildEvents;
     private Action<BuildEventSnapshot>? _onBegin;
     private Action<BuildEventSnapshot>? _onDone;
 
-    public void Dispatch(BuildAction action, int correlationWindowMilliseconds) => StaComDispatcher.Invoke(() =>
+    public void Dispatch(BuildAction action, int correlationWindowMilliseconds, TimeSpan timeout)
     {
-        var dte = _dte ?? VisualStudioConnector.GetActiveVS()
-            ?? throw new COMException("The registered Visual Studio automation object is disconnected.");
-        _dispatching = true;
-        _requestedAction = action;
-        _eventOwnership.BeginDispatch(correlationWindowMilliseconds, DateTimeOffset.UtcNow);
         try
         {
-            switch (action)
+            _ = StaComDispatcher.Invoke(() =>
             {
-                case BuildAction.Build:
-                    dte.Solution.SolutionBuild.Build(false);
-                    break;
-                case BuildAction.Rebuild:
-                    dte.ExecuteCommand("Build.RebuildSolution");
-                    break;
-                case BuildAction.Clean:
-                    dte.Solution.SolutionBuild.Clean(false);
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(action));
-            }
-            return true;
+                var dte = _dte ?? VisualStudioConnector.GetActiveVS()
+                    ?? throw new COMException("The registered Visual Studio automation object is disconnected.");
+                _dispatching = true;
+                _requestedAction = action;
+                _eventOwnership.BeginDispatch(correlationWindowMilliseconds, DateTimeOffset.UtcNow);
+                try
+                {
+                    switch (action)
+                    {
+                        case BuildAction.Build:
+                            dte.Solution.SolutionBuild.Build(false);
+                            break;
+                        case BuildAction.Rebuild:
+                            dte.ExecuteCommand("Build.RebuildSolution");
+                            break;
+                        case BuildAction.Clean:
+                            dte.Solution.SolutionBuild.Clean(false);
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException(nameof(action));
+                    }
+                    return true;
+                }
+                finally { _dispatching = false; }
+            }, timeout);
         }
-        finally { _dispatching = false; }
-    }, TimeSpan.FromSeconds(10));
+        catch (StaComInvocationTimeoutException ex)
+        {
+            throw new BuildDispatchException(ex.Message, ex.ExecutionStarted, ex);
+        }
+        catch (TimeoutException) { throw; }
+        catch (BuildActionUnavailableException) { throw; }
+        catch (Exception ex)
+        {
+            throw new BuildDispatchException(ex.Message, true, ex);
+        }
+    }
 
     public Task DisposeSubscriptionAsync(IDisposable subscription) => StaComDispatcher.Post(subscription.Dispose);
 

@@ -38,11 +38,23 @@ internal enum BuildAction { Build, Rebuild, Clean }
 
 internal sealed class BuildActionUnavailableException(string message) : Exception(message);
 
+internal sealed class BuildDispatchException(string message, bool executionStarted, Exception innerException) : Exception(message, innerException)
+{
+    public bool ExecutionStarted { get; } = executionStarted;
+    public string FailureCode => InnerException switch
+    {
+        TimeoutException => "com_timeout",
+        COMException => "com_error",
+        BuildActionUnavailableException => "build_action_unavailable",
+        _ => "operation_failed"
+    };
+}
+
 internal interface IBuildOperationAdapter
 {
-    BuildTargetSnapshot ReadTargetSnapshot();
-    IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone);
-    void Dispatch(BuildAction action, int correlationWindowMilliseconds);
+    BuildTargetSnapshot ReadTargetSnapshot(TimeSpan timeout);
+    IDisposable SubscribeBuildEvents(Action<BuildEventSnapshot> onBegin, Action<BuildEventSnapshot> onDone, TimeSpan timeout);
+    void Dispatch(BuildAction action, int correlationWindowMilliseconds, TimeSpan timeout);
     Task DisposeSubscriptionAsync(IDisposable subscription);
 }
 
@@ -105,7 +117,7 @@ internal sealed class BuildOperationCoordinator
         int? targetProcessId,
         long? targetProcessStartUtcTicks,
         bool allowBuild,
-        int timeoutMilliseconds = 15000,
+        int timeoutMilliseconds = 10000,
         string format = "json",
         CancellationToken cancellationToken = default,
         bool waitForBuild = true)
@@ -137,7 +149,9 @@ internal sealed class BuildOperationCoordinator
         try
         {
             BuildTargetSnapshot target;
-            try { target = _adapter.ReadTargetSnapshot(); }
+            var targetTimeout = Remaining();
+            if (targetTimeout <= TimeSpan.Zero) return Result(false, "com_timeout", "The build request deadline expired before target inspection.");
+            try { target = _adapter.ReadTargetSnapshot(targetTimeout); }
             catch (TimeoutException ex) { return Result(false, "com_timeout", Limit(ex.Message)); }
             catch (COMException ex) { return Result(false, "com_error", $"Visual Studio rejected target inspection (HRESULT 0x{ex.HResult:X8})."); }
             catch (Exception ex) { return Result(false, "com_error", Limit(ex.Message)); }
@@ -150,7 +164,8 @@ internal sealed class BuildOperationCoordinator
             configuration = target.Configuration;
             platform = target.Platform;
             operationId = Guid.NewGuid().ToString("N");
-            active = new ActiveOperation(operationId, action, solutionPath!, configuration!, platform, targetProcessId, timeout, started);
+            active = new ActiveOperation(operationId, action, solutionPath!, configuration!, platform,
+                targetProcessId, targetProcessStartUtcTicks, timeout, started);
             lock (_sync)
             {
                 if (_active is not null) return Result(false, "build_busy", "A build operation is already active.");
@@ -159,9 +174,15 @@ internal sealed class BuildOperationCoordinator
 
             try
             {
+                var subscribeTimeout = Remaining();
+                if (subscribeTimeout <= TimeSpan.Zero)
+                {
+                    Finish(active, "unknown", "com_timeout", "The build request deadline expired before event subscription.", null, null, false);
+                    return active.Current;
+                }
                 subscription = _adapter.SubscribeBuildEvents(
                     begin => OnBuildBegin(active, begin),
-                    done => OnBuildDone(active, done));
+                    done => OnBuildDone(active, done), subscribeTimeout);
                 active.Subscription = subscription;
             }
             catch (Exception ex)
@@ -172,6 +193,12 @@ internal sealed class BuildOperationCoordinator
             }
 
             // A begin event between subscription and dispatch belongs to an external operation.
+            var dispatchTimeout = Remaining();
+            if (dispatchTimeout <= TimeSpan.Zero)
+            {
+                Finish(active, "unknown", "com_timeout", "The build request deadline expired before dispatch.", null, null, false);
+                return active.Current;
+            }
             lock (_sync)
             {
                 if (active.ForeignActivity)
@@ -182,10 +209,36 @@ internal sealed class BuildOperationCoordinator
                 active.Dispatching = true;
             }
 
-            try { _adapter.Dispatch(action, timeout); }
+            try { _adapter.Dispatch(action, timeout, dispatchTimeout); }
             catch (BuildActionUnavailableException ex)
             {
                 Finish(active, "unknown", "build_action_unavailable", Limit(ex.Message), null, null, false);
+                return active.Current;
+            }
+            catch (BuildDispatchException ex)
+            {
+                if (!ex.ExecutionStarted)
+                {
+                    Finish(active, "unknown", ex.FailureCode, Limit(ex.Message), null, null, false);
+                    return active.Current;
+                }
+
+                lock (_sync)
+                {
+                    if (!active.Terminal)
+                    {
+                        active.Dispatched = true;
+                        active.DispatchUncertain = true;
+                        if (active.ForeignActivity)
+                            active.Current = Snapshot(active, false,
+                                "The dispatch call timed out after entering the STA; a foreign or uncertain build event prevents attribution.",
+                                "unknown", "unknown", null, null, code: "result_unknown");
+                        else if (active.DoneObserved) CompleteFromDoneLocked(active);
+                        else active.Current = Snapshot(active, false,
+                            "The dispatch call timed out after entering the STA; the Visual Studio action may still be running.",
+                            "unknown", "unknown", null, null, code: "result_unknown");
+                    }
+                }
                 return active.Current;
             }
             catch (TimeoutException ex)
@@ -221,9 +274,12 @@ internal sealed class BuildOperationCoordinator
             if (!waitForBuild && !active.Terminal) return active.Current;
             if (!active.Terminal)
             {
+                var waitTimeout = Remaining();
+                if (waitTimeout <= TimeSpan.Zero)
+                    return RecordWaitResult(active, "build_wait_timeout", "The build did not reach a terminal event before the deadline.");
                 try
                 {
-                    await active.Completed.Task.WaitAsync(TimeSpan.FromMilliseconds(timeout), cancellationToken).ConfigureAwait(false);
+                    await active.Completed.Task.WaitAsync(waitTimeout, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -243,6 +299,7 @@ internal sealed class BuildOperationCoordinator
             // Keep the event subscription and workspace gate while the outcome is pending or uncertain.
         }
 
+        TimeSpan Remaining() => TimeSpan.FromMilliseconds(Math.Max(0, timeout - Stopwatch.GetElapsedTime(started).TotalMilliseconds));
         BuildOperationResult Result(bool success, string code, string message) => new(success, code, Limit(message), targetProcessId, null, action.ToString().ToLowerInvariant(), null, null, null, "idle", null, null, null, null, null, Elapsed(started), timeout);
     }
 
@@ -254,6 +311,33 @@ internal sealed class BuildOperationCoordinator
             if (requestedOperationId is null) return _terminal.First?.Value ?? IdleResult();
             return _terminal.FirstOrDefault(x => x.OperationId == requestedOperationId) ?? new BuildOperationResult(false, "operation_not_found", "The operation ID is not retained.", null, requestedOperationId, null, null, null, null, "idle", null, null, null, null, null, 0, 15000);
         }
+    }
+
+    public async Task<BuildOperationResult> GetStatusAsync(string? requestedOperationId = null)
+    {
+        ActiveOperation? uncertain;
+        lock (_sync)
+        {
+            uncertain = _active is not null && !_active.Terminal && _active.DispatchUncertain &&
+                (requestedOperationId is null || _active.Id == requestedOperationId) ? _active : null;
+            if (uncertain is null) return GetStatus(requestedOperationId);
+        }
+
+        BuildTargetSnapshot target;
+        try { target = await Task.Run(() => _adapter.ReadTargetSnapshot(TimeSpan.FromSeconds(5))).ConfigureAwait(false); }
+        catch { return uncertain.Current; }
+
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_active, uncertain) || uncertain.Terminal || !uncertain.DispatchUncertain)
+                return GetStatus(requestedOperationId);
+            if (!IsSameTargetIdle(target, uncertain)) return uncertain.Current;
+            FinishLocked(uncertain, "unknown", "result_unknown",
+                "The same Visual Studio target is idle; the action result remains unknown, but no build is in progress.",
+                null, null, false);
+        }
+        CleanupIfTerminal(uncertain, uncertain.Subscription);
+        return uncertain.Current;
     }
 
     private void OnBuildBegin(ActiveOperation op, BuildEventSnapshot evt)
@@ -359,7 +443,8 @@ internal sealed class BuildOperationCoordinator
     private void FinishLocked(ActiveOperation op, string outcome, string code, string message, bool? buildSucceeded, int? failedProjectCount, bool? inProgress)
     {
         op.Terminal = true;
-        op.Current = Snapshot(op, code is "ok", message, "completed", outcome, buildSucceeded, inProgress, true, failedProjectCount, code);
+        var state = outcome == "unknown" ? "unknown" : "completed";
+        op.Current = Snapshot(op, code is "ok", message, state, outcome, buildSucceeded, inProgress, true, failedProjectCount, code);
         if (!_terminal.Any(item => item.OperationId == op.Id))
         {
             _terminal.AddFirst(op.Current);
@@ -417,6 +502,14 @@ internal sealed class BuildOperationCoordinator
         return null;
     }
 
+    private static bool IsSameTargetIdle(BuildTargetSnapshot target, ActiveOperation operation) =>
+        target.TargetProcessId == operation.TargetProcessId &&
+        target.TargetProcessStartUtcTicks == operation.TargetProcessStartUtcTicks &&
+        target.RegisteredProcessId == operation.TargetProcessId &&
+        target.RegisteredProcessStartUtcTicks == operation.TargetProcessStartUtcTicks &&
+        target.DteConnected && PathsEqual(target.SolutionPath, operation.SolutionPath) &&
+        !target.IsBuildInProgress && !target.HasForeignOrUncertainBuild;
+
     private static bool PathsEqual(string? a, string? b)
     {
         try { return a is not null && b is not null && string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); }
@@ -441,7 +534,7 @@ internal sealed class BuildOperationCoordinator
     private static BuildOperationResult Snapshot(ActiveOperation op, bool success, string message, string state, string? outcome, bool? buildSucceeded, bool? inProgress, bool includeFailedCount = false, int? failedProjectCount = null, string? code = null) =>
         new(success, code ?? (success ? "ok" : "operation_failed"), Limit(message), op.TargetProcessId, op.Id, op.Action.ToString().ToLowerInvariant(), op.SolutionPath, op.Configuration, op.Platform, state, outcome, buildSucceeded, includeFailedCount ? failedProjectCount : null, includeFailedCount ? failedProjectCount : null, inProgress, Elapsed(op.Started), op.TimeoutMilliseconds);
 
-    private sealed class ActiveOperation(string id, BuildAction action, string solutionPath, string configuration, string? platform, int? targetProcessId, int timeoutMilliseconds, long started)
+    private sealed class ActiveOperation(string id, BuildAction action, string solutionPath, string configuration, string? platform, int? targetProcessId, long? targetProcessStartUtcTicks, int timeoutMilliseconds, long started)
     {
         public string Id { get; } = id;
         public BuildAction Action { get; } = action;
@@ -449,12 +542,13 @@ internal sealed class BuildOperationCoordinator
         public string Configuration { get; } = configuration;
         public string? Platform { get; } = platform;
         public int? TargetProcessId { get; } = targetProcessId;
+        public long? TargetProcessStartUtcTicks { get; } = targetProcessStartUtcTicks;
         public int TimeoutMilliseconds { get; } = timeoutMilliseconds;
         public long Started { get; } = started;
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public BuildOperationResult Current { get; set; } = null!;
         public IDisposable? Subscription { get; set; }
-        public bool Dispatching, Dispatched, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, SubscriptionCleanupUncertain, CleanupScheduled, GateReleased;
+        public bool Dispatching, Dispatched, DispatchUncertain, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, SubscriptionCleanupUncertain, CleanupScheduled, GateReleased;
         public string? ForeignActivityReason { get; set; }
         public BuildEventSnapshot? DoneEvent { get; set; }
     }

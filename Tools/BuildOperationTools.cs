@@ -45,14 +45,17 @@ public class BuildOperationTools
 
     [McpServerTool]
     [Description("Returns the active or most recently retained build operation. An unknown operationId returns operation_not_found. An Open Folder workspace requires expectedWorkspaceRoot and returns unsupported when no public action can be bound.")]
-    public static string GetBuildStatus(string? operationId = null, string format = "json",
+    public static async Task<string> GetBuildStatus(string? operationId = null, string format = "json",
         [Description("For an Open Folder workspace, the exact expected absolute workspace root.")] string? expectedWorkspaceRoot = null)
     {
         if (!ValidFormat(format)) return Format(new BuildOperationResult(false, "invalid_format", "Format must be json or text.", null, operationId, null, null, null, null, "idle", null, null, null, null, null, 0, 10000), format);
         if (!VisualStudioConnector.TryGetTargetProcessIdentity(out var processId, out var startTicks))
             return Format(new BuildOperationResult(false, "target_identity_required", "The registered Visual Studio process identity is required.", null, operationId, null, null, null, null, "idle", null, null, null, null, null, 0, 10000), format);
-        BuildOperationResult result;
-        lock (Sync) result = _coordinator?.GetStatus(operationId) ?? Idle() with { TargetProcessId = processId };
+        BuildOperationCoordinator? coordinator;
+        lock (Sync) coordinator = _coordinator;
+        var result = coordinator is null
+            ? Idle() with { TargetProcessId = processId }
+            : await coordinator.GetStatusAsync(operationId).ConfigureAwait(false);
         if (result.Code == "operation_not_found" || result.OperationId is not null || result.State != "idle")
             return Format(result, format);
         var workspaceResult = OpenFolderBuildPolicy.Check(
