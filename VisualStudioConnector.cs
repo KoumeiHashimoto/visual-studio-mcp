@@ -671,6 +671,7 @@ public static class VisualStudioConnector
             var (dte, mode) = GetPausedDebugger();
             dynamic threads = dte.Debugger.CurrentProgram.Threads;
             dynamic currentThread = dte.Debugger.CurrentThread;
+            var currentThreadId = (int)currentThread.ID;
             var count = (int)threads.Count;
             var items = new List<DebuggerThreadInfo>();
             var returned = Math.Min(count, 64);
@@ -683,7 +684,7 @@ public static class VisualStudioConnector
                     Id = id,
                     Name = ReadBoundedString(() => (string?)thread.Name),
                     FrameCount = ReadInteger(() => (int)thread.StackFrames.Count),
-                    IsCurrent = id == ReadInteger(() => (int)currentThread.ID)
+                    IsCurrent = id == currentThreadId
                 });
             }
 
@@ -694,6 +695,7 @@ public static class VisualStudioConnector
                 Message = $"Listed {items.Count} thread(s).",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = mode,
+                CurrentThreadId = currentThreadId,
                 Threads = items,
                 TotalCount = count,
                 Truncated = count > returned
@@ -800,6 +802,7 @@ public static class VisualStudioConnector
                     Message = $"Selected thread {threadId}.",
                     TargetProcessId = _targetProcessId,
                     DebuggerMode = dte.Debugger.CurrentMode.ToString(),
+                    CurrentThreadId = threadId,
                     Threads = new List<DebuggerThreadInfo> { ReadDebuggerThread(threadId, thread, true) }
                 };
             }
@@ -843,16 +846,7 @@ public static class VisualStudioConnector
                 Message = $"Selected frame {index} ({current.Function}).",
                 TargetProcessId = _targetProcessId,
                 DebuggerMode = dte.Debugger.CurrentMode.ToString(),
-                Frames = new List<DebuggerFrameInfo> { new()
-                    {
-                        Index = current.Index,
-                        Function = current.Function,
-                        Module = current.Module,
-                        File = current.File,
-                        Line = current.Line,
-                        Language = current.Language,
-                        IsCurrent = true
-                    } }
+                Frames = new List<DebuggerFrameInfo> { ReadDebuggerFrame(index, frame, true) }
             };
         }
         catch (BreakpointOperationException ex) { return CreateInspectionError(ex.Code, ex.Message); }
@@ -882,8 +876,7 @@ public static class VisualStudioConnector
         {
             var (dte, mode) = GetPausedDebugger();
             var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
-            if (currentThreadId != expectedThreadId)
-                return CreateInspectionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            RequireCurrentThread(dte, currentThreadId, expectedThreadId);
             dynamic frames = dte.Debugger.CurrentThread.StackFrames;
             var count = (int)frames.Count;
             if (frameIndex > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
@@ -1097,17 +1090,58 @@ public static class VisualStudioConnector
         IsCurrent = isCurrent
     };
 
-    /// <summary>Reads supported frame metadata; EnvDTE.StackFrame has no source-coordinate properties.</summary>
-    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent) => new()
+    /// <summary>Rejects missing and non-current thread identities without changing debugger selection.</summary>
+    private static void RequireCurrentThread(DTE2 dte, int currentThreadId, int expectedThreadId)
     {
-        Index = index,
-        Function = ReadBoundedString(() => (string?)frame.FunctionName),
-        Module = ReadBoundedString(() => (string?)frame.Module),
-        File = string.Empty,
-        Line = 0,
-        Language = ReadBoundedString(() => (string?)frame.Language),
-        IsCurrent = isCurrent
-    };
+        if (currentThreadId == expectedThreadId) return;
+        dynamic threads = dte.Debugger.CurrentProgram.Threads;
+        var count = (int)threads.Count;
+        for (var index = 1; index <= Math.Min(count, 512); index++)
+        {
+            if ((int)threads.Item(index).ID == expectedThreadId)
+                throw new BreakpointOperationException("thread_not_current", "The requested thread exists but is not selected. Call select_debugger_thread, then get_call_stack before inspecting locals or evaluating expressions.");
+        }
+        if (count > 512)
+            throw new BreakpointOperationException("thread_lookup_incomplete", "The requested thread was not found within the 512-thread inspection limit; its absence could not be established. Select a thread from list_debugger_threads and get its stack again.");
+        throw new BreakpointOperationException("thread_not_found", "The requested thread ID is not present in the paused process. List threads and choose an existing thread ID.");
+    }
+
+    /// <summary>Reads frame metadata and source coordinates when the StackFrame2 provider supports them.</summary>
+    private static DebuggerFrameInfo ReadDebuggerFrame(int index, dynamic frame, bool isCurrent)
+    {
+        var language = ReadBoundedString(() => (string?)frame.Language);
+        var result = new DebuggerFrameInfo
+        {
+            Index = index,
+            Function = ReadBoundedString(() => (string?)frame.FunctionName),
+            Module = ReadBoundedString(() => (string?)frame.Module),
+            Language = DebuggerMetadata.NormalizeLanguage(language),
+            LanguageDisplayName = language,
+            IsCurrent = isCurrent
+        };
+        try
+        {
+            if (frame is EnvDTE90a.StackFrame2 sourceFrame)
+            {
+                var file = sourceFrame.FileName;
+                var line = sourceFrame.LineNumber;
+                if (!string.IsNullOrWhiteSpace(file) && file.Length <= 2048 && line > 0 && line <= int.MaxValue)
+                {
+                    result.File = file;
+                    result.Line = (int)line;
+                    result.SourceLocationUnavailableReason = null;
+                }
+                else
+                    result.SourceLocationUnavailableReason = file?.Length > 2048 || line > int.MaxValue
+                        ? "source_location_exceeds_limit" : "source_location_not_reported";
+            }
+        }
+        catch (COMException)
+        {
+            result.SourceLocationUnavailableReason = "source_location_com_error";
+        }
+        return result;
+    }
 
     private static DebuggerVariableInfo ReadDebuggerVariable(dynamic expression, int depth, bool allowMemberExpansion, ref int remaining)
     {
@@ -1174,8 +1208,7 @@ public static class VisualStudioConnector
         {
             var (dte, _) = GetPausedDebugger();
             var currentThreadId = (int)dte.Debugger.CurrentThread.ID;
-            if (currentThreadId != expectedThreadId)
-                return CreateExpressionError("stale_thread", "The selected thread changed since it was listed. List threads and the stack again.");
+            RequireCurrentThread(dte, currentThreadId, expectedThreadId);
             dynamic frames = dte.Debugger.CurrentThread.StackFrames;
             var frameCount = (int)frames.Count;
             if (frameIndex > frameCount)
