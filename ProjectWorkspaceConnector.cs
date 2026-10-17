@@ -10,7 +10,7 @@ namespace VisualStudioMcpServer;
 internal sealed class ProjectWorkspaceConnector
 {
     private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
-    private const int MaxDepth = 32;
+    internal const int MaxDepth = 32;
     private const int MaxNodes = ProjectTraversalBudget.MaxNodes;
     private readonly ProjectSnapshotStore _store;
 
@@ -246,12 +246,11 @@ internal sealed class ProjectWorkspaceConnector
         string parentLogical, string wantedLogicalPath, int depth, HashSet<string> visited,
         DateTimeOffset deadline, CancellationToken cancellationToken)
     {
-        var traversal = new ProjectTraversalBudget();
         return FindProject(projects, wantedPath, wantedKind, parentLogical, wantedLogicalPath,
-            depth, visited, traversal, deadline, cancellationToken);
+            depth, visited, new ProjectTraversalBudget(), deadline, cancellationToken);
     }
 
-    private static Project? FindProject(Projects projects, string? wantedPath, string? wantedKind,
+    internal static Project? FindProject(Projects projects, string? wantedPath, string? wantedKind,
         string parentLogical, string wantedLogicalPath, int depth, HashSet<string> visited,
         ProjectTraversalBudget traversal, DateTimeOffset deadline, CancellationToken cancellationToken)
     {
@@ -402,7 +401,7 @@ internal sealed class ProjectWorkspaceConnector
         catch (InvalidOperationException) { if (warning is not null) warningSink?.Invoke(warning); return fallback; }
     }
 
-    private static void CheckDeadline(DateTimeOffset deadline, CancellationToken token)
+    internal static void CheckDeadline(DateTimeOffset deadline, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (DateTimeOffset.UtcNow >= deadline) throw new TimeoutException("The project inventory deadline expired.");

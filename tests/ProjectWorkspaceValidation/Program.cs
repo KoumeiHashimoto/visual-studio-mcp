@@ -8,6 +8,12 @@ for (var i = 0; i < ProjectTraversalBudget.MaxNodes; i++)
     if (!traversalBudget.TryVisit()) throw new InvalidOperationException("Project traversal rejected a node before its limit.");
 Check(traversalBudget.VisitedCount == ProjectTraversalBudget.MaxNodes, "project traversal counts each accepted node");
 Check(!traversalBudget.TryVisit(), "project traversal rejects the first node beyond its limit");
+var sharedActionBudget = new ProjectTraversalBudget();
+for (var i = 0; i < ProjectTraversalBudget.MaxNodes - 2; i++)
+    if (!sharedActionBudget.TryVisit()) throw new InvalidOperationException("Shared project-file action budget ended early.");
+Check(sharedActionBudget.TryVisit(), "project-file action can share one budget across project and item lookup");
+Check(sharedActionBudget.TryVisit(), "project-file action can account for document or postcondition traversal in the same budget");
+Check(!sharedActionBudget.TryVisit(), "project-file action rejects aggregate traversal beyond the shared limit");
 var store = new ProjectSnapshotStore(() => now);
 var project = CreateProject("project-a", new string('A', 8));
 Check(store.TryPut(project), "project snapshot stored");
