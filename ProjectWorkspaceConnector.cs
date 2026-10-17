@@ -337,7 +337,7 @@ internal sealed class ProjectWorkspaceConnector
     }
 
     private static ProjectWorkspaceException TraversalLimitExceeded() =>
-        new("unsupported_state", "Project re-resolution exceeded the 10000-node traversal limit.");
+        new("operation_failed", "Project re-resolution exceeded the 10000-node traversal limit.");
 
     internal DTE2 GetBoundDte(int processId, long startTicks)
     {
