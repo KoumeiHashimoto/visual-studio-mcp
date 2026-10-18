@@ -193,6 +193,14 @@ Check(!ProviderOwnershipReconciler.Evaluate(Reconcile(true, 1, true, false, "des
 Check(!ProviderOwnershipReconciler.Evaluate(Reconcile(true, 0, false, false, "design")).Release, "quarantine stays when previous owner exit is unproven");
 Check(!ProviderOwnershipReconciler.Evaluate(Reconcile(true, 0, true, true, "design")).Release, "quarantine stays while a build is busy");
 Check(!ProviderOwnershipReconciler.Evaluate(Reconcile(true, 0, true, false, "unknown")).Release, "quarantine stays when debugger state is unknown");
+// capabilities.probe の応答本文（親の ProviderHostValidation が同じ文字列を生成する）。
+const string probeWire = "{\"visualStudioVersion\":\"18.11.12306.390\",\"vsixVersion\":\"1.3.0.0\",\"providerVersion\":\"1.3.0.0\",\"features\":[{\"featureKey\":\"debugger.execution\",\"availability\":\"supported\",\"reason\":\"provider_services_available\",\"observedAtUtc\":\"2026-10-19T00:00:00.0000000Z\"}]}";
+var probeBody = ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire);
+Check(probeBody.VisualStudioVersion == "18.11.12306.390" && probeBody.Features is [{ FeatureKey: "debugger.execution", Availability: "supported" }],
+    "capabilities.probe response parses the shared wire literal");
+Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("\"supported\"", "\"maybe\"")), "capabilities.probe rejects an unknown availability");
+Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("\"providerVersion\"", "\"extra\"")), "capabilities.probe rejects unknown members");
+Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("2026-10-19T00:00:00.0000000Z", "not-a-time")), "capabilities.probe rejects an invalid observation time");
 var refused = ProviderOwnershipReconciler.Evaluate(new ProviderCallResult(Epoch, "ownership.reconcile", "error", "unsupported_operation", "notDispatched", null, null));
 Check(!refused.Release && refused.Reason == "user_action_required", "unsupported reconcile keeps quarantine with user_action_required");
 

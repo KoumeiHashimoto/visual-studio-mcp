@@ -565,6 +565,24 @@ internal sealed record OutputReadRequestBody
     public int MaxCharacters { get; init; }
 }
 
+/// <summary>capabilities.probe の機能 1 件。</summary>
+internal sealed record CapabilitiesProbeFeature
+{
+    public string FeatureKey { get; init; } = string.Empty;
+    public string Availability { get; init; } = string.Empty;
+    public string Reason { get; init; } = string.Empty;
+    public string ObservedAtUtc { get; init; } = string.Empty;
+}
+
+/// <summary>capabilities.probe の応答本文。版は取得できない場合 null。</summary>
+internal sealed record CapabilitiesProbeResponseBody
+{
+    public string? VisualStudioVersion { get; init; }
+    public string? VsixVersion { get; init; }
+    public string? ProviderVersion { get; init; }
+    public CapabilitiesProbeFeature[] Features { get; init; } = [];
+}
+
 internal sealed record OwnershipReconcileOperation
 {
     public string OperationId { get; init; } = string.Empty;
@@ -749,6 +767,20 @@ internal static class ProviderBodyRules
         var value = ProviderProtocol.ParseBody<ProviderErrorBody>(body);
         if (!IsErrorCode(value.Code) || value.Message is null || value.Message.Length > ProviderProtocol.MaxErrorMessageCharacters)
             throw new ProviderProtocolViolationException("The provider error body is out of range.");
+        return value;
+    }
+
+    internal static CapabilitiesProbeResponseBody ParseCapabilitiesProbeResponse(string body)
+    {
+        var value = ProviderProtocol.ParseBody<CapabilitiesProbeResponseBody>(body);
+        static bool OptionalText(string? text) => text is null || text.Length is > 0 and <= 64;
+        if (!OptionalText(value.VisualStudioVersion) || !OptionalText(value.VsixVersion) || !OptionalText(value.ProviderVersion) ||
+            value.Features is not { Length: <= 64 } ||
+            !value.Features.All(static feature => feature is not null && IsToken(feature.FeatureKey, 64) &&
+                feature.Availability is "supported" or "unsupported" or "unknown" && IsToken(feature.Reason, 256) &&
+                DateTimeOffset.TryParse(feature.ObservedAtUtc, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out _)))
+            throw new ProviderProtocolViolationException("The capabilities probe response is out of range.");
         return value;
     }
 

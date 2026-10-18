@@ -258,6 +258,13 @@ internal static class Program
         using var monitorCancellation = new CancellationTokenSource();
         using var providerCancellation = new CancellationTokenSource();
         var parentMonitor = MonitorParentAsync(parent, app.Lifetime, monitorCancellation.Token);
+        ProviderClient.ImplementedOperationsObserved = CapabilityRuntimeContext.SetImplementedOperations;
+        ProviderClient.CapabilitiesProbed = (epoch, probe) => CapabilityRuntimeContext.ApplyProbe(epoch,
+            probe.VisualStudioVersion, probe.VsixVersion, probe.ProviderVersion,
+            probe.Features.Select(static feature => (feature.FeatureKey, feature.Availability, feature.Reason,
+                DateTimeOffset.Parse(feature.ObservedAtUtc, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind))),
+            DateTimeOffset.UtcNow);
         var providerTask = providerBootstrap is null ? null :
             ProviderClient.RunAsync(providerBootstrap, serverInstanceId, providerCancellation.Token,
                 CapabilityRuntimeContext.SetProvider);

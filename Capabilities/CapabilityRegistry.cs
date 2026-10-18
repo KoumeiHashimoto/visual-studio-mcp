@@ -13,6 +13,10 @@ internal static class CapabilityRuntimeContext
     private static Guid? _serverEpoch;
     private static ProviderCapabilityObservation _provider = new("not_configured", "unknown", null, null, null, null, null, null, "provider_not_configured");
     private static readonly Dictionary<string, FeatureProviderObservation> FeatureProviders = new(StringComparer.Ordinal);
+    private static IReadOnlyList<string>? _implementedOperations;
+    private static DateTimeOffset? _probeObservedAtUtc;
+    private static string? _visualStudioVersion;
+    private static string? _vsixVersion;
 
     public static void Initialize(string transport, string? serverInstanceId, bool providerConfigured)
     {
@@ -28,8 +32,54 @@ internal static class CapabilityRuntimeContext
                 null, null, null, null, null, null,
                 providerConfigured ? "provider_handshake_pending" :
                     unavailableForTransport ? "requires_vsix_provider" : "provider_bootstrap_missing");
-            FeatureProviders.Clear();
+            ClearProviderObservationsLocked();
         }
+    }
+
+    private static void ClearProviderObservationsLocked()
+    {
+        FeatureProviders.Clear();
+        _implementedOperations = null;
+        _probeObservedAtUtc = null;
+        _visualStudioVersion = null;
+        _vsixVersion = null;
+    }
+
+    /// <summary>Ready で通知された実装済み operation（最大 16、catalog 名のみ）を現在の epoch について記録する。</summary>
+    public static void SetImplementedOperations(string providerEpoch, IEnumerable<string> operations)
+    {
+        var list = operations.Where(static name => name.Length is > 0 and <= 64).Distinct(StringComparer.Ordinal)
+            .OrderBy(static name => name, StringComparer.Ordinal).Take(16).ToArray();
+        lock (Sync)
+        {
+            if (_provider.State != "connected" || _provider.Epoch != providerEpoch) return;
+            _implementedOperations = list;
+        }
+    }
+
+    /// <summary>
+    /// capabilities.probe の応答を反映する。接続中の同じ epoch に限り、provider 観測時刻・版・機能可否を更新する。
+    /// 定期 probe で更新されるため、接続中は 5 分の鮮度上限を超えて stale にならない。
+    /// </summary>
+    public static void ApplyProbe(string providerEpoch, string? visualStudioVersion, string? vsixVersion, string? providerVersion,
+        IEnumerable<(string Feature, string Availability, string Reason, DateTimeOffset ObservedAtUtc)> features, DateTimeOffset observedAtUtc)
+    {
+        lock (Sync)
+        {
+            if (_provider.State != "connected" || _provider.Epoch != providerEpoch) return;
+            _provider = _provider with
+            {
+                ObservedAtUtc = observedAtUtc,
+                Version = providerVersion ?? _provider.Version,
+                VersionReason = providerVersion is null ? _provider.VersionReason : null,
+                Reason = "authenticated_provider_channel_connected"
+            };
+            _probeObservedAtUtc = observedAtUtc;
+            _visualStudioVersion = visualStudioVersion;
+            _vsixVersion = vsixVersion;
+        }
+        foreach (var feature in features)
+            SetFeatureProviderAvailability(feature.Feature, feature.Availability, feature.Reason, providerEpoch, feature.ObservedAtUtc);
     }
 
     /// <summary>この server instance の識別子。未初期化なら null。</summary>
@@ -48,7 +98,7 @@ internal static class CapabilityRuntimeContext
     {
         lock (Sync)
         {
-            if (_provider.Epoch != observation.Epoch || observation.State != "connected") FeatureProviders.Clear();
+            if (_provider.Epoch != observation.Epoch || observation.State != "connected") ClearProviderObservationsLocked();
             _provider = observation;
         }
     }
@@ -75,7 +125,8 @@ internal static class CapabilityRuntimeContext
                 targetPid, targetStartTicks, workspace, _provider,
                 new Dictionary<string, FeatureProviderObservation>(FeatureProviders, StringComparer.Ordinal),
                 NormalizeDebuggerState("unknown"), "debugger_state_not_probed",
-                NormalizeMutationState("unknown"), "mutation_lease_not_probed", DateTimeOffset.UtcNow);
+                NormalizeMutationState("unknown"), "mutation_lease_not_probed", DateTimeOffset.UtcNow,
+                _implementedOperations, _probeObservedAtUtc, _visualStudioVersion, _vsixVersion);
         }
     }
 
@@ -101,7 +152,7 @@ internal static class CapabilityRegistry
         Feature("output.read", "implemented", true, true, "unknown", "Output pane provider capability has not been probed.", [], new Dictionary<string, int> { ["maxPanes"] = 100, ["maxLines"] = 2000 }),
         Feature("debugger.inspect", "implemented", true, true, "unknown", "Debugger inspection requires a live bound DTE observation.", [], new Dictionary<string, int> { ["maxThreads"] = 64, ["maxFrames"] = 128, ["maxLocals"] = 40, ["maxDepth"] = 3 }),
         Feature("debugger.control", "implemented", true, true, "unknown", "A live debugger state and owner lease must be revalidated for each request.", ["allowDebuggerControl"], new Dictionary<string, int> { ["maxTimeoutMilliseconds"] = 10000 }),
-        Feature("debugger.execution", "partial", false, true, "unsupported", "The execution coordinator has no provider dispatch adapter; legacy start and stop reject without side effects.", ["allowDebuggerControl", "allowLaunch", "allowBuild"], new Dictionary<string, int> { ["maxActiveOperations"] = 8, ["maxCompletedOperations"] = 64, ["completedTtlSeconds"] = 300 }),
+        Feature("debugger.execution", "implemented", true, true, "unknown", "Guarded start, start-without-debugging, stop and state waits dispatch through the VSIX provider; standalone stdio returns requires_vsix_provider.", ["allowDebuggerControl", "allowLaunch", "allowBuild", "allowStopExistingSession"], new Dictionary<string, int> { ["maxActiveOperations"] = 8, ["maxCompletedOperations"] = 64, ["completedTtlSeconds"] = 300 }),
         Feature("solution.build", "implemented", true, true, "unknown", "Build capability requires a fresh target and workspace observation.", ["allowBuild"], new Dictionary<string, int> { ["maxTimeoutMilliseconds"] = 30000 }),
         Feature("project.inventory", "implemented", true, true, "unknown", "Project inventory support depends on the active project system.", [], new Dictionary<string, int> { ["maxPageSize"] = 200, ["maxSnapshotCount"] = 8 }),
         Feature("project.mutation", "implemented", true, true, "unknown", "Project mutations require an exact fresh snapshot and workspace lease.", ["allowProjectMutation"], new Dictionary<string, int> { ["maxTraversalNodes"] = 20000, ["maxDepth"] = 32 }),
@@ -138,7 +189,14 @@ internal static class CapabilityRegistry
             if (feature.Feature == "get_vs_capabilities" || feature.Implementation == "not_implemented")
                 return feature with { ProviderAvailability = null, ProviderReason = null };
             if (!runtime.FeatureProviders.TryGetValue(feature.Feature, out var observation))
-                return feature with { ProviderAvailability = "unknown", ProviderReason = "provider_feature_capability_probe_unavailable" };
+                return feature with
+                {
+                    ProviderAvailability = "unknown",
+                    // probe 済みなら provider がこの機能を報告していない（DTE 経路の機能など）ことを区別する。
+                    ProviderReason = runtime.ProviderProbeObservedAtUtc is null
+                        ? "provider_feature_capability_probe_unavailable"
+                        : "provider_feature_not_reported"
+                };
             if (runtime.Provider.State != "connected" || runtime.Provider.Epoch != observation.ProviderEpoch)
                 return feature with { ProviderAvailability = "unknown", ProviderReason = "provider_epoch_changed" };
             var invalidTime = observation.ObservedAtUtc > now.AddSeconds(30);
@@ -163,10 +221,10 @@ internal static class CapabilityRegistry
         return new CapabilityDocument(
             1,
             "Visual Studio Debug MCP",
-            "unknown",
-            "VSIX version is not supplied to the companion process.",
-            "unknown",
-            "Visual Studio product version is not supplied by the companion bootstrap.",
+            Bound(runtime.VsixVersion, 64) ?? "unknown",
+            runtime.VsixVersion is null ? "VSIX version is not supplied to the companion process." : "Reported by the VSIX provider probe.",
+            Bound(runtime.VisualStudioVersion, 64) ?? "unknown",
+            runtime.VisualStudioVersion is null ? "Visual Studio product version is not supplied by the companion bootstrap." : "Reported by the VSIX provider probe.",
             runtime.ServerVersion,
             runtime.ServerVersionKind,
             runtime.Transport,
@@ -194,7 +252,8 @@ internal static class CapabilityRegistry
             runtime.TemporaryMutationState,
             runtime.TemporaryMutationReason,
             now,
-            reportedFeatures);
+            reportedFeatures,
+            runtime.ProviderImplementedOperations);
     }
 
     private static ProviderCapabilityObservation NormalizeProvider(ProviderCapabilityObservation value)

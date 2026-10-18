@@ -33,7 +33,11 @@ internal sealed record CapabilityRuntimeObservation(
     string TemporaryDebuggerReason,
     string TemporaryMutationState,
     string TemporaryMutationReason,
-    DateTimeOffset ObservedAtUtc);
+    DateTimeOffset ObservedAtUtc,
+    IReadOnlyList<string>? ProviderImplementedOperations = null,
+    DateTimeOffset? ProviderProbeObservedAtUtc = null,
+    string? VisualStudioVersion = null,
+    string? VsixVersion = null);
 
 internal sealed record CapabilityFeature(
     string Feature,
@@ -81,4 +85,5 @@ internal sealed record CapabilityDocument(
     string TemporaryMutationState,
     string TemporaryMutationReason,
     DateTimeOffset ObservedAtUtc,
-    IReadOnlyList<CapabilityFeature> Features);
+    IReadOnlyList<CapabilityFeature> Features,
+    IReadOnlyList<string>? ProviderImplementedOperations = null);

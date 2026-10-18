@@ -78,6 +78,13 @@ internal static class ProviderClient
         }
     }
 
+    /// <summary>capabilities.probe の間隔。capability の鮮度上限（5 分）より十分短くする。</summary>
+    internal static readonly TimeSpan CapabilityProbeInterval = TimeSpan.FromMinutes(2);
+
+    /// <summary>Ready 後の実装済み operation と probe 結果の通知先（capability 文書への反映）。</summary>
+    internal static Action<string, IReadOnlyCollection<string>>? ImplementedOperationsObserved { get; set; }
+    internal static Action<string, CapabilitiesProbeResponseBody>? CapabilitiesProbed { get; set; }
+
     internal static async Task RunAsync(ProviderBootstrap bootstrap, string serverInstanceId,
         CancellationToken cancellationToken, Action<ProviderCapabilityObservation>? statusChanged = null)
     {
@@ -141,6 +148,16 @@ internal static class ProviderClient
                 if (quarantined && decision.Release) TargetMutationOwner.TryReleaseCurrentQuarantine();
             }
 
+            var epoch = authenticatedIdentity.ProviderEpoch ?? string.Empty;
+            ImplementedOperationsObserved?.Invoke(epoch, channel.ImplementedOperations.ToArray());
+            var probeLoop = channel.ImplementedOperations.Contains("capabilities.probe")
+                ? ProbeCapabilitiesAsync(channel, new ProviderTarget
+                {
+                    VisualStudioPid = bootstrap.VisualStudioPid,
+                    VisualStudioStartTicks = bootstrap.VisualStudioStartTicks
+                }, epoch)
+                : Task.CompletedTask;
+
             using (cancellationToken.Register(static state => ((ProviderChannel)state!).Terminate(null), channel))
                 await channel.Completion.ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
@@ -168,6 +185,28 @@ internal static class ProviderClient
             if (channel is not null) await channel.DisposeAsync().ConfigureAwait(false);
             if (channel is not null) ChannelDetached?.Invoke(channel);
             CryptographicOperations.ZeroMemory(secret);
+        }
+    }
+
+    /// <summary>
+    /// channel が開いている間、capabilities.probe を定期的に送り、capability 文書の provider 観測を更新する。
+    /// probe の失敗は channel を切断せず、次の周期で再試行する（再送ではなく新しい読み取り要求）。
+    /// </summary>
+    private static async Task ProbeCapabilitiesAsync(ProviderChannel channel, ProviderTarget target, string epoch)
+    {
+        while (!channel.Completion.IsCompleted)
+        {
+            try
+            {
+                var call = await channel.SendAsync("capabilities.probe", new TargetOnlyRequestBody { Target = target },
+                    TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+                var result = await call.Result.ConfigureAwait(false);
+                if (result.IsOk && result.Body is not null)
+                    CapabilitiesProbed?.Invoke(epoch, ProviderBodyRules.ParseCapabilitiesProbeResponse(result.Body));
+            }
+            catch (Exception) when (!channel.Completion.IsCompleted) { /* 次の周期で再試行する。 */ }
+            catch (Exception) { return; }
+            if (await Task.WhenAny(channel.Completion, Task.Delay(CapabilityProbeInterval)).ConfigureAwait(false) == channel.Completion) return;
         }
     }
 
@@ -649,6 +688,7 @@ internal sealed class ProviderChannel : IAsyncDisposable
             if (frame.DispatchState != ProviderDispatchState.Dispatched)
                 throw new ProviderProtocolViolationException("A successful provider response must be dispatched.");
             if (frame.Operation == "ownership.reconcile") ProviderBodyRules.ParseReconcileResponse(frame.Body);
+            else if (frame.Operation == "capabilities.probe") ProviderBodyRules.ParseCapabilitiesProbeResponse(frame.Body);
             else ProviderProtocol.ValidateObjectBody(frame.Body);
             return new ProviderCallResult(frame.CorrelationId, frame.Operation, ProviderOutcome.Ok, null,
                 frame.DispatchState, frame.Body, null);
