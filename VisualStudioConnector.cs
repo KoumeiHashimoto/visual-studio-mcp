@@ -8,6 +8,7 @@ using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.Workspace;
 using Newtonsoft.Json;
 using VisualStudioMcpServer.Coordination;
+using VisualStudioMcpServer.Diagnostics;
 
 namespace VisualStudioMcpServer;
 
@@ -199,16 +200,11 @@ public static class VisualStudioConnector
 
     private static string GetSeverityString(EnvDTE80.ErrorItem item)
     {
-        // ErrorItem doesn't have a direct Severity property in all versions
-        // We infer from the error code or default to "Error"
         try
         {
-            var desc = item.Description?.ToLower() ?? "";
-            if (desc.Contains("warning")) return "Warning";
-            if (desc.Contains("message") || desc.Contains("info")) return "Message";
+            return ErrorListSeverityMapper.ToLegacySeverity(item.ErrorLevel);
         }
-        catch { }
-        return "Error";
+        catch { return "Unknown"; }
     }
 
     /// <summary>

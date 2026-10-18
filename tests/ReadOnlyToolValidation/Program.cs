@@ -2,6 +2,8 @@
 using Newtonsoft.Json.Linq;
 using VisualStudioMcpServer;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.Diagnostics;
+using EnvDTE80;
 
 if (!OperatingSystem.IsWindows())
     throw new PlatformNotSupportedException("These checks exercise the Windows COM STA dispatcher.");
@@ -112,7 +114,12 @@ Check(workspaceJson.Value<string>("WorkspaceKind") == "openFolder" &&
 VisualStudioConnector.Solution = null;
 Error(GetSolutionInfoTool.GetSolutionInfo(), "no_solution");
 Check(GetErrorListTool.GetErrorList() == "No errors or warnings in the Error List.", "Empty error list text must remain unchanged.");
-VisualStudioConnector.Errors.Add(new ErrorItem());
+Check(ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelHigh) == "Error" &&
+    ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelMedium) == "Warning" &&
+    ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelLow) == "Message" &&
+    ErrorListSeverityMapper.ToLegacySeverity((vsBuildErrorLevel)0) == "Unknown",
+    "Error List severity must come from the public enum, with unknown values left unknown.");
+VisualStudioConnector.Errors.Add(new VisualStudioMcpServer.ErrorItem());
 Check(JArray.Parse(GetErrorListTool.GetErrorList("json")).Count == 1, "Successful error JSON must remain an array.");
 VisualStudioConnector.Panes.Add("Build");
 Check(ListOutputPanesTool.ListOutputPanes() == "Available Output Panes (1):\n  - Build", "Successful pane list must remain unchanged.");
