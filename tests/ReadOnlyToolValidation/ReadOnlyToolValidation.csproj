@@ -13,11 +13,14 @@
     <Compile Include="../../Tools/ReadOnlyToolInvocation.cs" Link="ReadOnlyToolInvocation.cs" />
     <Compile Include="../../Diagnostics/ErrorListSeverityMapper.cs" Link="ErrorListSeverityMapper.cs" />
     <Compile Include="../../Output/OutputPaneInfo.cs" Link="OutputPaneInfo.cs" />
+    <Compile Include="../../Output/OutputPaneTextSnapshot.cs" Link="OutputPaneTextSnapshot.cs" />
+    <Compile Include="../../Output/OutputSnapshotCursor.cs" Link="OutputSnapshotCursor.cs" />
     <Compile Include="../../Tools/McpOutputBounds.cs" Link="McpOutputBounds.cs" />
     <Compile Include="../../Tools/GetSolutionInfoTool.cs" Link="GetSolutionInfoTool.cs" />
     <Compile Include="../../Tools/GetErrorListTool.cs" Link="GetErrorListTool.cs" />
     <Compile Include="../../Tools/ListOutputPanesTool.cs" Link="ListOutputPanesTool.cs" />
     <Compile Include="../../Tools/ReadOutputPaneTool.cs" Link="ReadOutputPaneTool.cs" />
+    <Compile Include="../../Tools/ReadOutputSinceTool.cs" Link="ReadOutputSinceTool.cs" />
     <Compile Include="../../StaComDispatcher.cs" Link="StaComDispatcher.cs" />
     <Compile Include="../../MessageFilter.cs" Link="MessageFilter.cs" />
   </ItemGroup>

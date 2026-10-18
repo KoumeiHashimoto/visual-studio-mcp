@@ -11,6 +11,7 @@ internal static class VisualStudioConnector
     public static List<ErrorItem> Errors { get; set; } = new();
     public static List<string> Panes { get; set; } = new();
     public static List<VisualStudioMcpServer.Output.OutputPaneInfo> OutputPanes { get; set; } = new();
+    public static VisualStudioMcpServer.Output.OutputPaneTextSnapshot? OutputSnapshot { get; set; }
     public static string? Content { get; set; } = "output";
 
     public static object? GetActiveVS()
@@ -34,6 +35,7 @@ internal static class VisualStudioConnector
     public static List<ErrorItem> GetErrorListItems() => Read(Errors);
     public static List<string> GetOutputPaneNames() => Read(Panes);
     public static List<VisualStudioMcpServer.Output.OutputPaneInfo> GetOutputPanes() => Read(OutputPanes);
+    public static VisualStudioMcpServer.Output.OutputPaneTextSnapshot? ReadOutputPaneSnapshot(string paneGuid, int maxLines, int maxCharacters) => Read(OutputSnapshot);
     public static string? ReadOutputPane(string paneName, int maxLines) => Read(Content);
 }
 

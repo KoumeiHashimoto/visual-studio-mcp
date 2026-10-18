@@ -132,6 +132,24 @@ Check(paneJson.Count == 2 && paneJson[0]!.Value<string>("Guid") == "{BUILD-GUID}
     "Structured output pane listing must include GUID, localized display name, and availability.");
 Check(paneJson[1]!["Guid"]!.Type == JTokenType.Null && paneJson[1]!.Value<string>("Availability") == "identity_unavailable",
     "Structured output pane listing must not invent an identity when GUID is unavailable.");
+VisualStudioConnector.OutputSnapshot = new VisualStudioMcpServer.Output.OutputPaneTextSnapshot("{BUILD-GUID}", "snapshot text", 1, 3, true);
+var initialOutput = JObject.Parse(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}"));
+Check(initialOutput.Value<string>("Mode") == "snapshot" && initialOutput.Value<bool>("IncrementalSupported") == false &&
+    initialOutput.Value<bool>("Gap") == false && initialOutput.Value<bool>("Reset") == false &&
+    initialOutput.Value<string>("Text") == "snapshot text" && !string.IsNullOrWhiteSpace(initialOutput.Value<string>("Cursor")),
+    "First output read returns an identified bounded snapshot with an opaque cursor and no delta claim.");
+var nextOutput = JObject.Parse(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", initialOutput.Value<string>("Cursor")));
+Check(nextOutput.Value<bool>("Gap") == true && nextOutput.Value<bool>("Reset") == true &&
+    nextOutput.Value<bool>("IncrementalSupported") == false,
+    "Follow-up output read requests a fresh snapshot when delta continuity is unproven.");
+Check(JObject.Parse(ReadOutputSinceTool.ReadOutputSince("{OTHER-GUID}", initialOutput.Value<string>("Cursor")))
+    .Value<string>("Code") == "invalid_cursor", "Cursor cannot be reused for another pane identity.");
+Check(JObject.Parse(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", maxCharacters: 32769))
+    .Value<string>("Code") == "invalid_max_characters", "Snapshot character request is bounded before provider dispatch.");
+VisualStudioConnector.OutputSnapshot = new VisualStudioMcpServer.Output.OutputPaneTextSnapshot("{BUILD-GUID}", new string('"', 32768), 1, 0, false);
+var boundedOutput = ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", maxCharacters: 32768);
+Check(boundedOutput.Length <= 65536 && JObject.Parse(boundedOutput).Value<bool>("Truncated"),
+    "Serialized output snapshots remain valid JSON within the response limit.");
 Check(ReadOutputPaneTool.ReadOutputPane("Build") == "output", "Successful output text must remain unchanged.");
 VisualStudioConnector.Content = new string('a', 100000);
 Check(ReadOutputPaneTool.ReadOutputPane("Build").Length < 65600, "Successful output must remain bounded.");

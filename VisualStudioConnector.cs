@@ -159,6 +159,45 @@ public static class VisualStudioConnector
     }
 
     /// <summary>
+    /// Reads only the requested bounded tail from a pane selected by its exact GUID.
+    /// </summary>
+    internal static OutputPaneTextSnapshot? ReadOutputPaneSnapshot(string paneGuid, int maxLines, int maxCharacters)
+    {
+        var dte = GetActiveVS();
+        if (dte == null) return null;
+
+        foreach (OutputWindowPane pane in dte.ToolWindows.OutputWindow.OutputWindowPanes)
+        {
+            string currentGuid;
+            try { currentGuid = pane.Guid; }
+            catch { continue; }
+            if (!string.Equals(currentGuid, paneGuid, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var document = pane.TextDocument;
+            var endPoint = document.EndPoint;
+            var firstLine = Math.Max(1, endPoint.Line - maxLines + 1);
+            var lineStart = endPoint.CreateEditPoint();
+            lineStart.MoveToLineAndOffset(firstLine, 1);
+            var characterStart = endPoint.CreateEditPoint();
+            try { characterStart.CharLeft(maxCharacters); }
+            catch { characterStart.MoveToLineAndOffset(1, 1); }
+            var charactersTruncated = IsAfter(characterStart, lineStart);
+            var startPoint = charactersTruncated ? characterStart : lineStart;
+            var text = startPoint.GetText(endPoint);
+            if (text.Length > 0 && char.IsLowSurrogate(text[0])) text = text[1..];
+            if (text.Length > 0 && char.IsHighSurrogate(text[^1])) text = text[..^1];
+            var omittedLines = Math.Max(0, startPoint.Line - firstLine);
+            var truncated = firstLine > 1 || charactersTruncated || omittedLines > 0;
+            var linesReturned = string.IsNullOrEmpty(text) ? 0 : endPoint.Line - startPoint.Line + 1;
+            return new OutputPaneTextSnapshot(currentGuid, text, linesReturned, omittedLines, truncated);
+        }
+        return null;
+    }
+
+    private static bool IsAfter(EditPoint candidate, EditPoint other) =>
+        candidate.Line > other.Line || candidate.Line == other.Line && candidate.LineCharOffset > other.LineCharOffset;
+
+    /// <summary>
     /// Reads content from a specific output pane.
     /// </summary>
     /// <param name="paneName">Name (or partial name) of the pane</param>

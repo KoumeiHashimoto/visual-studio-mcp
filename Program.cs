@@ -449,7 +449,9 @@ public sealed class ReadOnlyHttpTools
     /// <summary>Lists Output Window pane names.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Lists available Visual Studio Output Window panes.")]
-    public static string ListOutputPanes() => ListOutputPanesTool.ListOutputPanes();
+    public static string ListOutputPanes(
+        [System.ComponentModel.Description("Output format: 'text' preserves the legacy list; 'json' includes GUID, display name, and availability.")]
+        string format = "text") => ListOutputPanesTool.ListOutputPanes(format);
 
     /// <summary>Gets the tail of an Output Window pane.</summary>
     [ModelContextProtocol.Server.McpServerTool]
@@ -458,6 +460,16 @@ public sealed class ReadOnlyHttpTools
         [System.ComponentModel.Description("The name or partial name of the pane.")] string paneName,
         [System.ComponentModel.Description("Maximum number of lines, capped at 2000.")] int maxLines = 50) =>
         ReadOutputPaneTool.ReadOutputPane(paneName, maxLines);
+
+    /// <summary>Reads a bounded Output Window snapshot by exact pane GUID.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Reads a bounded snapshot from an Output Window pane selected by its exact GUID. Delta continuity is currently unavailable.")]
+    public static string ReadOutputSince(
+        [System.ComponentModel.Description("Exact pane GUID returned by list_output_panes(format='json').")] string paneId,
+        [System.ComponentModel.Description("Opaque cursor from a previous snapshot.")] string? cursor = null,
+        [System.ComponentModel.Description("Maximum tail lines, capped at 2000.")] int maxLines = 200,
+        [System.ComponentModel.Description("Maximum UTF-16 code units, capped at 32768.")] int maxCharacters = 16384) =>
+        ReadOutputSinceTool.ReadOutputSince(paneId, cursor, maxLines, maxCharacters);
 }
 
 /// <summary>
