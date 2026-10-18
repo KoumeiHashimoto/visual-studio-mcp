@@ -32,7 +32,7 @@ internal static class VisualStudioConnector
     }
 
     public static SolutionInfo? GetSolutionInfo() => Read(Solution);
-    public static List<ErrorItem> GetErrorListItems() => Read(Errors);
+    public static List<ErrorItem> GetErrorListItems(int maxItems = 500) => Read(Errors.Take(maxItems).ToList());
     public static List<string> GetOutputPaneNames() => Read(Panes);
     public static List<VisualStudioMcpServer.Output.OutputPaneInfo> GetOutputPanes() => Read(OutputPanes);
     public static VisualStudioMcpServer.Output.OutputPaneTextSnapshot? ReadOutputPaneSnapshot(string paneGuid, int maxLines, int maxCharacters) => Read(OutputSnapshot);
@@ -60,5 +60,9 @@ internal sealed class ErrorItem
 {
     public string Severity { get; set; } = "Error";
     public string Description { get; set; } = "Sample error";
+    public string FileName { get; set; } = "C:\\fixtures\\source.cs";
+    public int Line { get; set; } = 1;
+    public int Column { get; set; } = 1;
+    public string Project { get; set; } = "Sample";
     public override string ToString() => Description;
 }

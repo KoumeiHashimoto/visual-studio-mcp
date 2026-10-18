@@ -12,6 +12,7 @@ var tools = new (string Name, Func<string> Call)[]
 {
     ("get_solution_info", () => GetSolutionInfoTool.GetSolutionInfo("json")),
     ("get_error_list", () => GetErrorListTool.GetErrorList("json")),
+    ("get_diagnostics", () => GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: Path.GetFullPath("Sample.sln"))),
     ("list_output_panes", () => ListOutputPanesTool.ListOutputPanes()),
     ("read_output_pane", () => ReadOutputPaneTool.ReadOutputPane("Build"))
 };
@@ -111,6 +112,8 @@ Check(workspaceJson.Value<string>("WorkspaceKind") == "openFolder" &&
     workspaceJson.Value<string>("StartupTargetStatus") == "unsupported" &&
     workspaceJson.Value<string>("StartupTargetReason") == "fixture startup target reason",
     "Open Folder JSON must preserve workspace and unsupported metadata.");
+Check(JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedWorkspaceRoot: "C:\\fixtures\\open-folder"))
+    .Value<string>("Code") == "unsupported", "DTE diagnostics must explicitly reject Open Folder.");
 VisualStudioConnector.Solution = null;
 Error(GetSolutionInfoTool.GetSolutionInfo(), "no_solution");
 Check(GetErrorListTool.GetErrorList() == "No errors or warnings in the Error List.", "Empty error list text must remain unchanged.");
@@ -121,6 +124,30 @@ Check(ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLev
     "Error List severity must come from the public enum, with unknown values left unknown.");
 VisualStudioConnector.Errors.Add(new VisualStudioMcpServer.ErrorItem());
 Check(JArray.Parse(GetErrorListTool.GetErrorList("json")).Count == 1, "Successful error JSON must remain an array.");
+var expectedSolutionPath = Path.GetFullPath("Sample.sln");
+VisualStudioConnector.Solution = new SolutionInfo { SolutionPath = expectedSolutionPath };
+VisualStudioConnector.Errors = new List<VisualStudioMcpServer.ErrorItem>
+{
+    new VisualStudioMcpServer.ErrorItem { Severity = "Error", Description = "first", FileName = "C:\\fixtures\\a.cs" },
+    new VisualStudioMcpServer.ErrorItem { Severity = "Warning", Description = "second", FileName = "C:\\fixtures\\b.cs" }
+};
+var diagnosticsFirst = JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, pageSize: 1));
+Check(diagnosticsFirst.Value<int>("Total") == 2 && diagnosticsFirst.Value<int>("Returned") == 1 &&
+    diagnosticsFirst.Value<bool>("CaptureComplete") && diagnosticsFirst.Value<string>("OperationCorrelation") == "not_requested",
+    "Diagnostics first page carries bounded snapshot and unknown provenance metadata.");
+var diagnosticsCursor = diagnosticsFirst.Value<string>("NextCursor");
+VisualStudioConnector.Errors = new List<VisualStudioMcpServer.ErrorItem> { new() { Description = "replacement" } };
+var diagnosticsSecond = JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, pageSize: 1, cursor: diagnosticsCursor));
+Check(diagnosticsSecond.Value<int>("Total") == 2 && diagnosticsSecond["Items"]![0]!["Description"]!.Value<string>() == "second",
+    "Diagnostics cursor pages the original immutable capture after live rows change.");
+Check(JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, severity: "Warning", pageSize: 1, cursor: diagnosticsCursor))
+    .Value<string>("Code") == "cursor_filter_mismatch", "Diagnostics cursor is bound to filters.");
+Check(JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, projectId: "unknown"))
+    .Value<string>("Code") == "project_filter_unavailable", "Unavailable stable project identity is explicit.");
+Check(JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: Path.GetFullPath("Other.sln")))
+    .Value<string>("Code") == "target_mismatch", "Diagnostics request cannot read a different solution.");
+Check(JObject.Parse(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: "relative.sln"))
+    .Value<string>("Code") == "invalid_workspace_identity", "Diagnostics requires an absolute solution identity.");
 VisualStudioConnector.Panes.Add("Build");
 VisualStudioConnector.Panes.Add("Legacy pane");
 VisualStudioConnector.OutputPanes.Add(new VisualStudioMcpServer.Output.OutputPaneInfo("{BUILD-GUID}", "Build", "available"));

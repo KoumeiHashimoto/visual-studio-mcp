@@ -233,8 +233,9 @@ public static class VisualStudioConnector
     /// <summary>
     /// Gets all items from the Error List.
     /// </summary>
-    public static List<ErrorItem> GetErrorListItems()
+    public static List<ErrorItem> GetErrorListItems(int maxItems = 500)
     {
+        if (maxItems < 0) throw new ArgumentOutOfRangeException(nameof(maxItems));
         var dte = GetActiveVS();
         if (dte == null) return new List<ErrorItem>();
 
@@ -242,7 +243,7 @@ public static class VisualStudioConnector
         var errorList = dte.ToolWindows.ErrorList;
         var errorItems = errorList.ErrorItems;
 
-        for (int i = 1; i <= Math.Min(errorItems.Count, 500); i++)
+        for (int i = 1; i <= Math.Min(errorItems.Count, maxItems); i++)
         {
             var item = errorItems.Item(i);
             items.Add(new ErrorItem
