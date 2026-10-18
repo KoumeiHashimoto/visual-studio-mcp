@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
+using VisualStudioMcpServer.Capabilities;
 
 namespace VisualStudioMcpServer.Providers;
 
@@ -61,9 +62,20 @@ internal static class ProviderClient
     }
 
     internal static async Task RunAsync(ProviderBootstrap bootstrap, string serverInstanceId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, Action<ProviderCapabilityObservation>? statusChanged = null)
     {
         var secret = Convert.FromBase64String(bootstrap.SecretBase64);
+        ProviderFrame? authenticatedChallenge = null;
+        void Report(string state, string availability, string reason, ProviderFrame? frame = null)
+        {
+            var observation = new ProviderCapabilityObservation(state, availability,
+                frame is null ? null : "visual-studio-in-process-provider",
+                null,
+                "provider_software_version_not_supplied",
+                frame?.ProtocolVersion, frame?.ProviderEpoch,
+                DateTimeOffset.UtcNow, reason);
+            statusChanged?.Invoke(observation);
+        }
         try
         {
             using var parent = Process.GetProcessById(bootstrap.VisualStudioPid);
@@ -91,11 +103,17 @@ internal static class ProviderClient
             var ready = await ProviderProtocol.ReadAsync(stream, ProviderProtocol.MaxHandshakeBytes, cancellationToken).ConfigureAwait(false);
             if (!Matches(ready, challenge, ProviderFrameType.Ready) || !ProviderProtocol.VerifyProof(secret, "server", ready))
                 throw new InvalidDataException("The provider host proof is invalid.");
+            authenticatedChallenge = challenge;
+            Report("connected", "supported", "authenticated_provider_channel_connected_feature_probes_unavailable", challenge);
 
             while (!cancellationToken.IsCancellationRequested)
             {
                 var frame = await ProviderProtocol.ReadAsync(stream, ProviderProtocol.MaxRequestBytes, cancellationToken).ConfigureAwait(false);
-                if (frame.Type == ProviderFrameType.Goodbye) return;
+                if (frame.Type == ProviderFrameType.Goodbye)
+                {
+                    Report("disconnected", "unknown", "provider_closed_channel", challenge);
+                    return;
+                }
                 if (frame.Type != ProviderFrameType.Ping || frame.VisualStudioPid != bootstrap.VisualStudioPid ||
                     frame.VisualStudioStartTicks != bootstrap.VisualStudioStartTicks || frame.ServerPid != Environment.ProcessId ||
                     frame.ServerStartTicks != serverStartTicks || frame.ServerInstanceId != serverInstanceId ||
@@ -103,7 +121,18 @@ internal static class ProviderClient
                     throw new InvalidDataException("The provider request identity or type is invalid.");
                 await ProviderProtocol.WriteAsync(stream, Copy(frame, ProviderFrameType.Pong),
                     ProviderProtocol.MaxResponseBytes, cancellationToken).ConfigureAwait(false);
+                Report("connected", "supported", "authenticated_provider_channel_connected_feature_probes_unavailable", challenge);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Report("stopped", "unknown", "provider_client_stopped", authenticatedChallenge);
+            throw;
+        }
+        catch
+        {
+            Report("disconnected", "unknown", "provider_channel_failed", authenticatedChallenge);
+            throw;
         }
         finally { CryptographicOperations.ZeroMemory(secret); }
     }

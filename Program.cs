@@ -21,6 +21,7 @@ using VisualStudioMcpServer.ConnectionKeys;
 using VisualStudioMcpServer.Workspace;
 using VisualStudioMcpServer.Providers;
 using VisualStudioMcpServer.Coordination;
+using VisualStudioMcpServer.Capabilities;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -65,6 +66,8 @@ internal static class Program
     /// </summary>
     private static async Task RunStdioAsync(string[] args)
     {
+        var serverInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16));
+        CapabilityRuntimeContext.Initialize("stdio", serverInstanceId, providerConfigured: false);
         var targetIdentity = HttpOptions.ParseOptionalParentIdentity(args);
         if (targetIdentity.HasValue)
         {
@@ -105,6 +108,7 @@ internal static class Program
         var tokenBytes = RandomNumberGenerator.GetBytes(32);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         var serverInstanceId = ConnectionKeyCodec.Base64UrlEncode(RandomNumberGenerator.GetBytes(16));
+        CapabilityRuntimeContext.Initialize("http", serverInstanceId, providerBootstrap is not null);
         ConnectionKeyStore? connectionKeys = null;
         var workspaceSnapshots = new ActiveWorkspaceSnapshotStore(options.ParentPid, options.ParentStartTicks);
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
@@ -253,7 +257,8 @@ internal static class Program
         using var providerCancellation = new CancellationTokenSource();
         var parentMonitor = MonitorParentAsync(parent, app.Lifetime, monitorCancellation.Token);
         var providerTask = providerBootstrap is null ? null :
-            ProviderClient.RunAsync(providerBootstrap, serverInstanceId, providerCancellation.Token);
+            ProviderClient.RunAsync(providerBootstrap, serverInstanceId, providerCancellation.Token,
+                CapabilityRuntimeContext.SetProvider);
         try
         {
             var shutdownTask = app.WaitForShutdownAsync();
@@ -422,6 +427,11 @@ internal static class Program
 [McpServerToolType]
 public sealed class ReadOnlyHttpTools
 {
+    /// <summary>このtransportの能力情報とprovider状態を取得します。</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Returns bounded capabilities and provider availability for this Visual Studio companion instance.")]
+    public static string GetVsCapabilities() => GetVsCapabilitiesTool.GetVsCapabilities();
+
     /// <summary>Gets information about the currently open solution.</summary>
     [ModelContextProtocol.Server.McpServerTool]
     [System.ComponentModel.Description("Returns information about the currently open Visual Studio solution.")]
