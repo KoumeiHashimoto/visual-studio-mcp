@@ -448,17 +448,17 @@ public sealed class ReadOnlyHttpTools
 
     /// <summary>Gets a bounded, stable page from the Error List.</summary>
     [ModelContextProtocol.Server.McpServerTool]
-    [System.ComponentModel.Description("Returns a stable, bounded page from a captured Visual Studio Error List snapshot. DTE-only fields remain explicitly unavailable.")]
-    public static string GetDiagnostics(
-        [System.ComponentModel.Description("Exact active solution path. Required for solution workspaces; Open Folder is currently unsupported.")] string? expectedSolutionPath = null,
-        [System.ComponentModel.Description("Expected Open Folder root. The current DTE-only reader returns unsupported for Open Folder.")] string? expectedWorkspaceRoot = null,
+    [System.ComponentModel.Description("Returns a stable, bounded page from a captured Visual Studio Error List snapshot. Prefers the VSIX Error List table provider for code, source, project identity and Open Folder workspaces; otherwise falls back to the DTE reader, whose fields remain explicitly unavailable. Provenance reports which reader captured the snapshot.")]
+    public static Task<string> GetDiagnostics(
+        [System.ComponentModel.Description("Exact active solution path. Required for solution workspaces.")] string? expectedSolutionPath = null,
+        [System.ComponentModel.Description("Expected Open Folder root. Supported through the VSIX provider; the DTE fallback returns unsupported for Open Folder.")] string? expectedWorkspaceRoot = null,
         [System.ComponentModel.Description("Optional exact severity filter: Error, Warning, Message, or Unknown.")] string? severity = null,
-        [System.ComponentModel.Description("Stable project identity filter. Unavailable from the current DTE reader; requests return unsupported.")] string? projectId = null,
+        [System.ComponentModel.Description("Optional stable project identity filter (the project GUID reported by the VSIX provider). The DTE fallback cannot filter by project.")] string? projectId = null,
         [System.ComponentModel.Description("Optional case-insensitive file path substring filter.")] string? file = null,
-        [System.ComponentModel.Description("Optional source filter. DTE currently supports only 'unknown'.")] string? source = null,
+        [System.ComponentModel.Description("Optional source filter: build, intellisense, other, or unknown. The provider reports build or other from the Error List source and never infers intellisense; the DTE fallback supports only unknown.")] string? source = null,
         [System.ComponentModel.Description("Page size from 1 to 200, default 100.")] int pageSize = 100,
         [System.ComponentModel.Description("Opaque cursor returned by a prior page. Cursors expire with their bounded snapshot.")] string? cursor = null,
-        [System.ComponentModel.Description("Build observation annotation only. DTE does not provide exact diagnostic-to-operation correlation.")] string? operationId = null) =>
+        [System.ComponentModel.Description("Build observation annotation only. Rows are never attributed to an operation without provider evidence.")] string? operationId = null) =>
         GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath, expectedWorkspaceRoot, severity, projectId, file, source, pageSize, cursor, operationId);
 
     /// <summary>Lists Output Window pane names.</summary>

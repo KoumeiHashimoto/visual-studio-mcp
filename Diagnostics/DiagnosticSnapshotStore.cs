@@ -9,7 +9,33 @@ internal sealed record DiagnosticSnapshotItem(
     string FileName,
     int Line,
     int Column,
-    string Project);
+    string Project)
+{
+    /// <summary>診断 code。DTE 経路と table で値がない行は null。</summary>
+    public string? Code { get; init; }
+
+    /// <summary>build / intellisense / other / unknown。根拠のない値は unknown とし、推測しない。</summary>
+    public string Source { get; init; } = "unknown";
+
+    /// <summary>安定した project identity（provider では project GUID）。取得できない場合は null。</summary>
+    public string? ProjectId { get; init; }
+
+    public string? BuildTool { get; init; }
+    public bool DescriptionTruncated { get; init; }
+}
+
+/// <summary>capture 単位の由来と項目ごとの取得可否。</summary>
+internal sealed record DiagnosticCaptureInfo(
+    string Provenance,
+    string CodeAvailability,
+    string SourceAvailability,
+    string ProjectIdentityAvailability,
+    string RangeAvailability,
+    string? ProviderEpoch)
+{
+    internal static DiagnosticCaptureInfo Dte { get; } =
+        new("dte", "unavailable", "unavailable", "unavailable", "startOnly", null);
+}
 
 internal sealed record DiagnosticSnapshotPage(
     string CaptureId,
@@ -18,7 +44,8 @@ internal sealed record DiagnosticSnapshotPage(
     int TotalItems,
     int Offset,
     bool CaptureComplete,
-    string? NextCursor);
+    string? NextCursor,
+    DiagnosticCaptureInfo Info);
 
 internal sealed class DiagnosticSnapshotStore
 {
@@ -28,10 +55,11 @@ internal sealed class DiagnosticSnapshotStore
     private readonly Dictionary<string, Snapshot> _snapshots = new(StringComparer.Ordinal);
 
     internal string Capture(string workspaceIdentity, IEnumerable<DiagnosticSnapshotItem> items,
-        bool captureComplete, DateTimeOffset now)
+        bool captureComplete, DateTimeOffset now, DiagnosticCaptureInfo? info = null)
     {
         var id = Guid.NewGuid().ToString("N");
-        var snapshot = new Snapshot(id, workspaceIdentity, now, items.Take(500).ToArray(), captureComplete);
+        var snapshot = new Snapshot(id, workspaceIdentity, now, items.Take(500).ToArray(), captureComplete,
+            info ?? DiagnosticCaptureInfo.Dte);
         lock (_gate)
         {
             RemoveExpired(now);
@@ -45,8 +73,18 @@ internal sealed class DiagnosticSnapshotStore
         return id;
     }
 
+    /// <summary>capture の由来。期限切れ・不明は null。</summary>
+    internal DiagnosticCaptureInfo? GetInfo(string captureId, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            RemoveExpired(now);
+            return _snapshots.TryGetValue(captureId, out var snapshot) ? snapshot.Info : null;
+        }
+    }
+
     internal bool TryRead(string captureId, string workspaceIdentity, string? severity, string? file,
-        string? source, string filterFingerprint, int offset, int pageSize, DateTimeOffset now,
+        string? source, string? projectId, string filterFingerprint, int offset, int pageSize, DateTimeOffset now,
         out DiagnosticSnapshotPage? page)
     {
         lock (_gate)
@@ -59,7 +97,7 @@ internal sealed class DiagnosticSnapshotStore
                 return false;
             }
 
-            var filtered = snapshot.Items.Where(item => Matches(item, severity, file, source)).ToArray();
+            var filtered = snapshot.Items.Where(item => Matches(item, severity, file, source, projectId)).ToArray();
             if (offset < 0 || offset > filtered.Length)
             {
                 page = null;
@@ -70,14 +108,15 @@ internal sealed class DiagnosticSnapshotStore
             var nextOffset = offset + items.Length;
             page = new DiagnosticSnapshotPage(snapshot.Id, snapshot.CapturedAtUtc, items,
                 filtered.Length, offset, snapshot.CaptureComplete,
-                nextOffset < filtered.Length ? CreateCursor(snapshot.Id, nextOffset, filterFingerprint) : null);
+                nextOffset < filtered.Length ? CreateCursor(snapshot.Id, nextOffset, filterFingerprint) : null,
+                snapshot.Info);
             return true;
         }
     }
 
-    internal static string FilterFingerprint(string? severity, string? file, string? source)
+    internal static string FilterFingerprint(string? severity, string? file, string? source, string? projectId = null)
     {
-        var canonical = string.Join("\n", Normalize(severity), Normalize(file), Normalize(source));
+        var canonical = string.Join("\n", Normalize(severity), Normalize(file), Normalize(source), Normalize(projectId));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
     }
 
@@ -109,10 +148,11 @@ internal sealed class DiagnosticSnapshotStore
         catch (DecoderFallbackException) { return false; }
     }
 
-    private static bool Matches(DiagnosticSnapshotItem item, string? severity, string? file, string? source) =>
+    private static bool Matches(DiagnosticSnapshotItem item, string? severity, string? file, string? source, string? projectId) =>
         (string.IsNullOrWhiteSpace(severity) || string.Equals(item.Severity, severity, StringComparison.OrdinalIgnoreCase)) &&
         (string.IsNullOrWhiteSpace(file) || item.FileName.Contains(file, StringComparison.OrdinalIgnoreCase)) &&
-        (string.IsNullOrWhiteSpace(source) || string.Equals("unknown", source, StringComparison.OrdinalIgnoreCase));
+        (string.IsNullOrWhiteSpace(source) || string.Equals(item.Source, source, StringComparison.OrdinalIgnoreCase)) &&
+        (string.IsNullOrWhiteSpace(projectId) || string.Equals(item.ProjectId, projectId, StringComparison.OrdinalIgnoreCase));
 
     private static string CreateCursor(string captureId, int offset, string filterFingerprint) =>
         CreateCursorForOffset(captureId, offset, filterFingerprint);
@@ -127,5 +167,5 @@ internal sealed class DiagnosticSnapshotStore
     private static string Normalize(string? value) => (value ?? string.Empty).Trim().ToUpperInvariant();
 
     private sealed record Snapshot(string Id, string WorkspaceIdentity, DateTimeOffset CapturedAtUtc,
-        IReadOnlyList<DiagnosticSnapshotItem> Items, bool CaptureComplete);
+        IReadOnlyList<DiagnosticSnapshotItem> Items, bool CaptureComplete, DiagnosticCaptureInfo Info);
 }
