@@ -26,7 +26,82 @@ public sealed class ExecutionHttpTools
         CancellationToken cancellationToken = default) =>
         DebuggerObservationTools.WaitForDebuggerStateAsync(desiredState, afterSequence, expectedDebugSessionId, operationId,
             timeoutMilliseconds, cancellationToken);
+
+    /// <summary>bound IDE の debugger 状態を返します。</summary>
+    [McpServerTool]
+    [Description("Gets debugger state only from an explicitly bound Visual Studio process and matching absolute solution path. With the VSIX provider, JSON adds session, process-set, startup snapshot and EventSequence fields; operationId returns only that retained launch/stop operation.")]
+    public static Task<string> GetDebuggerState(
+        [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
+        string format = "text",
+        [Description("Required absolute path of the solution expected in the bound Visual Studio instance.")]
+        string? expectedSolutionPath = null,
+        [Description("Optional operation ID from start_debugging, start_without_debugging, or stop_debugging. Unknown IDs are never replaced by another operation.")]
+        string? operationId = null,
+        CancellationToken cancellationToken = default) =>
+        ExecutionToolImplementation.GetDebuggerStateAsync(format, expectedSolutionPath, operationId, cancellationToken);
+
+    /// <summary>design mode から単一 startup project を debug 起動します。</summary>
+    [McpServerTool]
+    [Description("Starts debugging the single supported startup project from design mode only, through the guarded VSIX provider. Requires allowDebuggerControl=true, allowBuild=true when a build may occur, a client requestId, and the startup snapshot ID from a fresh get_debugger_state. Paused sessions are never continued; use control_debugger.")]
+    public static Task<string> StartDebugging(
+        [Description("Absolute path of the solution expected in the bound Visual Studio instance.")] string expectedSolutionPath,
+        [Description("StartupSnapshot.SnapshotId from a fresh get_debugger_state(format='json').")] string expectedStartupSnapshotId,
+        [Description("Client-issued idempotency key: 1-128 printable ASCII characters. Repeat it to query the same operation; never reuse it for a different request.")] string requestId,
+        [Description("Must be true to start a debugger session.")] bool allowDebuggerControl = false,
+        [Description("Must be true when the launch may build. The provider currently reports that a build may occur.")] bool allowBuild = false,
+        [Description("Caller wait in milliseconds (1-30000). A shorter wait returns execution_pending without cancelling the operation.")] int timeoutMilliseconds = 10_000,
+        CancellationToken cancellationToken = default) =>
+        ExecutionToolImplementation.ExecuteAsync(ExecutionAction.StartDebugging, requestId, expectedSolutionPath, expectedStartupSnapshotId,
+            null, null, allowDebuggerControl, false, allowBuild, false, timeoutMilliseconds, cancellationToken);
+
+    /// <summary>design mode から単一 startup project を debug なしで起動します。</summary>
+    [McpServerTool]
+    [Description("Starts the single supported startup project without debugging from design mode, through the guarded VSIX provider (DebugLaunch with DBGLAUNCH_NoDebug). Requires allowLaunch=true (allowDebuggerControl does not authorize it), allowBuild=true when a build may occur, a client requestId, and a fresh startup snapshot ID. No debugger session is created and the launched process is not tracked.")]
+    public static Task<string> StartWithoutDebugging(
+        [Description("Absolute path of the solution expected in the bound Visual Studio instance.")] string expectedSolutionPath,
+        [Description("StartupSnapshot.SnapshotId from a fresh get_debugger_state(format='json').")] string expectedStartupSnapshotId,
+        [Description("Client-issued idempotency key: 1-128 printable ASCII characters. Repeat it to query the same operation; never reuse it for a different request.")] string requestId,
+        [Description("Must be true to launch without debugging.")] bool allowLaunch = false,
+        [Description("Must be true when the launch may build. The provider currently reports that a build may occur.")] bool allowBuild = false,
+        [Description("Caller wait in milliseconds (1-30000). A shorter wait returns execution_pending without cancelling the operation.")] int timeoutMilliseconds = 10_000,
+        CancellationToken cancellationToken = default) =>
+        ExecutionToolImplementation.ExecuteAsync(ExecutionAction.StartWithoutDebugging, requestId, expectedSolutionPath, expectedStartupSnapshotId,
+            null, null, false, allowLaunch, allowBuild, false, timeoutMilliseconds, cancellationToken);
+
+    /// <summary>指定した debugger session と process set だけを停止します。</summary>
+    [McpServerTool]
+    [Description("Stops the exact current debugger session through the guarded VSIX provider (Debugger.Stop). Requires allowDebuggerControl=true, the DebugSessionId and ProcessSetSnapshotId from a fresh get_debugger_state, a client requestId, and allowStopExistingSession=true for a session this server did not launch. Reports debugger end separately from process exit; it does not stop the MCP server or applications started without debugging.")]
+    public static Task<string> StopDebugging(
+        [Description("Absolute path of the solution expected in the bound Visual Studio instance.")] string expectedSolutionPath,
+        [Description("DebugSessionId from a fresh get_debugger_state(format='json').")] string expectedDebugSessionId,
+        [Description("ProcessSetSnapshotId from the same get_debugger_state response.")] string expectedProcessSetSnapshotId,
+        [Description("Client-issued idempotency key: 1-128 printable ASCII characters. Repeat it to query the same operation; never reuse it for a different request.")] string requestId,
+        [Description("Must be true to stop a debugger session.")] bool allowDebuggerControl = false,
+        [Description("Must be true to stop a session that this server did not launch.")] bool allowStopExistingSession = false,
+        [Description("Caller wait in milliseconds (1-30000). A shorter wait returns execution_pending without cancelling the operation.")] int timeoutMilliseconds = 10_000,
+        CancellationToken cancellationToken = default) =>
+        ExecutionToolImplementation.ExecuteAsync(ExecutionAction.StopDebugging, requestId, expectedSolutionPath, null,
+            expectedDebugSessionId, expectedProcessSetSnapshotId, allowDebuggerControl, false, false, allowStopExistingSession,
+            timeoutMilliseconds, cancellationToken);
 }
+
+/// <summary>起動・停止 tool の応答。coordinator の結果に、待機に使う公開 sequence と provider epoch を加える。</summary>
+internal sealed record ExecutionToolResponse(
+    bool Success,
+    string Code,
+    string Message,
+    string? OperationId,
+    string State,
+    bool MayHaveChanged,
+    int? TargetProcessId,
+    string? ServerInstanceId,
+    Guid? ServerEpoch,
+    string? DebugSessionId,
+    string? ProcessSetSnapshotId,
+    string Action,
+    string RequestId,
+    long? EventSequence,
+    string? ProviderEpoch);
 
 internal sealed record DebuggerWaitResult(
     bool Success,
@@ -132,6 +207,34 @@ internal static class ExecutionToolImplementation
 {
     private static readonly TimeSpan ProviderReadTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SequenceCatchUp = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// HTTP と stdio の起動・停止をすべて同じ coordinator へ渡す。束縛のない呼び出し、許可のない呼び出し、provider のない呼び出しは
+    /// dispatch 前に拒否される。応答の EventSequence は dispatch 前の観測位置で、wait_for_debugger_state の afterSequence に使える。
+    /// </summary>
+    internal static async Task<string> ExecuteAsync(ExecutionAction action, string? requestId, string? expectedSolutionPath,
+        string? expectedStartupSnapshotId, string? expectedDebugSessionId, string? expectedProcessSetSnapshotId,
+        bool allowDebuggerControl, bool allowLaunch, bool allowBuild, bool allowStopExistingSession, int timeoutMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        var target = ExecutionRuntime.Target();
+        var store = ProviderRuntime.ObservationStore;
+        long? eventSequence = store?.CurrentSequence;
+        var request = new ExecutionRequest(requestId ?? string.Empty, action, target?.ProcessId ?? 0, target?.StartTicks ?? 0,
+            CapabilityRuntimeContext.ServerInstanceId ?? string.Empty, CapabilityRuntimeContext.ServerEpoch ?? Guid.Empty,
+            expectedSolutionPath ?? string.Empty, Blank(expectedStartupSnapshotId), Blank(expectedDebugSessionId),
+            Blank(expectedProcessSetSnapshotId), allowDebuggerControl, allowLaunch, allowBuild, allowStopExistingSession,
+            CallerWaitTimeoutMilliseconds: timeoutMilliseconds);
+        var result = await ExecutionRuntime.Coordinator.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
+        var response = new ExecutionToolResponse(result.Success, result.Code, result.Message, result.OperationId, result.State,
+            result.MayHaveChanged, result.TargetProcessId, result.ServerInstanceId, result.ServerEpoch, result.DebugSessionId,
+            result.ProcessSetSnapshotId, ProviderExecutionAdapter.ActionName(action), Bound(requestId), eventSequence, store?.ProviderEpoch);
+        return JsonConvert.SerializeObject(response, Formatting.None);
+    }
+
+    private static string? Blank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    private static string Bound(string? value) => value is null ? string.Empty : value.Length <= 128 ? value : value[..128];
 
     internal static async Task<string> GetDebuggerStateAsync(string format, string? expectedSolutionPath, string? operationId,
         CancellationToken cancellationToken)

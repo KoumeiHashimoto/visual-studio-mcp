@@ -545,6 +545,10 @@ Check(sharedTarget.TargetProcessId == 101 && sharedTarget.LaunchBlockedCode == "
 var sharedState = ProviderExecutionBodies.ParseGetState(GetStateWire);
 Check(sharedState.StartupSnapshot!.StartupProjects.Single().UniqueName == "App\\App.csproj" && sharedState.ProviderSequence == 3,
     "debugger.getState shared wire literal parses with the same members");
+const string DispatchWire = "{\"state\":\"accepted\",\"code\":\"launch_accepted\",\"mayHaveChanged\":true,\"debugSessionId\":null,\"processSetSnapshotId\":null,\"launchAccepted\":true,\"processTrackingStatus\":\"unsupported\"}";
+var sharedDispatch = ProviderExecutionBodies.ParseDispatch(DispatchWire);
+Check(sharedDispatch.LaunchAccepted && sharedDispatch.ProcessTrackingStatus == "unsupported" && sharedDispatch.Code == "launch_accepted",
+    "execution.dispatch shared wire literal parses with the same members");
 // ---- 本番 execution adapter: 応答の写像 ----
 ProviderCallResult Ok(string operation, string body) => new(Guid.NewGuid().ToString("N"), operation, "ok", null, "dispatched", body, null);
 ProviderCallResult Err(string code, string dispatchState) => new(Guid.NewGuid().ToString("N"), "execution.dispatch", "error", code, dispatchState, null, "m");
