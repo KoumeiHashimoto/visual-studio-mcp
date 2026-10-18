@@ -11,40 +11,64 @@ namespace VisualStudioMcpServer.Tools;
 public static class DebugControlTool
 {
     [McpServerTool]
-    [Description("Starts debugging the current project (equivalent to F5). If already at a breakpoint, continues execution.")]
+    [Description("Legacy entry point. Returns requires_vsix_provider without dispatch until the provider-bound execution coordinator is available.")]
     public static string StartDebugging()
     {
         return VisualStudioConnector.StartDebugging();
     }
 
     [McpServerTool]
-    [Description("Starts the current project without debugging (equivalent to Ctrl+F5).")]
+    [Description("Legacy entry point. Returns requires_vsix_provider without dispatch until the provider-bound execution coordinator is available.")]
     public static string StartWithoutDebugging()
     {
         return VisualStudioConnector.StartWithoutDebugging();
     }
 
     [McpServerTool]
-    [Description("Stops the current debugging session.")]
+    [Description("Legacy entry point. Returns requires_vsix_provider without dispatch until an exact-session provider-bound stop is available.")]
     public static string StopDebugging()
     {
         return VisualStudioConnector.StopDebugging();
     }
 
     [McpServerTool]
-    [Description("Gets the current debugger state (running, at breakpoint, design mode) and current location if at breakpoint.")]
+    [Description("Gets debugger state only from an explicitly bound Visual Studio process and matching absolute solution path.")]
     public static string GetDebuggerState(
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
-        string format = "text")
+        string format = "text",
+        [Description("Required absolute path of the solution expected in the bound Visual Studio instance.")]
+        string? expectedSolutionPath = null)
     {
-        var state = VisualStudioConnector.GetDebuggerState();
+        DebuggerState state;
+        try { state = StaComDispatcher.Invoke(() => VisualStudioConnector.GetDebuggerState(expectedSolutionPath), TimeSpan.FromSeconds(5)); }
+        catch (TimeoutException) { state = DebuggerState.Unavailable("com_timeout", "The bound Visual Studio debugger state did not respond within the inspection deadline."); }
+        catch (System.Runtime.InteropServices.COMException ex)
+        {
+            state = DebuggerState.Unavailable("com_error", $"Visual Studio rejected debugger inspection (HRESULT 0x{ex.HResult:X8}).");
+        }
+        catch { state = DebuggerState.Unavailable("target_unavailable", "The bound Visual Studio debugger state is unavailable."); }
 
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
         {
-            return JsonConvert.SerializeObject(state, Formatting.Indented);
+            return SerializeDebuggerStateBounded(state);
         }
 
-        return state.Message;
+        return state.Message.Length <= 4096 ? state.Message : state.Message[..4096];
+    }
+
+    private static string SerializeDebuggerStateBounded(DebuggerState state)
+    {
+        const int maxBytes = 64 * 1024;
+        var json = JsonConvert.SerializeObject(state, Formatting.Indented);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) <= maxBytes) return json;
+        var bounded = DebuggerState.Unavailable("response_too_large", "Debugger state exceeded the response size limit.", state.TargetProcessId,
+            state.SolutionPath is { Length: > 4096 } ? state.SolutionPath[..4096] : state.SolutionPath);
+        bounded.Mode = state.Mode.Length <= 64 ? state.Mode : state.Mode[..64];
+        bounded.State = state.State.Length <= 64 ? state.State : state.State[..64];
+        json = JsonConvert.SerializeObject(bounded, Formatting.Indented);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > maxBytes)
+            throw new InvalidOperationException("Debugger state result schema exceeds response size limit.");
+        return json;
     }
 
     [McpServerTool]

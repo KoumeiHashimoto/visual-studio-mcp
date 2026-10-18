@@ -269,16 +269,44 @@ public static class VisualStudioConnector
     /// <summary>
     /// Gets the current debugger state.
     /// </summary>
-    public static DebuggerState GetDebuggerState()
+    public static DebuggerState GetDebuggerState(string? expectedSolutionPath = null)
     {
+        if (!TryGetTargetProcessIdentity(out var targetPid, out var targetStartTicks))
+            return DebuggerState.Unavailable("target_identity_required", "Bind to the invoking Visual Studio process before reading debugger state.");
+        if (string.IsNullOrWhiteSpace(expectedSolutionPath) || !Path.IsPathFullyQualified(expectedSolutionPath))
+            return DebuggerState.Unavailable("expected_solution_required", "An absolute expected solution path is required.", targetPid);
+
+        try
+        {
+            using var target = SystemProcess.GetProcessById(targetPid);
+            if (target.StartTime.ToUniversalTime().Ticks != targetStartTicks)
+                return DebuggerState.Unavailable("stale_target", "The bound Visual Studio process identity is stale.", targetPid);
+        }
+        catch
+        {
+            return DebuggerState.Unavailable("stale_target", "The bound Visual Studio process is unavailable.", targetPid);
+        }
+
         var dte = GetActiveVS();
         if (dte == null)
-            return new DebuggerState { Mode = "Unknown", Message = "No VS instance found" };
+            return DebuggerState.Unavailable("target_unavailable", "The bound Visual Studio instance is unavailable.", targetPid);
+
+        string activeSolution;
+        try { activeSolution = dte.Solution.IsOpen ? Path.GetFullPath(dte.Solution.FullName) : string.Empty; }
+        catch { activeSolution = string.Empty; }
+        if (string.IsNullOrEmpty(activeSolution))
+            return DebuggerState.Unavailable("no_solution", "The bound Visual Studio instance has no open solution.", targetPid);
+        if (!PathsEqual(activeSolution, expectedSolutionPath))
+            return DebuggerState.Unavailable("solution_mismatch", "The active solution does not match expectedSolutionPath.", targetPid, activeSolution);
 
         var mode = dte.Debugger.CurrentMode;
         var state = new DebuggerState
         {
+            Code = "ok",
             Mode = mode.ToString(),
+            State = mode == dbgDebugMode.dbgDesignMode ? "design" : mode == dbgDebugMode.dbgRunMode ? "running" : mode == dbgDebugMode.dbgBreakMode ? "break" : "unknown",
+            TargetProcessId = targetPid,
+            SolutionPath = activeSolution,
             IsDebugging = mode != dbgDebugMode.dbgDesignMode,
             IsRunning = mode == dbgDebugMode.dbgRunMode,
             IsAtBreakpoint = mode == dbgDebugMode.dbgBreakMode
@@ -310,21 +338,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartDebugging()
     {
-        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
-
-        var mode = dte.Debugger.CurrentMode;
-        if (mode == dbgDebugMode.dbgRunMode)
-            return "Already running";
-        if (mode == dbgDebugMode.dbgBreakMode)
-        {
-            dte.Debugger.Go(false); // Continue from breakpoint
-            return "Continued from breakpoint";
-        }
-
-        dte.Debugger.Go(false);
-        return "Started debugging";
+        return DisabledExecution("start_debugging");
     }
 
     /// <summary>
@@ -332,19 +346,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartWithoutDebugging()
     {
-        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
-
-        try
-        {
-            dte.ExecuteCommand("Debug.StartWithoutDebugging");
-            return "Started without debugging";
-        }
-        catch (Exception ex)
-        {
-            return $"Error: {ex.Message}";
-        }
+        return DisabledExecution("start_without_debugging");
     }
 
     /// <summary>
@@ -352,16 +354,36 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StopDebugging()
     {
-        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
+        return DisabledExecution("stop_debugging");
+    }
 
-        var mode = dte.Debugger.CurrentMode;
-        if (mode == dbgDebugMode.dbgDesignMode)
-            return "Not currently debugging";
+    private static string DisabledExecution(string action) => JsonConvert.SerializeObject(new
+    {
+        Success = false,
+        Code = "requires_vsix_provider",
+        Message = $"{action} is unavailable through the legacy unguarded stdio entry point. Use a provider-bound execution contract.",
+        OperationId = (string?)null,
+        State = "not_started",
+        MayHaveChanged = false
+    });
 
-        dte.Debugger.Stop(false);
-        return "Stopped debugging";
+    private static bool PathsEqual(string left, string right)
+    {
+        try
+        {
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return string.Equals(NormalizePath(left), NormalizePath(right), comparison);
+        }
+        catch { return false; }
+    }
+
+    private static string NormalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full);
+        return root is not null && full.Length <= root.Length
+            ? root
+            : full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
     /// <summary>
@@ -1301,14 +1323,28 @@ public static class VisualStudioConnector
 
 public class DebuggerState
 {
+    public string Code { get; set; } = "ok";
     public string Mode { get; set; } = "";
+    public string State { get; set; } = "unknown";
     public string Message { get; set; } = "";
+    public int? TargetProcessId { get; set; }
+    public string? SolutionPath { get; set; }
     public bool IsDebugging { get; set; }
     public bool IsRunning { get; set; }
     public bool IsAtBreakpoint { get; set; }
     public string? CurrentFunction { get; set; }
     public string? CurrentFile { get; set; }
     public int CurrentLine { get; set; }
+
+    public static DebuggerState Unavailable(string code, string message, int? targetProcessId = null, string? solutionPath = null) => new()
+    {
+        Code = code,
+        Mode = "Unknown",
+        State = "unknown",
+        Message = message,
+        TargetProcessId = targetProcessId,
+        SolutionPath = solutionPath
+    };
 }
 
 public class StackFrameInfo
