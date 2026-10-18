@@ -184,6 +184,14 @@ VisualStudioConnector.Content = null;
 Check(ReadOutputPaneTool.ReadOutputPane("missing").StartsWith("Error: Could not find output pane"), "Missing pane must remain distinct from missing DTE.");
 ProviderReadChecks.RunDiagnostics(Check, expectedSolutionPath);
 ProviderReadChecks.RunOutput(Check);
+// DTE 末尾テキストの文字数上限（CRLF を 1 文字と数える CharLeft の補正）。
+var crlfTail = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail(new string('y', 1000) + "\r\n", 1000, out var crlfTrimmed);
+Check(crlfTail.Length == 1000 && crlfTrimmed && crlfTail.EndsWith("\r\n", StringComparison.Ordinal), "DTE tail text is bounded to maxCharacters UTF-16 units when it ends with CRLF.");
+var splitCrlf = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("ab\r\ncd", 3, out _);
+Check(splitCrlf == "cd", "A bounded tail never starts inside a CRLF pair.");
+var surrogate = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("x\U0001F600yz", 3, out _);
+Check(surrogate == "yz", "A bounded tail never starts with a low surrogate.");
+Check(VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("short", 10, out var untouched) == "short" && !untouched, "Text within the limit is unchanged.");
 Console.WriteLine($"Passed {assertions} read-only tool assertions, including injected failures on the Windows STA. No live DTE was used.");
 
 static string Await(Task<string> task) => task.GetAwaiter().GetResult();

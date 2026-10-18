@@ -183,9 +183,9 @@ public static class VisualStudioConnector
             catch { characterStart.MoveToLineAndOffset(1, 1); }
             var charactersTruncated = IsAfter(characterStart, lineStart);
             var startPoint = charactersTruncated ? characterStart : lineStart;
-            var text = startPoint.GetText(endPoint);
-            if (text.Length > 0 && char.IsLowSurrogate(text[0])) text = text[1..];
-            if (text.Length > 0 && char.IsHighSurrogate(text[^1])) text = text[..^1];
+            // CharLeft は CRLF を 1 文字と数えるため、UTF-16 の上限に収め直す（#60 実機で 1 文字超過）。
+            var text = OutputSnapshotText.BoundTail(startPoint.GetText(endPoint), maxCharacters, out var boundedTrim);
+            charactersTruncated |= boundedTrim;
             var omittedLines = Math.Max(0, startPoint.Line - firstLine);
             var truncated = firstLine > 1 || charactersTruncated || omittedLines > 0;
             var linesReturned = string.IsNullOrEmpty(text) ? 0 : endPoint.Line - startPoint.Line + 1;
