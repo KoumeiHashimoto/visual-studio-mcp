@@ -10,6 +10,7 @@ internal sealed class TargetMutationOwner : IDisposable
     private readonly string _name;
     private readonly ManualResetEventSlim _ready = new(false);
     private readonly ManualResetEventSlim _shutdown = new(false);
+    private readonly ManualResetEventSlim _quarantineRelease = new(false);
     private readonly Thread _ownerThread;
     private bool _ownsMutationLease;
     private bool _quarantined;
@@ -33,6 +34,36 @@ internal sealed class TargetMutationOwner : IDisposable
     }
 
     internal bool IsOwner => _ownsMutationLease;
+
+    internal bool IsQuarantined => _quarantined;
+
+    /// <summary>mutex 取得時に作る owner generation（UUID-N）。Hello と execution.dispatch の ownerFence に使う。</summary>
+    internal string OwnerGeneration { get; } = Guid.NewGuid().ToString("N");
+
+    internal static bool IsCurrentQuarantined
+    {
+        get { lock (Sync) return _current?._quarantined == true; }
+    }
+
+    internal static string? CurrentOwnerFence
+    {
+        get { lock (Sync) return _current?.OwnerGeneration; }
+    }
+
+    /// <summary>ownership.reconcile が解除条件をすべて確認した場合だけ呼ぶ。timer/retry/再接続からは呼ばない。</summary>
+    internal static bool TryReleaseCurrentQuarantine()
+    {
+        lock (Sync) return _current?.ReleaseQuarantine() == true;
+    }
+
+    /// <summary>quarantine 中に保持している abandoned mutex を通常の所有へ移す。</summary>
+    internal bool ReleaseQuarantine()
+    {
+        if (!_quarantined) return false;
+        _quarantineRelease.Set();
+        // lease thread が所有状態へ移るまで待つ（mutex は同じ thread が保持し続ける）。
+        return _ready.Wait(TimeSpan.FromSeconds(2)) && SpinWait.SpinUntil(() => Volatile.Read(ref _ownsMutationLease), TimeSpan.FromSeconds(2));
+    }
 
     internal static void Initialize(int processId, long startTicks)
     {
@@ -97,9 +128,10 @@ internal sealed class TargetMutationOwner : IDisposable
             _ready.Set();
             if (_quarantined)
             {
-                // Keep the abandoned lease unavailable until this process exits; no timer clears uncertainty.
-                Thread.Sleep(Timeout.Infinite);
-                return;
+                // Keep the abandoned lease unavailable until reconciliation proves it safe; no timer clears uncertainty.
+                _quarantineRelease.Wait();
+                _quarantined = false;
+                Volatile.Write(ref _ownsMutationLease, true);
             }
             if (!_ownsMutationLease) return;
             _shutdown.Wait();

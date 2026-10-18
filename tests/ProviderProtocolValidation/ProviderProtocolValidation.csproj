@@ -10,5 +10,6 @@
     <Compile Include="../../Providers/ProviderProtocol.cs" Link="ProviderProtocol.cs" />
     <Compile Include="../../Providers/ProviderClient.cs" Link="ProviderClient.cs" />
     <Compile Include="../../Coordination/TargetMutationOwner.cs" Link="TargetMutationOwner.cs" />
+    <Compile Include="../../Capabilities/CapabilityModels.cs" Link="CapabilityModels.cs" />
   </ItemGroup>
 </Project>
