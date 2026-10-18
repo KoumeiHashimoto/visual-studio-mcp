@@ -293,12 +293,16 @@ internal static class Program
             try { await parentMonitor; } catch (OperationCanceledException) { }
             if (providerTask is not null)
             {
-                try { await providerTask; } catch (OperationCanceledException) { }
+                // 親 IDE の終了で provider channel は失敗として終わる。その例外で以降の後始末
+                // （endpoint descriptor の削除や owner の解放）を飛ばさない。
+                try { await providerTask; } catch (Exception) { }
             }
             connectionKeys.RevokeAll();
             ProjectInventoryTools.SnapshotStore.InvalidateAll();
             ActiveWorkspaceSnapshotStoreAccessor.Clear(workspaceSnapshots);
-            try { File.Delete(options.EndpointFile); } catch (IOException) { }
+            try { File.Delete(options.EndpointFile); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
             TargetMutationOwner.Shutdown();
         }
     }
