@@ -450,17 +450,17 @@ public sealed class ReadOnlyHttpTools
 
     /// <summary>Gets a bounded, stable page from the Error List.</summary>
     [ModelContextProtocol.Server.McpServerTool]
-    [System.ComponentModel.Description("Returns a stable, bounded page from a captured Visual Studio Error List snapshot. DTE-only fields remain explicitly unavailable.")]
-    public static string GetDiagnostics(
-        [System.ComponentModel.Description("Exact active solution path. Required for solution workspaces; Open Folder is currently unsupported.")] string? expectedSolutionPath = null,
-        [System.ComponentModel.Description("Expected Open Folder root. The current DTE-only reader returns unsupported for Open Folder.")] string? expectedWorkspaceRoot = null,
+    [System.ComponentModel.Description("Returns a stable, bounded page from a captured Visual Studio Error List snapshot. Prefers the VSIX Error List table provider for code, source, project identity and Open Folder workspaces; otherwise falls back to the DTE reader, whose fields remain explicitly unavailable. Provenance reports which reader captured the snapshot.")]
+    public static Task<string> GetDiagnostics(
+        [System.ComponentModel.Description("Exact active solution path. Required for solution workspaces.")] string? expectedSolutionPath = null,
+        [System.ComponentModel.Description("Expected Open Folder root. Supported through the VSIX provider; the DTE fallback returns unsupported for Open Folder.")] string? expectedWorkspaceRoot = null,
         [System.ComponentModel.Description("Optional exact severity filter: Error, Warning, Message, or Unknown.")] string? severity = null,
-        [System.ComponentModel.Description("Stable project identity filter. Unavailable from the current DTE reader; requests return unsupported.")] string? projectId = null,
+        [System.ComponentModel.Description("Optional stable project identity filter (the project GUID reported by the VSIX provider). The DTE fallback cannot filter by project.")] string? projectId = null,
         [System.ComponentModel.Description("Optional case-insensitive file path substring filter.")] string? file = null,
-        [System.ComponentModel.Description("Optional source filter. DTE currently supports only 'unknown'.")] string? source = null,
+        [System.ComponentModel.Description("Optional source filter: build, intellisense, other, or unknown. The provider reports build or other from the Error List source and never infers intellisense; the DTE fallback supports only unknown.")] string? source = null,
         [System.ComponentModel.Description("Page size from 1 to 200, default 100.")] int pageSize = 100,
         [System.ComponentModel.Description("Opaque cursor returned by a prior page. Cursors expire with their bounded snapshot.")] string? cursor = null,
-        [System.ComponentModel.Description("Build observation annotation only. DTE does not provide exact diagnostic-to-operation correlation.")] string? operationId = null) =>
+        [System.ComponentModel.Description("Build observation annotation only. Rows are never attributed to an operation without provider evidence.")] string? operationId = null) =>
         GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath, expectedWorkspaceRoot, severity, projectId, file, source, pageSize, cursor, operationId);
 
     /// <summary>Lists Output Window pane names.</summary>
@@ -480,13 +480,41 @@ public sealed class ReadOnlyHttpTools
 
     /// <summary>Reads a bounded Output Window snapshot by exact pane GUID.</summary>
     [ModelContextProtocol.Server.McpServerTool]
-    [System.ComponentModel.Description("Reads a bounded snapshot from an Output Window pane selected by its exact GUID. Delta continuity is currently unavailable.")]
-    public static string ReadOutputSince(
+    [System.ComponentModel.Description("Reads Output Window text from a pane selected by its exact GUID. Through the VSIX provider, a cursor returns Mode=delta only when the pane buffer is proven to have only been appended since that cursor; otherwise it returns a fresh bounded snapshot with Gap/Reset. The DTE fallback never claims incremental continuity.")]
+    public static Task<string> ReadOutputSince(
         [System.ComponentModel.Description("Exact pane GUID returned by list_output_panes(format='json').")] string paneId,
-        [System.ComponentModel.Description("Opaque cursor from a previous snapshot.")] string? cursor = null,
-        [System.ComponentModel.Description("Maximum tail lines, capped at 2000.")] int maxLines = 200,
+        [System.ComponentModel.Description("Opaque cursor from a previous read of the same pane. A delta is returned only when continuity is proven.")] string? cursor = null,
+        [System.ComponentModel.Description("Maximum lines, capped at 2000.")] int maxLines = 200,
         [System.ComponentModel.Description("Maximum UTF-16 code units, capped at 32768.")] int maxCharacters = 16384) =>
         ReadOutputSinceTool.ReadOutputSince(paneId, cursor, maxLines, maxCharacters);
+
+    /// <summary>Lists Running Document Table entries through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Lists Running Document Table entries from the bound Visual Studio instance as a bounded snapshot with opaque document IDs, dirty/read-only state, buffer generation, and tab visibility. RDT entries are not identical to visible tabs. Requires the VSIX provider; reads never save, open, or activate documents.")]
+    public static Task<string> ListOpenDocuments(
+        [System.ComponentModel.Description("'workspace' (default) returns registered project items and the active Open Folder root only; 'all' explicitly includes external and untitled documents.")] string scope = "workspace",
+        [System.ComponentModel.Description("Page size from 1 to 100, default 100.")] int pageSize = 100,
+        [System.ComponentModel.Description("Opaque cursor from a previous page of the same snapshot and scope.")] string? cursor = null) =>
+        DocumentReadTools.ListOpenDocuments(scope, pageSize, cursor);
+
+    /// <summary>Reads the focused or last active code view through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Returns the focused or last active code view in the bound Visual Studio instance: document ID, buffer generation, one-based UTF-16 caret and end-exclusive selection ranges, and content type. Selected text is opt-in and omitted for documents outside the workspace scope. Requires the VSIX provider; never changes focus or selection.")]
+    public static Task<string> GetEditorContext(
+        [System.ComponentModel.Description("Include the primary selection text. Defaults to false.")] bool includeSelectedText = false,
+        [System.ComponentModel.Description("Maximum selected-text UTF-16 code units, from 0 to 4096, default 4096.")] int maxCharacters = 4096) =>
+        DocumentReadTools.GetEditorContext(includeSelectedText, maxCharacters);
+
+    /// <summary>Reads a bounded range from a live editor buffer through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Reads a bounded line range from one immutable live editor-buffer snapshot, including unsaved changes. Lines and columns are one-based UTF-16 code units and the end position is exclusive; surrogate pairs are never split. A stale expectedBufferVersion returns document_changed. Requires the VSIX provider; never saves or reloads.")]
+    public static Task<string> ReadDocument(
+        [System.ComponentModel.Description("Opaque document ID from list_open_documents or get_editor_context.")] string documentId,
+        [System.ComponentModel.Description("Optional buffer version from a previous response. A different current version returns document_changed instead of mixing revisions.")] string? expectedBufferVersion = null,
+        [System.ComponentModel.Description("One-based first line, default 1.")] int startLine = 1,
+        [System.ComponentModel.Description("Number of lines from 1 to 500, default 200.")] int lineCount = 200,
+        [System.ComponentModel.Description("Maximum UTF-16 code units from 1 to 32768, default 16384.")] int maxCharacters = 16384) =>
+        DocumentReadTools.ReadDocument(documentId, expectedBufferVersion, startLine, lineCount, maxCharacters);
 }
 
 /// <summary>
