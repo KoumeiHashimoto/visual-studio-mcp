@@ -270,6 +270,7 @@ internal sealed class BuildOperationCoordinator
                 else active.Current = Snapshot(active, true, "Build action accepted; completion has not been observed.", "starting", null, null, null, true);
             }
             CleanupIfTerminal(active, subscription);
+            StartTerminalRecheck(active);
 
             if (!waitForBuild && !active.Terminal) return active.Current;
             if (!active.Terminal)
@@ -316,11 +317,20 @@ internal sealed class BuildOperationCoordinator
     public async Task<BuildOperationResult> GetStatusAsync(string? requestedOperationId = null)
     {
         ActiveOperation? uncertain;
+        ActiveOperation? awaiting;
         lock (_sync)
         {
             uncertain = _active is not null && !_active.Terminal && _active.DispatchUncertain &&
                 (requestedOperationId is null || _active.Id == requestedOperationId) ? _active : null;
-            if (uncertain is null) return GetStatus(requestedOperationId);
+            awaiting = uncertain is null && _active is not null && !_active.Terminal && _active.AwaitingTerminalState &&
+                (requestedOperationId is null || _active.Id == requestedOperationId) ? _active : null;
+            if (uncertain is null && awaiting is null) return GetStatus(requestedOperationId);
+        }
+        if (uncertain is null)
+        {
+            // 非終端の完了 event を受けた操作は、照会時にも対象が idle かを確認する。
+            TryFinishIdleAwaiting(awaiting!, await ReadTargetOrNullAsync().ConfigureAwait(false));
+            lock (_sync) return awaiting!.Current;
         }
 
         BuildTargetSnapshot target;
@@ -397,6 +407,58 @@ internal sealed class BuildOperationCoordinator
             }
         }
         if (cleanup || op.Terminal) CleanupIfTerminal(op, op.Subscription);
+        StartTerminalRecheck(op);
+    }
+
+    /// <summary>idle の再確認の間隔と回数（合計約 60 秒で打ち切り、以後は状態照会時に再確認する）。</summary>
+    internal static TimeSpan TerminalRecheckDelay { get; set; } = TimeSpan.FromSeconds(1);
+    private const int TerminalRecheckAttempts = 60;
+
+    private void StartTerminalRecheck(ActiveOperation op)
+    {
+        lock (_sync)
+        {
+            if (!op.AwaitingTerminalState || op.TerminalRecheckScheduled || op.Terminal || !op.Dispatched) return;
+            op.TerminalRecheckScheduled = true;
+        }
+        _ = RecheckTerminalAsync(op);
+    }
+
+    private async Task RecheckTerminalAsync(ActiveOperation op)
+    {
+        try
+        {
+            for (var attempt = 0; attempt < TerminalRecheckAttempts; attempt++)
+            {
+                await Task.Delay(TerminalRecheckDelay).ConfigureAwait(false);
+                lock (_sync) if (!ReferenceEquals(_active, op) || op.Terminal) return;
+                if (TryFinishIdleAwaiting(op, await ReadTargetOrNullAsync().ConfigureAwait(false))) return;
+            }
+        }
+        catch (Exception) { /* 状態照会時の再確認に任せる。 */ }
+        finally { lock (_sync) op.TerminalRecheckScheduled = false; }
+    }
+
+    private async Task<BuildTargetSnapshot?> ReadTargetOrNullAsync()
+    {
+        try { return await Task.Run(() => _adapter.ReadTargetSnapshot(TimeSpan.FromSeconds(5))).ConfigureAwait(false); }
+        catch { return null; }
+    }
+
+    /// <summary>非終端の完了 event を受けた操作を、同じ対象が idle なら結果不明で確定して所有を解放する。</summary>
+    private bool TryFinishIdleAwaiting(ActiveOperation op, BuildTargetSnapshot? target)
+    {
+        if (target is null) return false;
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_active, op) || op.Terminal || !op.AwaitingTerminalState) return op.Terminal;
+            if (!IsSameTargetIdle(target, op)) return false;
+            FinishLocked(op, "unknown", "result_unknown",
+                "Visual Studio later reported no build in progress, but it never reported this build's terminal result; the outcome is unknown and ownership was released.",
+                null, op.DoneEvent?.FailedProjectCount, false);
+        }
+        CleanupIfTerminal(op, op.Subscription);
+        return true;
     }
 
     private void CompleteFromDoneLocked(ActiveOperation op)
@@ -404,7 +466,10 @@ internal sealed class BuildOperationCoordinator
         var evt = op.DoneEvent!;
         if (!evt.IsTerminalState)
         {
-            op.Current = Snapshot(op, false, "Visual Studio did not report a terminal build state; operation ownership remains reserved.", "unknown", "unknown", null, evt.IsBuildInProgress, code: "result_unknown");
+            // 完了 event 時点で build 状態がまだ終端でないことがある（実機 VS 2026 で 0.4 秒の build 後に発生）。
+            // 同じ対象が idle と確認できるまで所有を保持し、確認後は結果不明で確定して lease を解放する。
+            op.AwaitingTerminalState = true;
+            op.Current = Snapshot(op, false, "Visual Studio did not report a terminal build state; operation ownership remains reserved until the target is idle.", "unknown", "unknown", null, evt.IsBuildInProgress, code: "result_unknown");
             return;
         }
         if (!evt.HasBuildResult)
@@ -549,6 +614,8 @@ internal sealed class BuildOperationCoordinator
         public BuildOperationResult Current { get; set; } = null!;
         public IDisposable? Subscription { get; set; }
         public bool Dispatching, Dispatched, DispatchUncertain, BeginObserved, DoneObserved, FastDone, ForeignActivity, Terminal, SubscriptionCleanupUncertain, CleanupScheduled, GateReleased;
+        /// <summary>完了 event は届いたが、その時点の build 状態が終端でなかった。</summary>
+        public bool AwaitingTerminalState, TerminalRecheckScheduled;
         public string? ForeignActivityReason { get; set; }
         public BuildEventSnapshot? DoneEvent { get; set; }
     }
