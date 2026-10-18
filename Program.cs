@@ -485,6 +485,34 @@ public sealed class ReadOnlyHttpTools
         [System.ComponentModel.Description("Maximum tail lines, capped at 2000.")] int maxLines = 200,
         [System.ComponentModel.Description("Maximum UTF-16 code units, capped at 32768.")] int maxCharacters = 16384) =>
         ReadOutputSinceTool.ReadOutputSince(paneId, cursor, maxLines, maxCharacters);
+
+    /// <summary>Lists Running Document Table entries through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Lists Running Document Table entries from the bound Visual Studio instance as a bounded snapshot with opaque document IDs, dirty/read-only state, buffer generation, and tab visibility. RDT entries are not identical to visible tabs. Requires the VSIX provider; reads never save, open, or activate documents.")]
+    public static Task<string> ListOpenDocuments(
+        [System.ComponentModel.Description("'workspace' (default) returns registered project items and the active Open Folder root only; 'all' explicitly includes external and untitled documents.")] string scope = "workspace",
+        [System.ComponentModel.Description("Page size from 1 to 100, default 100.")] int pageSize = 100,
+        [System.ComponentModel.Description("Opaque cursor from a previous page of the same snapshot and scope.")] string? cursor = null) =>
+        DocumentReadTools.ListOpenDocuments(scope, pageSize, cursor);
+
+    /// <summary>Reads the focused or last active code view through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Returns the focused or last active code view in the bound Visual Studio instance: document ID, buffer generation, one-based UTF-16 caret and end-exclusive selection ranges, and content type. Selected text is opt-in and omitted for documents outside the workspace scope. Requires the VSIX provider; never changes focus or selection.")]
+    public static Task<string> GetEditorContext(
+        [System.ComponentModel.Description("Include the primary selection text. Defaults to false.")] bool includeSelectedText = false,
+        [System.ComponentModel.Description("Maximum selected-text UTF-16 code units, from 0 to 4096, default 4096.")] int maxCharacters = 4096) =>
+        DocumentReadTools.GetEditorContext(includeSelectedText, maxCharacters);
+
+    /// <summary>Reads a bounded range from a live editor buffer through the VSIX provider.</summary>
+    [ModelContextProtocol.Server.McpServerTool]
+    [System.ComponentModel.Description("Reads a bounded line range from one immutable live editor-buffer snapshot, including unsaved changes. Lines and columns are one-based UTF-16 code units and the end position is exclusive; surrogate pairs are never split. A stale expectedBufferVersion returns document_changed. Requires the VSIX provider; never saves or reloads.")]
+    public static Task<string> ReadDocument(
+        [System.ComponentModel.Description("Opaque document ID from list_open_documents or get_editor_context.")] string documentId,
+        [System.ComponentModel.Description("Optional buffer version from a previous response. A different current version returns document_changed instead of mixing revisions.")] string? expectedBufferVersion = null,
+        [System.ComponentModel.Description("One-based first line, default 1.")] int startLine = 1,
+        [System.ComponentModel.Description("Number of lines from 1 to 500, default 200.")] int lineCount = 200,
+        [System.ComponentModel.Description("Maximum UTF-16 code units from 1 to 32768, default 16384.")] int maxCharacters = 16384) =>
+        DocumentReadTools.ReadDocument(documentId, expectedBufferVersion, startLine, lineCount, maxCharacters);
 }
 
 /// <summary>
