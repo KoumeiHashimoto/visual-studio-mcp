@@ -3,6 +3,20 @@
 /// <summary>式をディスパッチする前にデバッガ疑似変数を分類します。</summary>
 internal static class ExpressionSensitivityPolicy
 {
+    /// <summary>
+    /// 実 frame から読んだ言語で判定します。EnvDTE の frame は dynamic のため、呼び出し側の値が dynamic でも
+    /// 結果の Code/Message を実行時に解決できるよう、tuple ではなく名前付き型で返します。
+    /// </summary>
+    internal static ExpressionPolicyDecision ValidateForFrame(
+        string expression,
+        object? frameLanguage,
+        bool allowSensitiveRead,
+        bool allowSideEffects)
+    {
+        var (code, message) = Validate(expression, frameLanguage as string ?? string.Empty, allowSensitiveRead, allowSideEffects);
+        return new ExpressionPolicyDecision(code, message);
+    }
+
     internal static (string? Code, string? Message) Validate(
         string expression,
         string language,
@@ -98,3 +112,6 @@ internal static class ExpressionSensitivityPolicy
 
     private enum TokenKind { Safe, Sensitive, Mutating, Unknown }
 }
+
+/// <summary>疑似変数ポリシーの判定結果。dynamic 経由でも名前で読めるよう record class とします。</summary>
+internal sealed record ExpressionPolicyDecision(string? Code, string? Message);

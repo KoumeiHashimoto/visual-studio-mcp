@@ -838,7 +838,7 @@ public static class VisualStudioConnector
             for (var index = 1; index <= returned; index++)
             {
                 dynamic frame = frames.Item(index);
-                var frameInfo = ReadDebuggerFrame(index, frame, false);
+                DebuggerFrameInfo frameInfo = ReadDebuggerFrame(index, frame, false);
                 frameInfo.IsCurrent = (requestedThreadId is null || requestedThreadId.Value == currentThreadId) && !markedCurrent &&
                     string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
                     string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
@@ -925,7 +925,7 @@ public static class VisualStudioConnector
             var count = (int)frames.Count;
             if (index > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(index);
-            var current = ReadDebuggerFrame(index, frame, false);
+            DebuggerFrameInfo current = ReadDebuggerFrame(index, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(index, expectedFrameCount, count,
                 expectedFunction, current.Function, expectedModule, current.Module))
                 return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before selecting a frame.");
@@ -973,7 +973,7 @@ public static class VisualStudioConnector
             var count = (int)frames.Count;
             if (frameIndex > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(frameIndex);
-            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            DebuggerFrameInfo frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, count,
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before reading locals.");
@@ -1311,12 +1311,14 @@ public static class VisualStudioConnector
             if (frameIndex > frameCount)
                 return CreateExpressionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(frameIndex);
-            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            DebuggerFrameInfo frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, frameCount,
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
 
-            var sensitivityValidation = ExpressionSensitivityPolicy.Validate(
+            // frame は dynamic のため、判定結果を tuple で受けると実行時束縛で要素名が失われる。
+            // frameInfo を静的型で保持し、名前付きの判定結果を使う。
+            var sensitivityValidation = ExpressionSensitivityPolicy.ValidateForFrame(
                 expressionText!, frameInfo.Language, allowSensitiveRead, allowSideEffects);
             if (sensitivityValidation.Code is not null)
                 return CreateExpressionError(sensitivityValidation.Code,

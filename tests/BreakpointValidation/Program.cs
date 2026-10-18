@@ -79,6 +79,39 @@ foreach (var test in cases)
 
 Console.WriteLine($"Passed {cases.Length} breakpoint validation checks.");
 
+// 実 IDE の EnvDTE frame は dynamic で、frame 由来の値を渡すと呼び出し全体が実行時束縛になる（#53 実機不具合の再現）。
+dynamic dynamicFrame = new DynamicFrameProbe { Language = "cpp" };
+var dynamicChecks = 0;
+try
+{
+    var legacy = ExpressionSensitivityPolicy.Validate("$env", dynamicFrame.Language, false, false);
+    _ = (string?)legacy.Code;
+    throw new InvalidOperationException("The tuple result unexpectedly resolved its element name through dynamic binding.");
+}
+catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException) { dynamicChecks++; }
+foreach (var (expression, sensitive, expected) in new (string, bool, string?)[]
+{
+    ("$env", false, "sensitive_read_policy_required"),
+    ("$env", true, null),
+    ("1 + 1", false, null),
+    ("$returnvalue", false, null),
+})
+{
+    var decision = ExpressionSensitivityPolicy.ValidateForFrame(expression, dynamicFrame.Language, sensitive, false);
+    string? code = decision.Code;
+    if (code != expected) throw new InvalidOperationException($"dynamic frame {expression}: expected '{expected ?? "ok"}', got '{code ?? "ok"}'.");
+    dynamicChecks++;
+}
+dynamic csharpFrame = new DynamicFrameProbe { Language = "csharp" };
+if (ExpressionSensitivityPolicy.ValidateForFrame("$user", csharpFrame.Language, false, false).Code != "sensitive_read_policy_required")
+    throw new InvalidOperationException("dynamic C# frame did not gate $user.");
+dynamicChecks++;
+dynamic missingLanguage = new DynamicFrameProbe { Language = null };
+if (ExpressionSensitivityPolicy.ValidateForFrame("$env", missingLanguage.Language, true, true).Code != "expression_language_unsupported")
+    throw new InvalidOperationException("missing frame language did not fail closed.");
+dynamicChecks++;
+Console.WriteLine($"Passed {dynamicChecks} dynamic-frame expression policy checks.");
+
 if (OperatingSystem.IsWindows())
 {
     var apartment = VisualStudioMcpServer.StaComDispatcher.Invoke(() => Thread.CurrentThread.GetApartmentState());
@@ -166,4 +199,9 @@ if (OperatingSystem.IsWindows())
     VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
     if (!executionStarted) throw new InvalidOperationException("The dispatcher did not report that the timed-out COM operation had started.");
     Console.WriteLine("Passed 8 Windows STA dispatcher checks.");
+}
+
+internal sealed class DynamicFrameProbe
+{
+    public string? Language { get; set; }
 }
