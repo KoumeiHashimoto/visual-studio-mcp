@@ -241,12 +241,16 @@ internal static class ProviderProtocol
         return (frame, length);
     }
 
-    /// <summary>handshake 用 proof。既存の client/server purpose に catalogHash を加える。</summary>
+    /// <summary>
+    /// handshake 用 proof。既存の client/server purpose に catalogHash と本文の SHA-256 を加える。
+    /// 本文の hash により Hello の ownerFence を proof で保護する（Challenge/Ready は空本文の hash）。
+    /// </summary>
     internal static string CreateProof(ReadOnlySpan<byte> secret, string purpose, ProviderFrame frame)
     {
         var canonical = string.Join("\n", purpose, frame.ProtocolVersion, frame.Type, frame.RequestId,
             frame.VisualStudioPid, frame.VisualStudioStartTicks, frame.ServerPid, frame.ServerStartTicks,
-            frame.ServerInstanceId, frame.ProviderEpoch, frame.DeadlineUnixMilliseconds, frame.Nonce, frame.CatalogHash);
+            frame.ServerInstanceId, frame.ProviderEpoch, frame.DeadlineUnixMilliseconds, frame.Nonce, frame.CatalogHash,
+            Sha256Hex(Encoding.UTF8.GetBytes(frame.Body)));
         return Convert.ToBase64String(HMACSHA256.HashData(secret, Encoding.UTF8.GetBytes(canonical)));
     }
 

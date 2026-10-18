@@ -48,6 +48,7 @@ const string ExpectedCatalogHash = "cb847c6f323a206531b1c12e3e5d37ce7c867504a7dd
 const string ExpectedSessionKeyHex = "85b5f15f2406437ea7058f5f04ec5980fbeaa465122e0642f1c094b4f435fbde";
 const string ExpectedResponseProof = "3FD5QGOUGmYyEDHEAW2bZQlemT7W48XWclHB8ZX2SI4=";
 const string Epoch = "22222222222242228222222222222222";
+const string ExpectedHelloProof = "ktml8W09ZUToqC2glKVR9Y2p0Ruw2WUsKPgikbTZa3M=";
 
 var passed = 0;
 var secret = Enumerable.Range(0, 32).Select(static value => (byte)value).ToArray();
@@ -96,6 +97,16 @@ Check(!ProviderProtocol.VerifyProof(secret, "client", challenge with { Type = Pr
 Check(!ProviderProtocol.VerifyProof(secret, "client", challenge with { CatalogHash = new string('0', 64), Proof = clientProof }), "handshake proof is bound to catalog hash");
 Check(!ProviderProtocol.VerifyProof(secret, "client", challenge with { Proof = Convert.ToBase64String(new byte[32]) }), "incorrect secret proof rejected");
 Check(!ProviderProtocol.VerifyProof(secret, "client", challenge with { Proof = "not-base64" }), "malformed proof rejected");
+// Hello の本文（ownerFence）も handshake proof に束縛する。両 repository で同じ既知解を検査する。
+var helloKat = Frame(ProviderFrameType.Hello) with
+{
+    DeadlineUnixMilliseconds = 1800000000000, Body = "{\"ownerFence\":\"55555555555545558555555555555555\"}"
+};
+Check(ProviderProtocol.CreateProof(secret, "client", helloKat) == ExpectedHelloProof, "hello proof binds the body and matches known answer");
+Check(!ProviderProtocol.VerifyProof(secret, "client", helloKat with
+{
+    Proof = ExpectedHelloProof, Body = "{\"ownerFence\":\"66666666666646668666666666666666\"}"
+}), "swapped hello ownerFence fails the handshake proof");
 Check(ProviderProtocol.IsUuidN(challenge.ProviderEpoch), "provider epoch uses lowercase UUID-N form");
 Check(!ProviderProtocol.IsUuidN("ABCDEFABCDEF4ABC8DEFABCDEFABCDEF"), "uppercase UUID rejected");
 Check(!ProviderProtocol.IsUuidN("11111111111151118111111111111111"), "non-v4 UUID rejected");

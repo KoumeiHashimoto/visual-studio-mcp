@@ -121,7 +121,10 @@ internal static class ProviderClient
             Volatile.Write(ref _activeChannel, channel);
             Report("connected", "supported", "authenticated_provider_channel_connected_feature_probes_unavailable", authenticatedIdentity);
 
-            if (TargetMutationOwner.IsCurrentQuarantined)
+            // quarantine 中は必ず照合する。quarantine でなくても VSIX が照合を実装していれば送り、
+            // 前 owner の未照合記録を VSIX 側で解消できるようにする（解除判断は VSIX の記録と公開状態だけで行う）。
+            var quarantined = TargetMutationOwner.IsCurrentQuarantined;
+            if (quarantined || channel.ImplementedOperations.Contains("ownership.reconcile"))
             {
                 var target = new ProviderTarget
                 {
@@ -129,7 +132,7 @@ internal static class ProviderClient
                     VisualStudioStartTicks = bootstrap.VisualStudioStartTicks
                 };
                 var decision = await ProviderOwnershipReconciler.ReconcileAsync(channel, target, null).ConfigureAwait(false);
-                if (decision.Release) TargetMutationOwner.TryReleaseCurrentQuarantine();
+                if (quarantined && decision.Release) TargetMutationOwner.TryReleaseCurrentQuarantine();
             }
 
             using (cancellationToken.Register(static state => ((ProviderChannel)state!).Terminate(null), channel))
