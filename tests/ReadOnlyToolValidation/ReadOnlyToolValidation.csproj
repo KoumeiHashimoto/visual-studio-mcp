@@ -28,6 +28,7 @@
     <Compile Include="../../Providers/ProviderProtocol.cs" Link="ProviderProtocol.cs" />
     <Compile Include="../../Providers/ProviderReadGateway.cs" Link="ProviderReadGateway.cs" />
     <Compile Include="../../Providers/DiagnosticProviderBodies.cs" Link="DiagnosticProviderBodies.cs" />
+    <Compile Include="../../Providers/OutputProviderBodies.cs" Link="OutputProviderBodies.cs" />
     <Compile Include="../../Tools/ProviderToolResults.cs" Link="ProviderToolResults.cs" />
   </ItemGroup>
 </Project>

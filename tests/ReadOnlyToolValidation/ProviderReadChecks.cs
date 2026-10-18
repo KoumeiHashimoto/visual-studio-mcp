@@ -101,6 +101,76 @@ internal static class ProviderReadChecks
         Console.WriteLine("PASS provider-preferred diagnostics and DTE fallback");
     }
 
+    // 親 repository の ProviderHostValidation が VSIX 側 DTO から生成する文字列と同一。
+    internal const string OutputGolden = "{\"paneGuid\":\"1bd8a850-02d1-11d1-bee7-00a0c913d1f8\",\"paneName\":\"ビルド\",\"mode\":\"delta\",\"incrementalSupported\":true,\"providerCursor\":\"o1.0123456789ab4def8123456789abcdef.5.12\",\"text\":\"line 2\\r\\n\",\"gap\":false,\"reset\":false,\"truncated\":false,\"omittedCharacters\":0,\"omittedLines\":0,\"returnedLines\":1,\"bufferLength\":12,\"bufferVersion\":5,\"continuityReason\":\"append_only\"}";
+    internal const string OutputBaseline = "{\"paneGuid\":\"1bd8a850-02d1-11d1-bee7-00a0c913d1f8\",\"paneName\":\"ビルド\",\"mode\":\"snapshot\",\"incrementalSupported\":true,\"providerCursor\":\"o1.0123456789ab4def8123456789abcdef.4.8\",\"text\":\"line 1\\r\\n\",\"gap\":false,\"reset\":false,\"truncated\":false,\"omittedCharacters\":0,\"omittedLines\":0,\"returnedLines\":1,\"bufferLength\":8,\"bufferVersion\":4,\"continuityReason\":\"baseline\"}";
+    private const string BuildPane = "{1BD8A850-02D1-11D1-BEE7-00A0C913D1F8}";
+
+    internal static void RunOutput(Action<bool, string> check)
+    {
+        var fake = new FakeReadTransport();
+        ProviderReadGateway.Transport = fake;
+        VisualStudioConnector.Available = true;
+        VisualStudioConnector.Failure = null;
+        VisualStudioConnector.OutputSnapshot = new VisualStudioMcpServer.Output.OutputPaneTextSnapshot(BuildPane, "dte text", 1, 0, false);
+
+        fake.Next = FakeOk(OutputBaseline);
+        var baseline = JObject.Parse(Output(BuildPane));
+        var request = fake.Calls.Single();
+        check(request.Operation == "output.read" && ProviderBodyRules.TryValidateRequest(request.Operation, request.Body, out _) &&
+            request.Body.Contains("\"paneGuid\":\"1bd8a850-02d1-11d1-bee7-00a0c913d1f8\"") && request.Body.Contains("\"providerCursor\":null"),
+            "Output reads send the exact pane GUID without a provider cursor for a baseline.");
+        check(baseline.Value<string>("Provenance") == "outputBufferProvider" && baseline.Value<string>("Mode") == "snapshot" &&
+            baseline.Value<bool>("IncrementalSupported") && !baseline.Value<bool>("Gap") && !baseline.Value<bool>("Reset") &&
+            baseline.Value<string>("Text") == "line 1\r\n" && baseline.Value<string>("PaneGuid") == BuildPane,
+            "A provider baseline is an identified snapshot that supports later deltas.");
+
+        fake.Next = FakeOk(OutputGolden);
+        var delta = JObject.Parse(Output(BuildPane, baseline.Value<string>("Cursor")));
+        check(fake.Calls[^1].Body.Contains("\"providerCursor\":\"o1.0123456789ab4def8123456789abcdef.4.8\"") &&
+            delta.Value<string>("Mode") == "delta" && delta.Value<string>("Text") == "line 2\r\n" && !delta.Value<bool>("Gap") &&
+            !delta.Value<bool>("Reset") && delta.Value<string>("ContinuityReason") == "append_only",
+            "A follow-up read forwards the provider cursor and returns only appended text.");
+
+        fake.Next = FakeOk(OutputBaseline.Replace("\"gap\":false,\"reset\":false", "\"gap\":true,\"reset\":true")
+            .Replace("\"baseline\"", "\"buffer_rewritten\""));
+        var reset = JObject.Parse(Output(BuildPane, delta.Value<string>("Cursor")));
+        check(reset.Value<string>("Mode") == "snapshot" && reset.Value<bool>("Gap") && reset.Value<bool>("Reset") &&
+            reset.Value<string>("ContinuityReason") == "buffer_rewritten", "A cleared or rewritten pane returns a reset snapshot.");
+
+        fake.Next = FakeOk(OutputGolden);
+        check(JObject.Parse(Output(BuildPane)).Value<string>("Code") == "provider_response_invalid",
+            "A delta without a submitted cursor is rejected.");
+        fake.Next = FakeOk(OutputGolden.Replace("\"mode\":\"delta\"", "\"mode\":\"delta\"").Replace("\"gap\":false", "\"gap\":true"));
+        check(JObject.Parse(Output(BuildPane, baseline.Value<string>("Cursor"))).Value<string>("Code") == "provider_response_invalid",
+            "A delta that also reports a gap is rejected.");
+        fake.Next = FakeOk(OutputGolden);
+        check(JObject.Parse(Output(BuildPane, baseline.Value<string>("Cursor"), maxCharacters: 3)).Value<string>("Code") == "provider_response_invalid",
+            "Provider text above maxCharacters is rejected.");
+
+        fake.Next = ProviderReadGateway.Unavailable("provider_not_configured");
+        var dte = JObject.Parse(Output(BuildPane));
+        check(dte.Value<string>("Provenance") == "dte" && dte.Value<string>("ProviderFallbackReason") == "provider_not_configured" &&
+            !dte.Value<bool>("IncrementalSupported") && dte.Value<string>("Text") == "dte text",
+            "Without a provider the DTE snapshot fallback never claims incremental support.");
+        fake.Next = FakeOk(OutputBaseline);
+        var afterDte = JObject.Parse(Output(BuildPane, dte.Value<string>("Cursor")));
+        check(fake.Calls[^1].Body.Contains("\"providerCursor\":null") && afterDte.Value<bool>("Gap"),
+            "A cursor from a DTE snapshot cannot prove provider continuity and reports a gap.");
+        var callsBefore = fake.Calls.Count;
+        var notGuid = JObject.Parse(Output("Build"));
+        check(fake.Calls.Count == callsBefore && notGuid.Value<string>("ProviderFallbackReason") == "pane_id_not_guid",
+            "A non-GUID pane identity is not sent to the provider.");
+
+        ProviderReadGateway.Transport = null;
+        Console.WriteLine("PASS provider-preferred output reads and DTE fallback");
+    }
+
+    private static ProviderReadOutcome FakeOk(string body) => Ok(body);
+
+    private static string Output(string paneId, string? cursor = null, int maxLines = 200, int maxCharacters = 16384) =>
+        ReadOutputSinceTool.ReadOutputSince(paneId, cursor, maxLines, maxCharacters).GetAwaiter().GetResult();
+
     private static string Call(string? expectedSolutionPath = null, string? expectedWorkspaceRoot = null, string? severity = null,
         string? projectId = null, string? file = null, string? source = null, int pageSize = 100, string? cursor = null) =>
         GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath, expectedWorkspaceRoot, severity, projectId, file, source, pageSize,

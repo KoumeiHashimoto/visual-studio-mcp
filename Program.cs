@@ -478,11 +478,11 @@ public sealed class ReadOnlyHttpTools
 
     /// <summary>Reads a bounded Output Window snapshot by exact pane GUID.</summary>
     [ModelContextProtocol.Server.McpServerTool]
-    [System.ComponentModel.Description("Reads a bounded snapshot from an Output Window pane selected by its exact GUID. Delta continuity is currently unavailable.")]
-    public static string ReadOutputSince(
+    [System.ComponentModel.Description("Reads Output Window text from a pane selected by its exact GUID. Through the VSIX provider, a cursor returns Mode=delta only when the pane buffer is proven to have only been appended since that cursor; otherwise it returns a fresh bounded snapshot with Gap/Reset. The DTE fallback never claims incremental continuity.")]
+    public static Task<string> ReadOutputSince(
         [System.ComponentModel.Description("Exact pane GUID returned by list_output_panes(format='json').")] string paneId,
-        [System.ComponentModel.Description("Opaque cursor from a previous snapshot.")] string? cursor = null,
-        [System.ComponentModel.Description("Maximum tail lines, capped at 2000.")] int maxLines = 200,
+        [System.ComponentModel.Description("Opaque cursor from a previous read of the same pane. A delta is returned only when continuity is proven.")] string? cursor = null,
+        [System.ComponentModel.Description("Maximum lines, capped at 2000.")] int maxLines = 200,
         [System.ComponentModel.Description("Maximum UTF-16 code units, capped at 32768.")] int maxCharacters = 16384) =>
         ReadOutputSinceTool.ReadOutputSince(paneId, cursor, maxLines, maxCharacters);
 
