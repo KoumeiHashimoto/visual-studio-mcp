@@ -26,7 +26,7 @@ Check(missing.Features.Count <= CapabilityRegistry.MaximumFeatures, "feature cou
 Check(features.Keys.Order().SequenceEqual(connected.Features.Select(feature => feature.Feature).Order()), "stdio and HTTP share the same feature contract");
 Check(features["get_vs_capabilities"].Availability == "supported" && features["get_vs_capabilities"].HttpExposed && features["get_vs_capabilities"].StdioExposed,
     "capability query is exposed on both transports");
-Check(features["debugger.execution"].Availability == "unsupported" && features["documents.read"].Availability == "unsupported",
+Check(features["debugger.execution"].Availability == "unsupported" && features["documents.read"].Availability != "supported",
     "unimplemented execution and document reads are not declared supported");
 Check(missing.ProviderAvailability == "unsupported" && missing.ProviderReason == "requires_vsix_provider" &&
     connected.ProviderAvailability == "supported" && connected.ProviderVersion is null && connected.ProviderProtocolVersion == 1,

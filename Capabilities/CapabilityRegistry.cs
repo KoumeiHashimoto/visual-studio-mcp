@@ -94,9 +94,9 @@ internal static class CapabilityRegistry
         Feature("project.inventory", "implemented", true, true, "unknown", "Project inventory support depends on the active project system.", [], new Dictionary<string, int> { ["maxPageSize"] = 200, ["maxSnapshotCount"] = 8 }),
         Feature("project.mutation", "implemented", true, true, "unknown", "Project mutations require an exact fresh snapshot and workspace lease.", ["allowProjectMutation"], new Dictionary<string, int> { ["maxTraversalNodes"] = 20000, ["maxDepth"] = 32 }),
         Feature("expression.evaluation", "implemented", true, true, "unknown", "Expression evaluation is sensitive and requires per-request authorization.", ["allowEvaluation", "allowSideEffects", "allowSensitiveRead"], new Dictionary<string, int> { ["maxExpressionCharacters"] = 4096 }),
-        Feature("documents.read", "not_implemented", false, false, "unsupported", "Live document buffers are not implemented.", [], new Dictionary<string, int> { ["maxLines"] = 500, ["maxCharacters"] = 32768 }),
-        Feature("diagnostics.paging", "not_implemented", false, false, "unsupported", "Snapshot-backed diagnostics paging is not implemented.", [], new Dictionary<string, int> { ["maxPageSize"] = 200 }),
-        Feature("output.incremental", "not_implemented", false, false, "unsupported", "Incremental output snapshots are not implemented.", [], new Dictionary<string, int> { ["maxPanes"] = 64, ["maxHistoryEntries"] = 10000 })
+        Feature("documents.read", "implemented", true, true, "unknown", "Live document reads require the VSIX document provider; standalone stdio returns requires_vsix_provider.", [], new Dictionary<string, int> { ["maxLines"] = 500, ["maxCharacters"] = 32768, ["maxPageSize"] = 100 }),
+        Feature("diagnostics.paging", "implemented", true, true, "unknown", "Snapshot paging is implemented; code, source and project identity require the VSIX Error List table provider, otherwise the DTE reader reports them unavailable.", [], new Dictionary<string, int> { ["maxPageSize"] = 200, ["maxCaptureRows"] = 500 }),
+        Feature("output.incremental", "implemented", true, true, "unknown", "Delta mode requires the VSIX output provider to prove append-only continuity; otherwise bounded snapshots report IncrementalSupported=false.", [], new Dictionary<string, int> { ["maxTrackedPanes"] = 32, ["maxLines"] = 2000, ["maxCharacters"] = 32768 })
     };
 
     public static bool ContainsFeature(string key) => DeclaredFeatures.Any(feature => feature.Feature == key);
