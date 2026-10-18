@@ -14,7 +14,7 @@ public static class DebuggerExpressionTool
 {
     /// <summary>Evaluates an expression in a validated paused frame.</summary>
     [McpServerTool]
-    [Description("Evaluates an expression on a frame from the latest get_call_stack response. Requires allowEvaluation=true. Automatic property/function evaluation is disabled unless allowSideEffects=true. Output and evaluation time are bounded; returns structured JSON.")]
+    [Description("Evaluates an expression on a frame from the latest get_call_stack response. Requires allowEvaluation=true. Sensitive pseudovariables also require allowSensitiveRead=true. Automatic property/function evaluation is disabled unless allowSideEffects=true. Output and evaluation time are bounded; returns structured JSON.")]
     public static string EvaluateExpression(
         [Description("Expression text, limited to 1024 characters.")] string expression,
         [Description("One-based frame index from the latest get_call_stack response (1-128).")]
@@ -24,9 +24,10 @@ public static class DebuggerExpressionTool
         [Description("TotalCount from the latest get_call_stack response.")] int totalFrameCount,
         [Description("CurrentThreadId from the latest get_call_stack response.")] int threadId,
         [Description("Explicit authorization for expression evaluation. Defaults to false.")] bool allowEvaluation = false,
-        [Description("Explicit permission for automatic property and function evaluation. Defaults to false.")] bool allowSideEffects = false) =>
+        [Description("Explicit permission for automatic property and function evaluation. Defaults to false.")] bool allowSideEffects = false,
+        [Description("Explicit permission to read sensitive debugger or process pseudovariables. Defaults to false.")] bool allowSensitiveRead = false) =>
         Invoke(() => VisualStudioConnector.EvaluateDebuggerExpression(expression, frameIndex, expectedFunction,
-            expectedModule, totalFrameCount, threadId, allowEvaluation, allowSideEffects));
+            expectedModule, totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead));
 
     private static string Invoke(Func<DebuggerExpressionResponse> operation)
     {

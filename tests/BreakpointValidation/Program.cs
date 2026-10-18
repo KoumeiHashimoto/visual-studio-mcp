@@ -43,7 +43,30 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("running step is not complete", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("step_into", "dbgRunMode", true, false, false).ToString(), null), "False"),
     ("continue can immediately hit another breakpoint", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", true, true, false).ToString(), null), "True"),
     ("continue cannot reuse an unchanged paused state", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", false, false, false).ToString(), null), "False"),
-    ("pause observes a new break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("pause", "dbgBreakMode", false, true, false).ToString(), null), "True")
+    ("pause observes a new break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("pause", "dbgBreakMode", false, true, false).ToString(), null), "True"),
+    ("native environment read requires sensitive policy", () => ExpressionSensitivityPolicy.Validate("$env", "cpp", false, false), "sensitive_read_policy_required"),
+    ("native environment read accepts explicit sensitive policy", () => ExpressionSensitivityPolicy.Validate("$ENV", "cpp", true, false), null),
+    ("native command line read is sensitive", () => ExpressionSensitivityPolicy.Validate("$cmdline", "cpp", false, false), "sensitive_read_policy_required"),
+    ("native current user pseudovariable is sensitive", () => ExpressionSensitivityPolicy.Validate("$user", "cpp", false, false), "sensitive_read_policy_required"),
+    ("current user pseudovariable is sensitive in C sharp", () => ExpressionSensitivityPolicy.Validate("$user", "csharp", false, false), "sensitive_read_policy_required"),
+    ("unclassified native context pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$tid", "cpp", true, true), "unsupported_expression_token"),
+    ("return value pseudovariable is supported in C sharp", () => ExpressionSensitivityPolicy.Validate("$returnvalue", "csharp", false, false), null),
+    ("return value pseudovariable is supported in native", () => ExpressionSensitivityPolicy.Validate("$returnvalue", "cpp", false, false), null),
+    ("exception pseudovariable is supported in Visual Basic", () => ExpressionSensitivityPolicy.Validate("$exception", "basic", false, false), null),
+    ("unknown language rejects pseudovariables", () => ExpressionSensitivityPolicy.Validate("$env", "unknown", true, true), "expression_language_unsupported"),
+    ("unknown pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$mystery", "cpp", true, true), "unsupported_expression_token"),
+    ("C sharp rejects native-only environment pseudovariable", () => ExpressionSensitivityPolicy.Validate("$env", "csharp", true, true), "unsupported_expression_token"),
+    ("native register syntax fails closed", () => ExpressionSensitivityPolicy.Validate("@eax", "cpp", true, true), "unsupported_expression_token"),
+    ("unclassified native context pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$handles", "cpp", true, true), "unsupported_expression_token"),
+    ("sensitive permission does not authorize mutation", () => ExpressionSensitivityPolicy.Validate("$delete", "basic", true, false), "side_effect_policy_required"),
+    ("side-effect permission does not authorize sensitive read", () => ExpressionSensitivityPolicy.Validate("$env", "cpp", false, true), "sensitive_read_policy_required"),
+    ("Basic delete alias remains mutating", () => ExpressionSensitivityPolicy.Validate("$$DELETE", "basic", false, false), "side_effect_policy_required"),
+    ("Basic delete alias accepts explicit side-effect policy", () => ExpressionSensitivityPolicy.Validate("$$delete", "basic", false, true), null),
+    ("pseudovariable text inside a quoted literal is ignored", () => ExpressionSensitivityPolicy.Validate("\"$env\"", "cpp", false, false), null),
+    ("escaped quote does not expose quoted pseudovariable", () => ExpressionSensitivityPolicy.Validate("\"text \\\" $env\"", "cpp", false, false), null),
+    ("unterminated literal fails closed", () => ExpressionSensitivityPolicy.Validate("\"$env", "cpp", true, false), "unsupported_expression_token"),
+    ("bare pseudovariable prefix fails closed", () => ExpressionSensitivityPolicy.Validate("$", "cpp", true, true), "unsupported_expression_token"),
+    ("interpolated string fails closed", () => ExpressionSensitivityPolicy.Validate("$\"{$env}\"", "cpp", true, true), "unsupported_expression_token")
 };
 
 foreach (var test in cases)

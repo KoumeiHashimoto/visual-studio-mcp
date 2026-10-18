@@ -1193,7 +1193,8 @@ public static class VisualStudioConnector
         int expectedFrameCount,
         int expectedThreadId,
         bool allowEvaluation,
-        bool allowSideEffects)
+        bool allowSideEffects,
+        bool allowSensitiveRead)
     {
         var expressionValidation = BreakpointRequestValidation.ValidateExpression(
             expressionText, allowEvaluation, allowSideEffects);
@@ -1218,6 +1219,12 @@ public static class VisualStudioConnector
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, frameCount,
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
+
+            var sensitivityValidation = ExpressionSensitivityPolicy.Validate(
+                expressionText!, frameInfo.Language, allowSensitiveRead, allowSideEffects);
+            if (sensitivityValidation.Code is not null)
+                return CreateExpressionError(sensitivityValidation.Code,
+                    sensitivityValidation.Message ?? "The pseudovariable is not allowed for this request.");
 
             var debugger = (EnvDTE100.Debugger5)dte.Debugger;
             var result = debugger.GetExpression3(

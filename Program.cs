@@ -480,16 +480,17 @@ public sealed class DebuggerHttpTools
         DebuggerInspectionTool.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
             totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion);
 
-    /// <summary>Evaluates an expression with explicit evaluation and side-effect policy.</summary>
+    /// <summary>Evaluates an expression with explicit evaluation, sensitive-read, and side-effect policies.</summary>
     [McpServerTool]
-    [System.ComponentModel.Description("Evaluates an expression from a current paused frame. Requires allowEvaluation=true; automatic property/function evaluation additionally requires allowSideEffects=true.")]
+    [System.ComponentModel.Description("Evaluates an expression from a current paused frame. Requires allowEvaluation=true; sensitive pseudovariables additionally require allowSensitiveRead=true; automatic property/function evaluation additionally requires allowSideEffects=true.")]
     public static string EvaluateExpression(string expression,
         [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
         [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
         string expectedFunction,
-        string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false) =>
+        string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false,
+        bool allowSensitiveRead = false) =>
         DebuggerExpressionTool.EvaluateExpression(expression, frameIndex, expectedFunction, expectedModule,
-            totalFrameCount, threadId, allowEvaluation, allowSideEffects);
+            totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead);
 
     /// <summary>Controls the bound paused or running debugger with explicit authorization.</summary>
     [McpServerTool]
