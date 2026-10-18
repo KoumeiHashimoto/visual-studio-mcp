@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace VisualStudioMcpServer.Execution;
 
@@ -37,7 +37,9 @@ internal sealed record ExecutionTargetSnapshot(
     string State,
     bool ProviderAvailable,
     bool BuildMayOccur,
-    bool SessionAgentOwned);
+    bool SessionAgentOwned,
+    string? LaunchBlockedCode = null,
+    string? LaunchBlockedReason = null);
 
 internal sealed record ExecutionDispatchObservation(
     ExecutionState State,

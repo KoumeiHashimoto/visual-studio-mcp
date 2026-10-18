@@ -1,4 +1,4 @@
-using VisualStudioMcpServer.Execution;
+﻿using VisualStudioMcpServer.Execution;
 
 var epoch = Guid.NewGuid();
 var solution = Path.GetFullPath("fixture.sln");
@@ -35,7 +35,10 @@ var deniedCases = new (string Name, ExecutionRequest Request, ExecutionTargetSna
     ("mutation owner unavailable", Request("deny-owner"), target, false, "target_owner_busy"),
     ("missing stop binding", Request("deny-stop", ExecutionAction.StopDebugging) with { ExpectedProcessSetSnapshotId = null }, target, true, "debug_session_required"),
     ("wrong debug session", Request("deny-stop-session", ExecutionAction.StopDebugging) with { ExpectedDebugSessionId = "other-session" }, target with { State = "break" }, true, "debug_session_mismatch"),
-    ("pre-existing session requires explicit permission", Request("deny-existing", ExecutionAction.StopDebugging), target with { State = "break", SessionAgentOwned = false }, true, "existing_session_policy_required")
+    ("pre-existing session requires explicit permission", Request("deny-existing", ExecutionAction.StopDebugging), target with { State = "break", SessionAgentOwned = false }, true, "existing_session_policy_required"),
+    ("unsupported startup is refused before dispatch", Request("deny-unsupported"), target with { LaunchBlockedCode = "unsupported", LaunchBlockedReason = "multiple_startup_projects" }, true, "unsupported"),
+    ("dirty documents require user action before no-debug launch", Request("deny-dirty", ExecutionAction.StartWithoutDebugging), target with { LaunchBlockedCode = "user_action_required", LaunchBlockedReason = "dirty_documents" }, true, "user_action_required"),
+    ("missing provider is reported before solution identity", Request("deny-provider-first"), target with { ProviderAvailable = false, SolutionPath = null }, true, "requires_vsix_provider")
 };
 foreach (var item in deniedCases)
 {
@@ -198,6 +201,16 @@ foreach (var item in deniedCases)
     await Task.WhenAll(active);
 }
 
+{
+    var adapter = new FakeAdapter(target with { LaunchBlockedCode = "unsupported", LaunchBlockedReason = "launch_profile_unidentified" });
+    var result = await Coordinator(adapter).ExecuteAsync(Request("blocked-reason"));
+    Check(result.Message.Contains("launch_profile_unidentified", StringComparison.Ordinal) && adapter.DispatchCount == 0,
+        "blocked launch reports the provider reason without dispatch");
+    var stop = await Coordinator(new FakeAdapter(target with { State = "break", LaunchBlockedCode = "unsupported" }))
+        .ExecuteAsync(Request("blocked-stop", ExecutionAction.StopDebugging));
+    Check(stop.State == "observed", "launch blockers do not block an exact-session stop");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
@@ -214,7 +227,7 @@ sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
         return SnapshotTask ?? Task.FromResult(snapshot);
     }
 
-    public Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, CancellationToken cancellationToken)
+    public Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, TimeSpan remaining, CancellationToken cancellationToken)
     {
         DispatchCount++;
         return DispatchTask ?? Task.FromResult(Observation);

@@ -2,6 +2,7 @@
 using ModelContextProtocol.Server;
 using Newtonsoft.Json;
 using VisualStudioMcpServer.Capabilities;
+using VisualStudioMcpServer.Execution;
 using VisualStudioMcpServer.Observation;
 using VisualStudioMcpServer.Providers;
 
@@ -121,4 +122,162 @@ internal static class DebuggerObservationTools
 
     // 各 field は構築時に上限があるため、直列化した JSON を切り詰めない。
     private static string Serialize(DebuggerWaitResult result) => JsonConvert.SerializeObject(result, Formatting.None);
+}
+
+/// <summary>
+/// get_debugger_state の共通実装。既存の DTE 読み取り（Mode/State などの既存 field）を保ち、
+/// provider があれば debugger.getState の session・process set・startup snapshot を追加 field として返す。
+/// </summary>
+internal static class ExecutionToolImplementation
+{
+    private static readonly TimeSpan ProviderReadTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan SequenceCatchUp = TimeSpan.FromSeconds(1);
+
+    internal static async Task<string> GetDebuggerStateAsync(string format, string? expectedSolutionPath, string? operationId,
+        CancellationToken cancellationToken)
+    {
+        DebuggerState state;
+        try { state = StaComDispatcher.Invoke(() => VisualStudioConnector.GetDebuggerState(expectedSolutionPath), TimeSpan.FromSeconds(5)); }
+        catch (TimeoutException) { state = DebuggerState.Unavailable("com_timeout", "The bound Visual Studio debugger state did not respond within the inspection deadline."); }
+        catch (System.Runtime.InteropServices.COMException ex)
+        {
+            state = DebuggerState.Unavailable("com_error", $"Visual Studio rejected debugger inspection (HRESULT 0x{ex.HResult:X8}).");
+        }
+        catch { state = DebuggerState.Unavailable("target_unavailable", "The bound Visual Studio debugger state is unavailable."); }
+
+        if (state.Code == "ok") await EnrichFromProviderAsync(state, expectedSolutionPath!, cancellationToken).ConfigureAwait(false);
+        else state.ProviderStateReason = "debugger_state_unavailable";
+        if (operationId is not null) state.Operation = QueryOperation(operationId);
+
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase)) return SerializeBounded(state);
+        return state.Message.Length <= 4096 ? state.Message : state.Message[..4096];
+    }
+
+    /// <summary>保持中の operation だけを照会する。不明・期限切れ・別世代の ID は operation_not_found のまま返す。</summary>
+    internal static ExecutionOperationResult QueryOperation(string operationId)
+    {
+        var target = ExecutionRuntime.Target();
+        var serverInstanceId = CapabilityRuntimeContext.ServerInstanceId;
+        var serverEpoch = CapabilityRuntimeContext.ServerEpoch;
+        if (!ProviderProtocol.IsUuidN(operationId))
+            return new ExecutionOperationResult(false, "invalid_argument", "operationId must be a lowercase 32-character UUID value.",
+                null, "not_started", false, target?.ProcessId, serverInstanceId, serverEpoch, null, null);
+        if (target is null || serverInstanceId is null || serverEpoch is null)
+            return new ExecutionOperationResult(false, "operation_not_found", "The operation is unknown for this server generation.",
+                null, "not_started", false, target?.ProcessId, serverInstanceId, serverEpoch, null, null);
+        return ExecutionRuntime.Coordinator.Query(operationId, target.Value.ProcessId, target.Value.StartTicks, serverInstanceId,
+            serverEpoch.Value);
+    }
+
+    private static async Task EnrichFromProviderAsync(DebuggerState state, string expectedSolutionPath, CancellationToken cancellationToken)
+    {
+        var channel = ProviderRuntime.Channel;
+        var store = ProviderRuntime.ObservationStore;
+        var target = ExecutionRuntime.Target();
+        if (channel is null || channel.IsTerminated || target is null)
+        {
+            state.ProviderStateAvailability = "requires_vsix_provider";
+            state.ProviderStateReason = "provider_channel_unavailable";
+            return;
+        }
+        state.ProviderEpoch = channel.Identity.ProviderEpoch;
+        if (!channel.ImplementedOperations.Contains("debugger.getState"))
+        {
+            state.ProviderStateAvailability = "unsupported";
+            state.ProviderStateReason = ProviderErrorCodes.UnsupportedOperation;
+            return;
+        }
+        var call = await channel.SendAsync("debugger.getState", new DebuggerGetStateRequestBody
+        {
+            Target = new ProviderTarget { VisualStudioPid = target.Value.ProcessId, VisualStudioStartTicks = target.Value.StartTicks },
+            IncludeStartupSnapshot = true
+        }, ProviderReadTimeout).ConfigureAwait(false);
+        var result = await call.Result.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!result.IsOk)
+        {
+            state.ProviderStateAvailability = "unknown";
+            state.ProviderStateReason = result.Code;
+            return;
+        }
+        DebuggerGetStateResponseBody body;
+        try { body = ProviderExecutionBodies.ParseGetState(result.Body!); }
+        catch (ProviderProtocolException)
+        {
+            state.ProviderStateAvailability = "unknown";
+            state.ProviderStateReason = "invalid_provider_response";
+            return;
+        }
+        if (body.SolutionPath is null || !SamePath(body.SolutionPath, expectedSolutionPath))
+        {
+            // DTE の読み取り後に solution が変わった。古い snapshot を混ぜずに状態不明として返す。
+            state.ProviderStateAvailability = "unknown";
+            state.ProviderStateReason = "solution_mismatch";
+            return;
+        }
+
+        state.ProviderStateAvailability = "supported";
+        state.ProviderStateReason = null;
+        state.ProviderSequence = body.ProviderSequence;
+        state.DebugSessionId = body.DebugSessionId;
+        state.LaunchOperationId = body.LaunchOperationId;
+        state.SessionAgentOwned = body.DebugSessionId is null ? null : body.SessionAgentOwned;
+        state.ProcessSetSnapshotId = body.ProcessSetSnapshotId;
+        state.Processes = body.Processes.Select(static process => new DebuggedProcessInfo
+        {
+            ProcessId = process.ProcessId, StartTicks = process.StartTicks, Name = process.Name
+        }).ToList();
+        state.ProcessesTruncated = body.ProcessesTruncated;
+        state.CurrentThreadAvailable = body.CurrentThreadAvailable;
+        state.Configuration = body.Configuration;
+        state.Platform = body.Platform;
+        if (body.StartupSnapshot is { } startup)
+        {
+            state.StartupSnapshot = new StartupSnapshotInfo
+            {
+                SnapshotId = startup.SnapshotId,
+                StartupProjects = startup.StartupProjects.Select(static project => new StartupProjectInfo
+                {
+                    UniqueName = project.UniqueName, ProviderKind = project.ProviderKind
+                }).ToList(),
+                ProviderKind = startup.ProviderKind,
+                ProfileStatus = startup.ProfileStatus,
+                LaunchSupported = startup.LaunchSupported,
+                UnsupportedCode = startup.UnsupportedCode,
+                UnsupportedReason = startup.UnsupportedReason,
+                BuildMayOccur = startup.BuildMayOccur
+            };
+        }
+        if (store is not null && store.ProviderEpoch == channel.Identity.ProviderEpoch)
+        {
+            // 状態に反映済みの mode event まで観測 store が追いつくのを短時間だけ待ち、同じ時点の公開 sequence を返す。
+            await store.WaitForProviderSequenceAsync(body.ProviderSequence, SequenceCatchUp, cancellationToken).ConfigureAwait(false);
+            if (store.TryGetSequenceForProviderSequence(body.ProviderSequence, out var sequence)) state.EventSequence = sequence;
+        }
+    }
+
+    private static bool SamePath(string left, string right)
+    {
+        try
+        {
+            static string Normalize(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(Normalize(left), Normalize(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static string SerializeBounded(DebuggerState state)
+    {
+        const int maxBytes = 64 * 1024;
+        var json = JsonConvert.SerializeObject(state, Formatting.Indented);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) <= maxBytes) return json;
+        // 上限を超える場合は追加 field を外した既存の小さな形にし、JSON を途中で切らない。
+        var bounded = DebuggerState.Unavailable("response_too_large", "Debugger state exceeded the response size limit.", state.TargetProcessId,
+            state.SolutionPath is { Length: > 4096 } ? state.SolutionPath[..4096] : state.SolutionPath);
+        bounded.Mode = state.Mode.Length <= 64 ? state.Mode : state.Mode[..64];
+        bounded.State = state.State.Length <= 64 ? state.State : state.State[..64];
+        json = JsonConvert.SerializeObject(bounded, Formatting.Indented);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > maxBytes)
+            throw new InvalidOperationException("Debugger state result schema exceeds response size limit.");
+        return json;
+    }
 }

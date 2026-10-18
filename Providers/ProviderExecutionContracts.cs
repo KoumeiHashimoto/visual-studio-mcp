@@ -45,6 +45,39 @@ internal sealed record DebuggerGetStateResponseBody
     public bool SessionAgentOwned { get; init; }
 }
 
+/// <summary>execution.readTarget の応答。ExecutionTargetSnapshot の各 field に対応する。</summary>
+internal sealed record ExecutionReadTargetResponseBody
+{
+    public int TargetProcessId { get; init; }
+    public long TargetProcessStartTicks { get; init; }
+    public string ServerInstanceId { get; init; } = string.Empty;
+    public string ProviderEpoch { get; init; } = string.Empty;
+    public string? SolutionPath { get; init; }
+    public string? Configuration { get; init; }
+    public string? Platform { get; init; }
+    public string? StartupSnapshotId { get; init; }
+    public string? DebugSessionId { get; init; }
+    public string? ProcessSetSnapshotId { get; init; }
+    public string State { get; init; } = "unknown";
+    public bool ProviderAvailable { get; init; }
+    public bool BuildMayOccur { get; init; }
+    public bool SessionAgentOwned { get; init; }
+    public string? LaunchBlockedCode { get; init; }
+    public string? LaunchBlockedReason { get; init; }
+}
+
+/// <summary>execution.dispatch の応答。凍結した契約の field だけを持つ。</summary>
+internal sealed record ExecutionDispatchResponseBody
+{
+    public string State { get; init; } = string.Empty;
+    public string Code { get; init; } = string.Empty;
+    public bool MayHaveChanged { get; init; }
+    public string? DebugSessionId { get; init; }
+    public string? ProcessSetSnapshotId { get; init; }
+    public bool LaunchAccepted { get; init; }
+    public string ProcessTrackingStatus { get; init; } = string.Empty;
+}
+
 /// <summary>execution 系の応答本文を型で解析し、catalog の per-field 上限を検査する。違反は契約違反として扱う。</summary>
 internal static class ProviderExecutionBodies
 {
@@ -61,6 +94,29 @@ internal static class ProviderExecutionBodies
             !IsOptionalText(value.SolutionPath, 1024) || !IsOptionalText(value.Configuration, 256) ||
             !IsOptionalText(value.Platform, 256) || (value.StartupSnapshot is not null && !IsValidStartup(value.StartupSnapshot)))
             throw new ProviderProtocolViolationException("The debugger.getState response is out of range.");
+        return value;
+    }
+
+    internal static ExecutionReadTargetResponseBody ParseReadTarget(string body)
+    {
+        var value = ProviderProtocol.ParseBody<ExecutionReadTargetResponseBody>(body);
+        if (value.TargetProcessId <= 0 || value.TargetProcessStartTicks <= 0 || !ProviderProtocol.IsServerInstanceId(value.ServerInstanceId) ||
+            !ProviderProtocol.IsUuidN(value.ProviderEpoch) || !IsOptionalText(value.SolutionPath, 1024) ||
+            !IsOptionalText(value.Configuration, 256) || !IsOptionalText(value.Platform, 256) || !IsOptionalId(value.StartupSnapshotId) ||
+            !IsOptionalId(value.DebugSessionId) || !IsOptionalId(value.ProcessSetSnapshotId) || !IsState(value.State) ||
+            value.LaunchBlockedCode is not (null or "unsupported" or "user_action_required") ||
+            !ProviderBodyRules.IsOptionalToken(value.LaunchBlockedReason, 128))
+            throw new ProviderProtocolViolationException("The execution.readTarget response is out of range.");
+        return value;
+    }
+
+    internal static ExecutionDispatchResponseBody ParseDispatch(string body)
+    {
+        var value = ProviderProtocol.ParseBody<ExecutionDispatchResponseBody>(body);
+        if (value.State is not ("accepted" or "failed" or "uncertain") || !ProviderBodyRules.IsToken(value.Code, 64) ||
+            !IsOptionalId(value.DebugSessionId) || !IsOptionalId(value.ProcessSetSnapshotId) ||
+            !ProviderBodyRules.IsToken(value.ProcessTrackingStatus, 64))
+            throw new ProviderProtocolViolationException("The execution.dispatch response is out of range.");
         return value;
     }
 

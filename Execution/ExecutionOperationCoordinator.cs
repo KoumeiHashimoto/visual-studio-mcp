@@ -1,9 +1,10 @@
-namespace VisualStudioMcpServer.Execution;
+﻿namespace VisualStudioMcpServer.Execution;
 
 internal interface IExecutionAdapter
 {
     Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(TimeSpan remaining, CancellationToken cancellationToken);
-    Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, CancellationToken cancellationToken);
+    /// <summary>1 回だけ dispatch する。remaining は coordinator がこの dispatch を待つ残り時間で、adapter はこれより前に確定させる。</summary>
+    Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, TimeSpan remaining, CancellationToken cancellationToken);
 }
 
 internal interface IExecutionMutationLease : IDisposable { }
@@ -97,7 +98,14 @@ internal sealed class ExecutionOperationCoordinator
             catch (Exception) { RemoveDenied(record, "target_unavailable", request); return; }
 
             code = ValidateSnapshot(request, snapshot);
-            if (code is not null) { RemoveDenied(record, code, request); return; }
+            if (code is not null)
+            {
+                // provider が起動前提を満たさないと判断した場合は、その理由を message に含めて dispatch 前に拒否する。
+                var blocked = code == snapshot.LaunchBlockedCode && snapshot.LaunchBlockedReason is { } reason
+                    ? $"{Message(code)} Reason: {reason}." : null;
+                RemoveDenied(record, code, request, blocked);
+                return;
+            }
             remaining = Remaining(record);
             if (remaining <= TimeSpan.Zero) { RemoveDenied(record, "deadline_expired", request); return; }
             if (preDispatchCancellation.IsCancellationRequested) { RemoveDenied(record, "cancelled_before_dispatch", request); return; }
@@ -109,7 +117,7 @@ internal sealed class ExecutionOperationCoordinator
             Task<ExecutionDispatchObservation>? dispatchTask = null;
             try
             {
-                dispatchTask = _adapter.DispatchAsync(request, record.OperationId, CancellationToken.None);
+                dispatchTask = _adapter.DispatchAsync(request, record.OperationId, remaining, CancellationToken.None);
                 observation = await dispatchTask.WaitAsync(remaining).ConfigureAwait(false);
                 lock (_sync) record.DispatchSettled = true;
             }
@@ -261,9 +269,9 @@ internal sealed class ExecutionOperationCoordinator
         }
     }
 
-    private ExecutionOperationResult RemoveDenied(OperationRecord record, string code, ExecutionRequest request)
+    private ExecutionOperationResult RemoveDenied(OperationRecord record, string code, ExecutionRequest request, string? message = null)
     {
-        var denied = Denied(code, Message(code), request.TargetProcessId, request.ServerInstanceId, request.ServerEpoch);
+        var denied = Denied(code, Limit(message ?? Message(code)), request.TargetProcessId, request.ServerInstanceId, request.ServerEpoch);
         lock (_sync)
         {
             _byRequestId.Remove(record.RequestId);
@@ -314,14 +322,16 @@ internal sealed class ExecutionOperationCoordinator
     {
         if (snapshot.TargetProcessId != request.TargetProcessId || snapshot.TargetProcessStartUtcTicks != request.TargetProcessStartUtcTicks ||
             snapshot.ServerInstanceId != request.ServerInstanceId || snapshot.ServerEpoch != request.ServerEpoch) return "stale_target";
-        if (!PathEquals(snapshot.SolutionPath, request.ExpectedSolutionPath)) return "solution_mismatch";
+        // provider がなければ solution を確認できないため、solution より先に判定する。
         if (!snapshot.ProviderAvailable) return "requires_vsix_provider";
+        if (!PathEquals(snapshot.SolutionPath, request.ExpectedSolutionPath)) return "solution_mismatch";
         if (request.Action is not ExecutionAction.StopDebugging && snapshot.BuildMayOccur && !request.AllowBuild) return "build_policy_required";
         return request.Action switch
         {
             ExecutionAction.StartDebugging when snapshot.State != "design" => "invalid_debugger_state",
             ExecutionAction.StartWithoutDebugging when snapshot.State != "design" => "invalid_debugger_state",
             ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when snapshot.StartupSnapshotId != request.ExpectedStartupSnapshotId => "stale_startup_snapshot",
+            ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when snapshot.LaunchBlockedCode is { } blocked => blocked,
             ExecutionAction.StopDebugging when snapshot.State is not "running" and not "break" => "invalid_debugger_state",
             ExecutionAction.StopDebugging when snapshot.DebugSessionId != request.ExpectedDebugSessionId || snapshot.ProcessSetSnapshotId != request.ExpectedProcessSetSnapshotId => "debug_session_mismatch",
             ExecutionAction.StopDebugging when !snapshot.SessionAgentOwned && !request.AllowStopExistingSession => "existing_session_policy_required",
@@ -414,6 +424,8 @@ internal sealed class ExecutionOperationCoordinator
         "invalid_operation_transition" => "The operation observation would move its state backwards.",
         "cancelled_before_dispatch" => "The caller cancelled before dispatch.",
         "operation_failed" => "The execution request failed before dispatch.",
+        "unsupported" => "The startup configuration is not supported for a guarded launch.",
+        "user_action_required" => "The startup configuration needs user action (for example saving documents) before a guarded launch.",
         _ => "The execution request was rejected before dispatch."
     };
 

@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using VisualStudioMcpServer.Providers;
 using VisualStudioMcpServer.Coordination;
 using VisualStudioMcpServer.Observation;
+using VisualStudioMcpServer.Execution;
 
 if (args.Length == 3 && args[0] == "--owner-probe")
 {
@@ -535,6 +536,115 @@ Violation(() => ProviderExecutionBodies.ParseGetState(JsonSerializer.Serialize(n
 Violation(() => ProviderExecutionBodies.ParseGetState("{\"state\":\"design\",\"debugSessionId\":\"not-a-uuid\"}"), "non-UUID session identity is a violation");
 Violation(() => ProviderExecutionBodies.ParseGetState("{\"state\":\"design\",\"extra\":1}"), "unknown getState member is a violation");
 
+// ---- 親 repository と共有する execution 応答の wire 形 ----
+const string ReadTargetWire = "{\"targetProcessId\":101,\"targetProcessStartTicks\":638900000000000000,\"serverInstanceId\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"providerEpoch\":\"22222222222242228222222222222222\",\"solutionPath\":\"C:\\\\fixture\\\\App.sln\",\"configuration\":\"Debug\",\"platform\":\"Any CPU\",\"startupSnapshotId\":\"33333333333343338333333333333333\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"state\":\"design\",\"providerAvailable\":true,\"buildMayOccur\":true,\"sessionAgentOwned\":false,\"launchBlockedCode\":\"user_action_required\",\"launchBlockedReason\":\"dirty_documents\"}";
+const string GetStateWire = "{\"state\":\"break\",\"debugSessionId\":\"44444444444444448444444444444444\",\"processSetSnapshotId\":\"55555555555545558555555555555555\",\"processes\":[{\"processId\":10,\"startTicks\":5,\"name\":\"App.exe\"}],\"processesTruncated\":false,\"currentThreadAvailable\":true,\"solutionPath\":\"C:\\\\fixture\\\\App.sln\",\"configuration\":\"Debug\",\"platform\":\"Any CPU\",\"startupSnapshot\":{\"snapshotId\":\"33333333333343338333333333333333\",\"startupProjects\":[{\"uniqueName\":\"App\\\\App.csproj\",\"providerKind\":\"csharp-sdk\"}],\"providerKind\":\"csharp-sdk\",\"profileStatus\":\"default\",\"launchSupported\":true,\"unsupportedCode\":null,\"unsupportedReason\":null,\"buildMayOccur\":true},\"providerSequence\":3,\"launchOperationId\":null,\"sessionAgentOwned\":false}";
+var sharedTarget = ProviderExecutionBodies.ParseReadTarget(ReadTargetWire);
+Check(sharedTarget.TargetProcessId == 101 && sharedTarget.LaunchBlockedCode == "user_action_required" && sharedTarget.StartupSnapshotId == "33333333333343338333333333333333",
+    "execution.readTarget shared wire literal parses with the same members");
+var sharedState = ProviderExecutionBodies.ParseGetState(GetStateWire);
+Check(sharedState.StartupSnapshot!.StartupProjects.Single().UniqueName == "App\\App.csproj" && sharedState.ProviderSequence == 3,
+    "debugger.getState shared wire literal parses with the same members");
+// ---- 本番 execution adapter: 応答の写像 ----
+ProviderCallResult Ok(string operation, string body) => new(Guid.NewGuid().ToString("N"), operation, "ok", null, "dispatched", body, null);
+ProviderCallResult Err(string code, string dispatchState) => new(Guid.NewGuid().ToString("N"), "execution.dispatch", "error", code, dispatchState, null, "m");
+string DispatchBody(string state, bool launchAccepted, string tracking = "unsupported") => JsonSerializer.Serialize(new ExecutionDispatchResponseBody
+{
+    State = state, Code = state == "accepted" ? "launch_accepted" : "launch_failed", MayHaveChanged = state != "failed",
+    LaunchAccepted = launchAccepted, ProcessTrackingStatus = tracking
+}, ProviderProtocol.BodyJsonOptions);
+Check(ProviderExecutionAdapter.Map(ExecutionAction.StartDebugging, Ok("execution.dispatch", DispatchBody("accepted", true))).State == ExecutionState.Accepted,
+    "accepted debug launch stays accepted until the session is observed");
+var noDebug = ProviderExecutionAdapter.Map(ExecutionAction.StartWithoutDebugging, Ok("execution.dispatch", DispatchBody("accepted", true)));
+Check(noDebug.State == ExecutionState.Observed && noDebug.Message.Contains("process tracking: unsupported", StringComparison.Ordinal),
+    "accepted no-debug launch settles with explicit process-tracking status");
+Check(ProviderExecutionAdapter.Map(ExecutionAction.StartDebugging, Ok("execution.dispatch", DispatchBody("failed", false))).State == ExecutionState.Failed,
+    "provider-reported failure settles as failed");
+var refusedDispatch = ProviderExecutionAdapter.Map(ExecutionAction.StartDebugging, Err("owner_fence_failed", "notDispatched"));
+Check(refusedDispatch.State == ExecutionState.Failed && !refusedDispatch.MayHaveChanged && refusedDispatch.Code == "owner_fence_failed",
+    "notDispatched provider error is a failure without possible effects");
+foreach (var (code, dispatchState) in new[] { ("result_unknown", "unknown"), ("internal_error", "unknown"), ("provider_disconnected", "unknown") })
+    Check(ProviderExecutionAdapter.Map(ExecutionAction.StopDebugging, Err(code, dispatchState)) is { State: ExecutionState.Uncertain, MayHaveChanged: true, Code: "result_unknown" },
+        $"{code} with {dispatchState} dispatch is uncertain and never replayed");
+Check(ProviderExecutionAdapter.Map(ExecutionAction.StartDebugging, Ok("execution.dispatch", "{\"state\":\"bogus\"}")).State == ExecutionState.Uncertain,
+    "invalid dispatch response is treated as uncertain");
+Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAction.StopDebugging, 1, 1, "s", Guid.NewGuid(), "C:\\a.sln", null, "x", "y",
+    AllowDebuggerControl: true, AllowStopExistingSession: true)).SequenceEqual(["allowDebuggerControl", "allowStopExistingSession"]),
+    "only granted policy flags are sent to the provider");
+
+// ---- 本番 execution adapter: channel 上の readTarget / dispatch / observed ----
+{
+    var serverEpoch = Guid.NewGuid();
+    var vsTarget = (101, 638900000000000000L);
+    var noChannel = new ProviderExecutionAdapter(() => null, () => vsTarget, () => "AAAAAAAAAAAAAAAAAAAAAA", () => serverEpoch,
+        () => "55555555555545558555555555555555");
+    var unavailable = await noChannel.ReadTargetSnapshotAsync(TimeSpan.FromSeconds(1), CancellationToken.None);
+    Check(!unavailable.ProviderAvailable && unavailable.ServerEpoch == serverEpoch, "missing provider channel reports provider unavailable without a request");
+
+    await using var harness = await Harness.CreateAsync(sessionKeyKat, ["execution.readTarget", "execution.dispatch"], ProviderRuntime.Attach);
+    var adapter = new ProviderExecutionAdapter(() => harness.Channel, () => vsTarget, () => "AAAAAAAAAAAAAAAAAAAAAA", () => serverEpoch,
+        () => "55555555555545558555555555555555");
+    var released = 0;
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, acquireWorkspaceLease: () => new TestLease(() => released++));
+    ProviderRuntime.ExecutionObserved = (_, body) =>
+        coordinator.ReportObservation(body.OperationId, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch, ProviderExecutionAdapter.MapObserved(body));
+    var startupSnapshot = Guid.NewGuid().ToString("N");
+    var readTarget = JsonSerializer.Serialize(new ExecutionReadTargetResponseBody
+    {
+        TargetProcessId = 101, TargetProcessStartTicks = 638900000000000000, ServerInstanceId = "AAAAAAAAAAAAAAAAAAAAAA", ProviderEpoch = Epoch,
+        SolutionPath = "C:\\fixture\\App.sln", Configuration = "Debug", Platform = "Any CPU", StartupSnapshotId = startupSnapshot,
+        State = "design", ProviderAvailable = true, BuildMayOccur = true
+    }, ProviderProtocol.BodyJsonOptions);
+    var request = new ExecutionRequest("launch-1", ExecutionAction.StartDebugging, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch,
+        "C:\\fixture\\App.sln", startupSnapshot, null, null, AllowDebuggerControl: true, AllowBuild: true, CallerWaitTimeoutMilliseconds: 10_000);
+    var execute = coordinator.ExecuteAsync(request);
+    var targetRequest = await harness.Provider.ReadAsync();
+    Check(targetRequest.Operation == "execution.readTarget", "coordinator reads the provider target before dispatch");
+    await harness.Provider.RespondAsync(targetRequest, "ok", "dispatched", readTarget);
+    var dispatchRequest = await harness.Provider.ReadAsync();
+    var dispatchBody = ProviderProtocol.ParseBody<ExecutionDispatchRequestBody>(dispatchRequest.Body);
+    Check(dispatchRequest.Operation == "execution.dispatch" && dispatchBody.Action == "startDebugging" &&
+        dispatchBody.OwnerFence == "55555555555545558555555555555555" && dispatchBody.ExpectedStartupSnapshotId == startupSnapshot &&
+        dispatchBody.PolicyFlags.SequenceEqual(["allowDebuggerControl", "allowBuild"]) && ProviderProtocol.IsUuidN(dispatchBody.OperationId) &&
+        dispatchRequest.DeadlineUnixMilliseconds <= DateTimeOffset.UtcNow.AddSeconds(30).ToUnixTimeMilliseconds(),
+        "dispatch carries the operation, owner fence, expected snapshot and granted flags within the 30-second ceiling");
+    await harness.Provider.RespondAsync(dispatchRequest, "ok", "dispatched", JsonSerializer.Serialize(new ExecutionDispatchResponseBody
+    {
+        State = "accepted", Code = "launch_accepted", MayHaveChanged = true, LaunchAccepted = true, ProcessTrackingStatus = "debugger_session"
+    }, ProviderProtocol.BodyJsonOptions));
+    var accepted = await execute.WaitAsync(TimeSpan.FromSeconds(10));
+    Check(accepted.State == "accepted" && accepted.OperationId == dispatchBody.OperationId && released == 0,
+        "accepted launch keeps the workspace lease until the session is observed");
+    var session = Guid.NewGuid().ToString("N");
+    await harness.Provider.EventAsync("execution.observed", "{\"operationId\":\"" + dispatchBody.OperationId +
+        "\",\"state\":\"observed\",\"code\":\"debug_session_started\",\"debugSessionId\":\"" + session + "\",\"processSetSnapshotId\":null}");
+    var observedDeadline = DateTime.UtcNow.AddSeconds(5);
+    while (coordinator.Query(accepted.OperationId!, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch).State != "observed" &&
+           DateTime.UtcNow < observedDeadline) await Task.Delay(20);
+    var settledLaunch = coordinator.Query(accepted.OperationId!, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch);
+    Check(settledLaunch.State == "observed" && settledLaunch.DebugSessionId == session && released == 1,
+        "execution.observed settles the exact operation and releases the lease");
+
+    var lostRequest = request with { RequestId = "lost-1", ExpectedStartupSnapshotId = startupSnapshot };
+    var lost = coordinator.ExecuteAsync(lostRequest with { CallerWaitTimeoutMilliseconds = 30_000 });
+    await harness.Provider.RespondAsync(await harness.Provider.ReadAsync(), "ok", "dispatched", readTarget);
+    var lostDispatch = await harness.Provider.ReadAsync();
+    var lostResult = await lost.WaitAsync(TimeSpan.FromSeconds(40));
+    Check(lostResult.State == "uncertain" && lostResult.Code == "result_unknown" && lostResult.MayHaveChanged,
+        "dispatch without a reply settles as result_unknown before the coordinator deadline");
+    var retry = await coordinator.ExecuteAsync(lostRequest);
+    Check(retry.OperationId == lostResult.OperationId && !harness.Provider.HasPendingInput(), "retrying the same requestId queries the operation and never replays");
+    await harness.Provider.EventAsync("execution.observed", "{\"operationId\":\"" + ProviderProtocol.ParseBody<ExecutionDispatchRequestBody>(lostDispatch.Body).OperationId +
+        "\",\"state\":\"observed\",\"code\":\"debug_session_started\",\"debugSessionId\":\"" + Guid.NewGuid().ToString("N") + "\",\"processSetSnapshotId\":null}");
+    observedDeadline = DateTime.UtcNow.AddSeconds(5);
+    while (coordinator.Query(lostResult.OperationId!, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch).State != "observed" &&
+           DateTime.UtcNow < observedDeadline) await Task.Delay(20);
+    Check(coordinator.Query(lostResult.OperationId!, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch).State == "observed" && released == 2,
+        "a later observation settles the uncertain operation without replay");
+    ProviderRuntime.ExecutionObserved = null;
+    ProviderRuntime.Detach(harness.Channel);
+}
+
 // ---- 所有者 lease の abandoned quarantine と解除 ----
 using (var crashedOwner = StartOwnerProbe(current.Id, ownerIdentityTicks))
 {
@@ -836,5 +946,14 @@ sealed class Harness : IAsyncDisposable
         await Channel.DisposeAsync();
         await Provider.DisposeAsync();
         await _client.DisposeAsync();
+    }
+}
+
+sealed class TestLease(Action onDispose) : IExecutionMutationLease
+{
+    private int _disposed;
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0) onDispose();
     }
 }

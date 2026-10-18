@@ -1394,6 +1394,30 @@ public class DebuggerState
     public string? CurrentFile { get; set; }
     public int CurrentLine { get; set; }
 
+    // ---- v1.3 P13-01 の追加 field（既存 field と値は変えない）----
+    /// <summary>provider から得た状態の可否。supported / requires_vsix_provider / provider_unavailable など。</summary>
+    public string ProviderStateAvailability { get; set; } = "requires_vsix_provider";
+    public string? ProviderStateReason { get; set; }
+    public string? ProviderEpoch { get; set; }
+    public ulong? ProviderSequence { get; set; }
+    /// <summary>wait_for_debugger_state の afterSequence に使う公開 sequence。対応付けられない場合は null。</summary>
+    public long? EventSequence { get; set; }
+    public string? DebugSessionId { get; set; }
+    public string? LaunchOperationId { get; set; }
+    public bool? SessionAgentOwned { get; set; }
+    public string? ProcessSetSnapshotId { get; set; }
+    public List<DebuggedProcessInfo>? Processes { get; set; }
+    public bool? ProcessesTruncated { get; set; }
+    public bool? CurrentThreadAvailable { get; set; }
+    public string? Configuration { get; set; }
+    public string? Platform { get; set; }
+    public StartupSnapshotInfo? StartupSnapshot { get; set; }
+    /// <summary>停止理由・例外・終了コードは mode 通知から得られないため常に unsupported。</summary>
+    public string StopReasonAvailability { get; set; } = "unsupported";
+    /// <summary>operationId 指定時の、その operation だけの結果。不明 ID を別の operation で代用しない。</summary>
+    [JsonProperty("Operation")]
+    internal Execution.ExecutionOperationResult? Operation { get; set; }
+
     public static DebuggerState Unavailable(string code, string message, int? targetProcessId = null, string? solutionPath = null) => new()
     {
         Code = code,
@@ -1403,6 +1427,31 @@ public class DebuggerState
         TargetProcessId = targetProcessId,
         SolutionPath = solutionPath
     };
+}
+
+public class DebuggedProcessInfo
+{
+    public int ProcessId { get; set; }
+    public long? StartTicks { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public class StartupSnapshotInfo
+{
+    public string SnapshotId { get; set; } = "";
+    public List<StartupProjectInfo> StartupProjects { get; set; } = new();
+    public string ProviderKind { get; set; } = "";
+    public string ProfileStatus { get; set; } = "";
+    public bool LaunchSupported { get; set; }
+    public string? UnsupportedCode { get; set; }
+    public string? UnsupportedReason { get; set; }
+    public bool BuildMayOccur { get; set; }
+}
+
+public class StartupProjectInfo
+{
+    public string UniqueName { get; set; } = "";
+    public string ProviderKind { get; set; } = "";
 }
 
 public class StackFrameInfo
