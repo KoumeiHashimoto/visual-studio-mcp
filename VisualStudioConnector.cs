@@ -7,6 +7,7 @@ using EnvDTE80;
 using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.Workspace;
 using Newtonsoft.Json;
+using VisualStudioMcpServer.Coordination;
 
 namespace VisualStudioMcpServer;
 
@@ -309,6 +310,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartDebugging()
     {
+        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
         var dte = GetActiveVS();
         if (dte == null) return "Error: No VS instance found";
 
@@ -330,6 +332,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartWithoutDebugging()
     {
+        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
         var dte = GetActiveVS();
         if (dte == null) return "Error: No VS instance found";
 
@@ -349,6 +352,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StopDebugging()
     {
+        if (!TargetMutationOwner.IsCurrentOwner) return "Error: target_owner_busy";
         var dte = GetActiveVS();
         if (dte == null) return "Error: No VS instance found";
 
@@ -449,6 +453,8 @@ public static class VisualStudioConnector
             file, line, function, condition, allowMutation, allowConditionEvaluation);
         if (validation.Code is not null)
             return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateBreakpointError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         if ((file?.Length ?? 0) > 2048 || (function?.Length ?? 0) > 2048 || (condition?.Length ?? 0) > 2048)
             return CreateBreakpointError("invalid_location", "Breakpoint arguments exceed their size limits.");
@@ -514,6 +520,8 @@ public static class VisualStudioConnector
             id, expectedFile, expectedLine, expectedFunction, expectedCondition, allowMutation);
         if (validation.Code is not null)
             return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint removal request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateBreakpointError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         try
         {
@@ -785,6 +793,8 @@ public static class VisualStudioConnector
     public static DebuggerInspectionResponse SelectDebuggerThread(int threadId)
     {
         if (threadId <= 0) return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current thread list.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateInspectionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
@@ -826,6 +836,8 @@ public static class VisualStudioConnector
         if (!BreakpointRequestValidation.IsValidFrameIndex(index) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
             return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateInspectionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
@@ -935,6 +947,8 @@ public static class VisualStudioConnector
         var validation = BreakpointRequestValidation.ValidateDebuggerControl(action, allowDebuggerControl);
         if (validation.Code is not null)
             return CreateDebuggerControlError(action, validation.Code, validation.Message ?? "The debugger control request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateDebuggerControlError(action, "target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         timeoutMilliseconds = Math.Clamp(timeoutMilliseconds, 1000, 10000);
         var startedAt = System.Diagnostics.Stopwatch.StartNew();
@@ -1200,6 +1214,8 @@ public static class VisualStudioConnector
             expressionText, allowEvaluation, allowSideEffects);
         if (expressionValidation.Code is not null)
             return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateExpressionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) ||
             expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
             expectedFrameCount < 1 || expectedThreadId <= 0)

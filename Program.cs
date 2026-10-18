@@ -20,6 +20,7 @@ using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.ConnectionKeys;
 using VisualStudioMcpServer.Workspace;
 using VisualStudioMcpServer.Providers;
+using VisualStudioMcpServer.Coordination;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -66,7 +67,10 @@ internal static class Program
     {
         var targetIdentity = HttpOptions.ParseOptionalParentIdentity(args);
         if (targetIdentity.HasValue)
+        {
             VisualStudioConnector.SetTargetProcessIdentity(targetIdentity.Value.ProcessId, targetIdentity.Value.StartTicks);
+            TargetMutationOwner.Initialize(targetIdentity.Value.ProcessId, targetIdentity.Value.StartTicks);
+        }
         StaComDispatcher.Start();
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
@@ -74,7 +78,8 @@ internal static class Program
             .WithStdioServerTransport()
             .WithToolsFromAssembly(typeof(GetSolutionInfoTool).Assembly);
 
-        await builder.Build().RunAsync();
+        try { await builder.Build().RunAsync(); }
+        finally { TargetMutationOwner.Shutdown(); }
     }
 
     /// <summary>
@@ -95,6 +100,7 @@ internal static class Program
         }
 
         VisualStudioConnector.SetTargetProcessIdentity(options.ParentPid, options.ParentStartTicks);
+        TargetMutationOwner.Initialize(options.ParentPid, options.ParentStartTicks);
         StaComDispatcher.Start();
         var tokenBytes = RandomNumberGenerator.GetBytes(32);
         var token = Convert.ToBase64String(tokenBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
@@ -276,6 +282,7 @@ internal static class Program
             ProjectInventoryTools.SnapshotStore.InvalidateAll();
             ActiveWorkspaceSnapshotStoreAccessor.Clear(workspaceSnapshots);
             try { File.Delete(options.EndpointFile); } catch (IOException) { }
+            TargetMutationOwner.Shutdown();
         }
     }
 

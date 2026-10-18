@@ -4,6 +4,7 @@ using System.Text.Json;
 using EnvDTE;
 using EnvDTE80;
 using ModelContextProtocol.Server;
+using VisualStudioMcpServer.Coordination;
 
 namespace VisualStudioMcpServer.Tools;
 
@@ -125,6 +126,7 @@ public sealed class ProjectFileActionTools
         if (!ValidFormat(format)) return Format(Result(false, "invalid_format", "Format must be text or json.", null, null, null, filePath, started));
         if (!allowMutation) return Format(Result(false, "mutation_not_allowed", "Set allowProjectMutation=true to change project registration.", null, expectedSolutionPath, expectedProjectPath, filePath, started));
         if (!TryBoundTarget(out var pid, out var ticks, out var error)) return Format(Result(false, error!, "The bound Visual Studio process identity is required.", null, expectedSolutionPath, expectedProjectPath, filePath, started));
+        if (!TargetMutationOwner.IsCurrentOwner) return Format(Result(false, "target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
         if (!Absolute(expectedSolutionPath) || !Absolute(expectedProjectPath)) return Format(Result(false, "invalid_argument", "Expected solution and project paths must be absolute.", pid, expectedSolutionPath, expectedProjectPath, filePath, started));
         ProjectSnapshotData? projects = null; ProjectInfoRecord? selected = null; FileSnapshotData? files = null; ProjectFileRecord? selectedItem = null;
         if (fileSnapshotId is null)

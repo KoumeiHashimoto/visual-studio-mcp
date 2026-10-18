@@ -5,6 +5,16 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Security.Cryptography;
 using VisualStudioMcpServer.Providers;
+using VisualStudioMcpServer.Coordination;
+
+if (args.Length == 3 && args[0] == "--owner-probe")
+{
+    using var probeOwner = TargetMutationOwner.TryAcquire(int.Parse(args[1]), long.Parse(args[2]));
+    Console.WriteLine(probeOwner is null ? "denied" : "acquired");
+    await Console.Out.FlushAsync();
+    if (probeOwner is null) Environment.Exit(2);
+    Thread.Sleep(Timeout.Infinite);
+}
 
 var passed = 0;
 var secret = Enumerable.Range(0, 32).Select(static value => (byte)value).ToArray();
@@ -55,6 +65,19 @@ await Throws<InvalidDataException>(Task.Run(() => ProviderProtocol.Serialize(Fra
 
 var current = Process.GetCurrentProcess();
 var currentStartTicks = current.StartTime.ToUniversalTime().Ticks;
+var ownerIdentityTicks = currentStartTicks;
+using var ownerObserver = new Mutex(false, TargetMutationOwner.GetMutexName(current.Id, ownerIdentityTicks));
+using (var firstOwner = TargetMutationOwner.TryAcquire(current.Id, ownerIdentityTicks))
+{
+    Check(firstOwner is not null, "first companion acquires per-target mutation owner");
+    Check(TargetMutationOwner.TryAcquire(current.Id, ownerIdentityTicks) is null, "second companion is denied while owner lease is held");
+    using var competingProcess = StartOwnerProbe(current.Id, ownerIdentityTicks);
+    var competingResult = await competingProcess.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5));
+    Check(competingResult == "denied", "separate companion process is denied while owner lease is held");
+    await competingProcess.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+}
+using (var replacementOwner = TargetMutationOwner.TryAcquire(current.Id, ownerIdentityTicks))
+    Check(replacementOwner is not null, "replacement can acquire after confirmed owner exit/release");
 var pipeName = "provider-validation-" + Guid.NewGuid().ToString("N");
 var bootstrapPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".json");
 var pipeSecret = Enumerable.Range(32, 32).Select(static value => (byte)value).ToArray();
@@ -107,7 +130,32 @@ using (var clientCancellation = new CancellationTokenSource(TimeSpan.FromSeconds
 }
 CryptographicOperations.ZeroMemory(pipeSecret);
 
+using (var crashedOwner = StartOwnerProbe(current.Id, ownerIdentityTicks))
+{
+    Check(await crashedOwner.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)) == "acquired",
+        "separate companion process acquires owner lease");
+    crashedOwner.Kill(entireProcessTree: true);
+    await crashedOwner.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+}
+using (var fencedOwner = TargetMutationOwner.TryAcquire(current.Id, ownerIdentityTicks))
+    Check(fencedOwner is not null && !fencedOwner.IsOwner, "abandoned owner lease remains quarantined after companion crash");
+
 Console.WriteLine($"Passed {passed} provider protocol checks.");
+
+Process StartOwnerProbe(int processId, long startTicks)
+{
+    var start = new ProcessStartInfo(Environment.ProcessPath!)
+    {
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true
+    };
+    start.ArgumentList.Add("--owner-probe");
+    start.ArgumentList.Add(processId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    start.ArgumentList.Add(startTicks.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    return Process.Start(start) ?? throw new InvalidOperationException("The owner probe process did not start.");
+}
 
 ProviderFrame Frame(ProviderFrameType type) => new()
 {

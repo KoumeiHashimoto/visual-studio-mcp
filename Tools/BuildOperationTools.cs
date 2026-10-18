@@ -1,6 +1,7 @@
 ﻿using System.ComponentModel;
 using ModelContextProtocol.Server;
 using VisualStudioMcpServer.Workspace;
+using VisualStudioMcpServer.Coordination;
 
 namespace VisualStudioMcpServer.Tools;
 
@@ -74,6 +75,8 @@ public class BuildOperationTools
         if (!ValidFormat(format)) return Format(new BuildOperationResult(false, "invalid_format", "Format must be json or text.", null, null, action.ToString().ToLowerInvariant(), null, null, null, "idle", null, null, null, null, null, 0, Math.Clamp(timeoutMilliseconds, 1000, 30000)), format);
         if (!VisualStudioConnector.TryGetTargetProcessIdentity(out var processId, out var startTicks))
             return Format(new BuildOperationResult(false, "target_identity_required", "The registered Visual Studio process identity is required.", null, null, action.ToString().ToLowerInvariant(), null, null, null, "idle", null, null, null, null, null, 0, Math.Clamp(timeoutMilliseconds, 1000, 30000)), format);
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return Format(new BuildOperationResult(false, "target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.", processId, null, action.ToString().ToLowerInvariant(), null, null, null, "idle", null, null, null, null, null, 0, Math.Clamp(timeoutMilliseconds, 1000, 30000)), format);
 
         var workspaceResult = OpenFolderBuildPolicy.Check(
             ActiveWorkspaceSnapshotStoreAccessor.Get()?.GetCurrent(), processId, startTicks,
