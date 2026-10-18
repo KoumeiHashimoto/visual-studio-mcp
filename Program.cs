@@ -93,6 +93,7 @@ internal static class Program
     {
         var options = HttpOptions.Parse(args);
         var providerBootstrap = ProviderClient.ReadBootstrap(options.ProviderBootstrapFile);
+        ProviderRuntime.Install();
         if (providerBootstrap is not null && (providerBootstrap.VisualStudioPid != options.ParentPid ||
             providerBootstrap.VisualStudioStartTicks != options.ParentStartTicks))
             throw new InvalidDataException("The provider bootstrap does not match the Visual Studio parent identity.");
@@ -127,7 +128,8 @@ internal static class Program
             .WithTools<DebuggerHttpTools>()
             .WithTools<BuildOperationTools>()
             .WithTools<ProjectInventoryTools>()
-            .WithTools<ProjectFileActionTools>();
+            .WithTools<ProjectFileActionTools>()
+            .WithTools<ExecutionHttpTools>();
 
         await using var app = builder.Build();
         app.Use(async (context, next) =>

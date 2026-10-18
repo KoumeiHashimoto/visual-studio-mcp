@@ -11,5 +11,8 @@
     <Compile Include="../../Providers/ProviderClient.cs" Link="ProviderClient.cs" />
     <Compile Include="../../Coordination/TargetMutationOwner.cs" Link="TargetMutationOwner.cs" />
     <Compile Include="../../Capabilities/CapabilityModels.cs" Link="CapabilityModels.cs" />
+    <Compile Include="../../Providers/ProviderRuntime.cs" Link="ProviderRuntime.cs" />
+    <Compile Include="../../Providers/ProviderExecutionContracts.cs" Link="ProviderExecutionContracts.cs" />
+    <Compile Include="../../Observation/DebuggerObservationStore.cs" Link="DebuggerObservationStore.cs" />
   </ItemGroup>
 </Project>

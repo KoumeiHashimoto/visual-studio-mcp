@@ -94,6 +94,55 @@ Throws<ArgumentException>(() => waitStore.Publish("not-a-uuid", null, DebuggerOb
 await ThrowsAsync<ArgumentException>(() => waitStore.WaitAsync(DebuggerWaitDesiredState.Break, 0, expectedSession, operation,
     TimeSpan.FromSeconds(1), CancellationToken.None), "ambiguous session and launch binding rejected");
 
+// ---- provider の event 欠落（gap）・channel 終端・provider sequence の対応 ----
+var gapSession = Guid.NewGuid().ToString("N");
+var gapStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now,
+    static (_, token) => Task.Delay(Timeout.InfiniteTimeSpan, token));
+var gapRun = gapStore.Publish(gapSession, null, DebuggerObservedState.Running, 1);
+var spanning = gapStore.WaitAsync(DebuggerWaitDesiredState.Break, gapRun.Sequence, gapSession, null,
+    TimeSpan.FromSeconds(5), CancellationToken.None);
+await Task.Yield();
+var gapSequence = gapStore.MarkHistoryGap();
+var spanningResult = await spanning.WaitAsync(TimeSpan.FromSeconds(5));
+Check(spanningResult.Status == DebuggerObservationWaitStatus.EventHistoryExpired && gapSequence == gapRun.Sequence + 1 &&
+    spanningResult.OldestAvailableSequence == gapSequence + 1, "registered waiter spanning a provider gap gets event_history_expired");
+var gapBreak = gapStore.Publish(gapSession, null, DebuggerObservedState.Break, 5);
+var acrossGap = await gapStore.WaitAsync(DebuggerWaitDesiredState.Break, gapRun.Sequence, gapSession, null,
+    TimeSpan.FromSeconds(1), CancellationToken.None);
+Check(acrossGap.Status == DebuggerObservationWaitStatus.EventHistoryExpired,
+    "cursor before a gap is expired even when a later event matches");
+var afterGap = await gapStore.WaitAsync(DebuggerWaitDesiredState.Break, gapSequence, gapSession, null,
+    TimeSpan.FromSeconds(1), CancellationToken.None);
+Check(afterGap.Status == DebuggerObservationWaitStatus.Matched && afterGap.Observation == gapBreak,
+    "fresh cursor at the gap marker matches later events");
+Check(gapStore.TryGetSequenceForProviderSequence(5, out var mapped) && mapped == gapBreak.Sequence && gapStore.LastProviderSequence == 5,
+    "provider sequence maps to the public sequence of the same observation");
+Check(!gapStore.TryGetSequenceForProviderSequence(3, out _), "a provider sequence lost in a gap is not mapped");
+var beforeGapStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+var beforeRun = beforeGapStore.Publish(gapSession, null, DebuggerObservedState.Running, 1);
+var beforeBreak = beforeGapStore.Publish(gapSession, null, DebuggerObservedState.Break, 2);
+beforeGapStore.MarkHistoryGap();
+var beforeGap = await beforeGapStore.WaitAsync(DebuggerWaitDesiredState.Break, beforeRun.Sequence, gapSession, null,
+    TimeSpan.FromSeconds(1), CancellationToken.None);
+Check(beforeGap.Status == DebuggerObservationWaitStatus.Matched && beforeGap.Observation == beforeBreak,
+    "a match recorded before a gap still satisfies the wait");
+var emptyStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"));
+Check(emptyStore.TryGetSequenceForProviderSequence(0, out var initial) && initial == 0,
+    "provider sequence 0 maps to the initial public sequence");
+Check(await gapStore.WaitForProviderSequenceAsync(5, TimeSpan.FromMilliseconds(100), CancellationToken.None) &&
+    !await gapStore.WaitForProviderSequenceAsync(6, TimeSpan.FromMilliseconds(60), CancellationToken.None),
+    "bounded catch-up wait reports whether a provider sequence has been applied");
+
+var closingStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now,
+    static (_, token) => Task.Delay(Timeout.InfiniteTimeSpan, token));
+var closingWait = closingStore.WaitAsync(DebuggerWaitDesiredState.Break, 0, gapSession, null, TimeSpan.FromSeconds(5), CancellationToken.None);
+await Task.Yield();
+closingStore.Close();
+Check((await closingWait.WaitAsync(TimeSpan.FromSeconds(5))).Status == DebuggerObservationWaitStatus.ProviderDisconnected &&
+    (await closingStore.WaitAsync(DebuggerWaitDesiredState.Break, 0, gapSession, null, TimeSpan.FromSeconds(1), CancellationToken.None)).Status ==
+    DebuggerObservationWaitStatus.ProviderDisconnected && closingStore.IsClosed,
+    "channel loss ends current and later waits as provider_disconnected");
+
 Console.WriteLine($"Debugger observation validation: {passed} checks passed.");
 
 void Check(bool condition, string description)

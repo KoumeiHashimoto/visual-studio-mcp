@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Security.Cryptography;
 using VisualStudioMcpServer.Providers;
 using VisualStudioMcpServer.Coordination;
+using VisualStudioMcpServer.Observation;
 
 if (args.Length == 3 && args[0] == "--owner-probe")
 {
@@ -476,6 +477,64 @@ await using (var harness = await Harness.CreateAsync(sessionKeyKat, ["execution.
     Check(pong.Type == ProviderFrameType.Pong && pong.Sequence == 1, "ping after Ready receives a sequenced pong");
 }
 
+// ---- ProviderRuntime: mode event を観測 store へ、execution.observed を coordinator へ振り分ける ----
+var routedObservations = new List<ExecutionObservedEventBody>();
+ProviderRuntime.ExecutionObserved = (_, body) => { lock (routedObservations) routedObservations.Add(body); };
+await using (var harness = await Harness.CreateAsync(sessionKeyKat, ["execution.dispatch"], ProviderRuntime.Attach))
+{
+    var store = ProviderRuntime.ObservationStore!;
+    Check(store.ProviderEpoch == harness.Channel.Identity.ProviderEpoch && ReferenceEquals(ProviderRuntime.Channel, harness.Channel),
+        "runtime attaches a per-epoch observation store before the read loop starts");
+    var session = Guid.NewGuid().ToString("N");
+    var launchOperation = Guid.NewGuid().ToString("N");
+    await harness.Channel.SendAsync("execution.dispatch", Dispatch(launchOperation), TimeSpan.FromSeconds(20));
+    await harness.Provider.ReadAsync();
+    await harness.Provider.EventAsync("debugger.modeChanged", ModeFor(1, "running", session, launchOperation));
+    await harness.Provider.EventAsync("debugger.modeChanged", ModeFor(3, "break", session, launchOperation));
+    await harness.Provider.EventAsync("provider.eventsDropped", "{\"droppedCount\":3,\"firstProviderSequence\":4,\"lastProviderSequence\":6}");
+    await harness.Provider.EventAsync("debugger.modeChanged", ModeFor(7, "design", session, launchOperation));
+    await harness.Provider.EventAsync("execution.observed", "{\"operationId\":\"" + launchOperation + "\",\"state\":\"observed\",\"code\":\"debug_session_started\",\"debugSessionId\":\"" + session + "\",\"processSetSnapshotId\":null}");
+    Check(await store.WaitForProviderSequenceAsync(7, TimeSpan.FromSeconds(5), CancellationToken.None), "mode events reach the observation store");
+    var observations = store.Snapshot();
+    Check(observations.Select(static item => item.State).SequenceEqual([DebuggerObservedState.Running, DebuggerObservedState.Break, DebuggerObservedState.Design]) &&
+        observations.Select(static item => item.Sequence).SequenceEqual([1L, 3L, 5L]) &&
+        observations.All(item => item.DebugSessionId == session && item.LaunchOperationId == launchOperation),
+        "providerSequence gaps and eventsDropped become single public gap markers without duplicate marking");
+    var expiredWait = await store.WaitAsync(DebuggerWaitDesiredState.Design, 1, session, null, TimeSpan.FromSeconds(1), CancellationToken.None);
+    var freshWait = await store.WaitAsync(DebuggerWaitDesiredState.Design, 4, session, null, TimeSpan.FromSeconds(1), CancellationToken.None);
+    Check(expiredWait.Status == DebuggerObservationWaitStatus.EventHistoryExpired && freshWait.Status == DebuggerObservationWaitStatus.Matched,
+        "waits spanning a provider gap expire and fresh waits match the terminal design event");
+    var deadline = DateTime.UtcNow.AddSeconds(5);
+    while (DateTime.UtcNow < deadline) { lock (routedObservations) if (routedObservations.Count > 0) break; await Task.Delay(20); }
+    lock (routedObservations)
+        Check(routedObservations.Count == 1 && routedObservations[0].OperationId == launchOperation, "execution.observed is routed to the execution observer");
+    ProviderRuntime.Detach(harness.Channel);
+    Check(store.IsClosed && ProviderRuntime.ObservationStore is null && ProviderRuntime.Channel is null,
+        "detaching the channel closes the store so waits end as provider_disconnected");
+}
+ProviderRuntime.ExecutionObserved = null;
+
+// ---- debugger.getState 応答本文の検査 ----
+var validState = JsonSerializer.Serialize(new DebuggerGetStateResponseBody
+{
+    State = "break", DebugSessionId = Guid.NewGuid().ToString("N"), ProcessSetSnapshotId = Guid.NewGuid().ToString("N"),
+    Processes = [new DebuggerProcessIdentity { ProcessId = 10, StartTicks = 5, Name = "App.exe" }], CurrentThreadAvailable = true,
+    SolutionPath = "C:\\fixture\\App.sln", Configuration = "Debug", Platform = "Any CPU", ProviderSequence = 3,
+    StartupSnapshot = new StartupSnapshotBody
+    {
+        SnapshotId = Guid.NewGuid().ToString("N"), StartupProjects = [new StartupProjectIdentity { UniqueName = "App\\App.csproj", ProviderKind = "csharp-sdk" }],
+        ProviderKind = "csharp-sdk", ProfileStatus = "default", LaunchSupported = true, BuildMayOccur = true
+    }
+}, ProviderProtocol.BodyJsonOptions);
+Check(ProviderExecutionBodies.ParseGetState(validState).Processes.Single().Name == "App.exe", "typed debugger.getState body is accepted");
+Violation(() => ProviderExecutionBodies.ParseGetState(validState.Replace("\"state\":\"break\"", "\"state\":\"paused\"")), "unknown debugger state is a violation");
+Violation(() => ProviderExecutionBodies.ParseGetState(JsonSerializer.Serialize(new DebuggerGetStateResponseBody
+{
+    State = "running", Processes = Enumerable.Range(1, 33).Select(static pid => new DebuggerProcessIdentity { ProcessId = pid, Name = "p" }).ToArray()
+}, ProviderProtocol.BodyJsonOptions)), "more than 32 debugged processes is a violation");
+Violation(() => ProviderExecutionBodies.ParseGetState("{\"state\":\"design\",\"debugSessionId\":\"not-a-uuid\"}"), "non-UUID session identity is a violation");
+Violation(() => ProviderExecutionBodies.ParseGetState("{\"state\":\"design\",\"extra\":1}"), "unknown getState member is a violation");
+
 // ---- 所有者 lease の abandoned quarantine と解除 ----
 using (var crashedOwner = StartOwnerProbe(current.Id, ownerIdentityTicks))
 {
@@ -562,6 +621,10 @@ static ExecutionDispatchRequestBody Dispatch(string operationId) => new()
     PolicyFlags = ["allowLaunch"],
     OwnerFence = "55555555555545558555555555555555"
 };
+
+static string ModeFor(ulong sequence, string state, string session, string? launchOperation) =>
+    "{\"providerSequence\":" + sequence + ",\"state\":\"" + state + "\",\"debugSessionId\":\"" + session + "\",\"processSetSnapshotId\":null,\"launchOperationId\":" +
+    (launchOperation is null ? "null" : "\"" + launchOperation + "\"") + ",\"observedAtUtc\":\"2026-10-18T00:00:00Z\"}";
 
 static string Mode(ulong sequence) =>
     "{\"providerSequence\":" + sequence + ",\"state\":\"running\",\"debugSessionId\":\"s1\",\"processSetSnapshotId\":null,\"launchOperationId\":null,\"observedAtUtc\":\"2026-10-18T00:00:00Z\"}";
@@ -750,7 +813,7 @@ sealed class Harness : IAsyncDisposable
     internal ProviderChannel Channel { get; }
     internal FakeProvider Provider { get; }
 
-    internal static async Task<Harness> CreateAsync(byte[] key, string[] implemented)
+    internal static async Task<Harness> CreateAsync(byte[] key, string[] implemented, Action<ProviderChannel>? beforeStart = null)
     {
         var name = "provider-validation-" + Guid.NewGuid().ToString("N");
         var server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous,
@@ -764,7 +827,7 @@ sealed class Harness : IAsyncDisposable
             ServerInstanceId = "AAAAAAAAAAAAAAAAAAAAAA", ProviderEpoch = "22222222222242228222222222222222"
         };
         var channel = new ProviderChannel(client,
-            new ProviderHandshakeResult(identity, new ProviderSession(key, isCompanion: true), implemented));
+            new ProviderHandshakeResult(identity, new ProviderSession(key, isCompanion: true), implemented), beforeStart);
         return new Harness(client, channel, new FakeProvider(server, key, identity));
     }
 

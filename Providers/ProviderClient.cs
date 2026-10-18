@@ -36,6 +36,12 @@ internal static class ProviderClient
     /// <summary>現在の provider epoch の channel。切断後は null（同一 server での再接続はしない）。</summary>
     internal static ProviderChannel? ActiveChannel => Volatile.Read(ref _activeChannel);
 
+    /// <summary>channel の読み取り開始前に呼ぶ hook。event の受け口をここで設定し、最初の event を取り逃さない。</summary>
+    internal static Action<ProviderChannel>? ChannelAttached { get; set; }
+
+    /// <summary>channel の終端後に呼ぶ hook。待機中の観測を終えるために使う。</summary>
+    internal static Action<ProviderChannel>? ChannelDetached { get; set; }
+
     internal static ProviderBootstrap? ReadBootstrap(string? path)
     {
         if (string.IsNullOrWhiteSpace(path)) return null;
@@ -117,7 +123,7 @@ internal static class ProviderClient
             finally { CryptographicOperations.ZeroMemory(secret); }
 
             authenticatedIdentity = handshake.Identity;
-            channel = new ProviderChannel(stream, handshake);
+            channel = new ProviderChannel(stream, handshake, ChannelAttached);
             Volatile.Write(ref _activeChannel, channel);
             Report("connected", "supported", "authenticated_provider_channel_connected_feature_probes_unavailable", authenticatedIdentity);
 
@@ -160,6 +166,7 @@ internal static class ProviderClient
         {
             Interlocked.CompareExchange(ref _activeChannel, null, channel);
             if (channel is not null) await channel.DisposeAsync().ConfigureAwait(false);
+            if (channel is not null) ChannelDetached?.Invoke(channel);
             CryptographicOperations.ZeroMemory(secret);
         }
     }
@@ -301,14 +308,19 @@ internal sealed class ProviderChannel : IAsyncDisposable
     private int _lateResponses;
     private int _ignoredObservations;
 
-    internal ProviderChannel(Stream stream, ProviderHandshakeResult handshake)
+    internal ProviderChannel(Stream stream, ProviderHandshakeResult handshake, Action<ProviderChannel>? beforeStart = null)
     {
         _stream = stream;
         _session = handshake.Session;
         _identity = handshake.Identity;
         _implementedOperations = new HashSet<string>(handshake.ImplementedOperations, StringComparer.Ordinal);
+        // 読み取り loop の開始前に受け口を設定させ、Ready 直後の event を取り逃さない。
+        beforeStart?.Invoke(this);
         _ = Task.Run(ReadLoopAsync);
     }
+
+    /// <summary>この channel の identity（VS PID/開始時刻、server identity、provider epoch）。</summary>
+    internal ProviderFrame Identity => _identity;
 
     /// <summary>応答待ち超過の猶予。既定は契約どおり 2 秒（検証では短縮できる）。</summary>
     internal static TimeSpan ResponseGrace { get; set; } = TimeSpan.FromSeconds(2);

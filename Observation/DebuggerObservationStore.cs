@@ -24,7 +24,8 @@ internal sealed record DebuggerObservation(
     string? DebugSessionId,
     string? LaunchOperationId,
     DebuggerObservedState State,
-    DateTimeOffset ObservedAtUtc);
+    DateTimeOffset ObservedAtUtc,
+    ulong ProviderSequence = 0);
 
 internal enum DebuggerObservationWaitStatus
 {
@@ -34,7 +35,8 @@ internal enum DebuggerObservationWaitStatus
     InvalidCursor,
     WaiterLimit,
     TimedOut,
-    Cancelled
+    Cancelled,
+    ProviderDisconnected
 }
 
 internal sealed record DebuggerObservationWaitResult(
@@ -59,7 +61,10 @@ internal sealed class DebuggerObservationStore
     private readonly Func<DateTimeOffset> _utcNow;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly string _providerEpoch;
+    private readonly List<long> _gaps = new();
     private long _sequence;
+    private ulong _lastProviderSequence;
+    private bool _closed;
 
     internal DebuggerObservationStore(
         string providerEpoch,
@@ -81,6 +86,88 @@ internal sealed class DebuggerObservationStore
         get { lock (_sync) return _sequence; }
     }
 
+    /// <summary>最後に反映した provider の mode sequence。0 は未受信。</summary>
+    internal ulong LastProviderSequence
+    {
+        get { lock (_sync) return _lastProviderSequence; }
+    }
+
+    internal bool IsClosed
+    {
+        get { lock (_sync) return _closed; }
+    }
+
+    /// <summary>
+    /// provider の event 欠落を履歴の gap として記録する。公開 sequence を 1 つ進めて gap の位置を示し、
+    /// gap をまたぐ待機（既存 waiter を含む）は event_history_expired とする。
+    /// </summary>
+    internal long MarkHistoryGap()
+    {
+        Waiter[] waiters;
+        long gap;
+        lock (_sync)
+        {
+            gap = checked(++_sequence);
+            _gaps.Add(gap);
+            while (_gaps.Count > MaximumHistoryEntries) _gaps.RemoveAt(0);
+            waiters = _waiters.Values.ToArray();
+        }
+        foreach (var waiter in waiters)
+            waiter.Completion.TrySetResult(new(DebuggerObservationWaitStatus.EventHistoryExpired, OldestAvailableSequence: gap + 1));
+        return gap;
+    }
+
+    /// <summary>provider channel の終端。待機中の waiter を provider_disconnected で終え、以後の待機も同じ結果にする。</summary>
+    internal void Close()
+    {
+        Waiter[] waiters;
+        lock (_sync)
+        {
+            _closed = true;
+            waiters = _waiters.Values.ToArray();
+        }
+        foreach (var waiter in waiters)
+            waiter.Completion.TrySetResult(new(DebuggerObservationWaitStatus.ProviderDisconnected));
+    }
+
+    /// <summary>
+    /// provider の sequence に対応する公開 sequence を返す。providerSequence 0 は event を 1 件も受けていない状態を表す。
+    /// 履歴から外れた値は false を返す。
+    /// </summary>
+    internal bool TryGetSequenceForProviderSequence(ulong providerSequence, out long sequence)
+    {
+        lock (_sync)
+        {
+            sequence = 0;
+            if (providerSequence == 0)
+            {
+                if (_lastProviderSequence != 0) return false;
+                sequence = _sequence;
+                return true;
+            }
+            foreach (var observation in _history)
+            {
+                if (observation.ProviderSequence != providerSequence) continue;
+                sequence = observation.Sequence;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>指定した provider sequence まで反映されるのを短時間だけ待つ。読み取り専用で lease を取らない。</summary>
+    internal async Task<bool> WaitForProviderSequenceAsync(ulong providerSequence, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (true)
+        {
+            lock (_sync)
+                if (_lastProviderSequence >= providerSequence || _closed) return _lastProviderSequence >= providerSequence;
+            if (DateTimeOffset.UtcNow >= deadline) return false;
+            await Task.Delay(TimeSpan.FromMilliseconds(20), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     internal IReadOnlyList<DebuggerObservation> Snapshot()
     {
         lock (_sync)
@@ -93,7 +180,8 @@ internal sealed class DebuggerObservationStore
     internal DebuggerObservation Publish(
         string? debugSessionId,
         string? launchOperationId,
-        DebuggerObservedState state)
+        DebuggerObservedState state,
+        ulong providerSequence = 0)
     {
         if (debugSessionId is not null && !ProviderEpochIsValid(debugSessionId))
             throw new ArgumentException("Debug session ID must be a lowercase UUID-N v4 value.", nameof(debugSessionId));
@@ -109,7 +197,8 @@ internal sealed class DebuggerObservationStore
             var now = _utcNow();
             PruneExpired(now);
             observation = new DebuggerObservation(_providerEpoch, checked(++_sequence), debugSessionId,
-                launchOperationId, state, now);
+                launchOperationId, state, now, providerSequence);
+            if (providerSequence > _lastProviderSequence) _lastProviderSequence = providerSequence;
             _history.AddLast(observation);
             while (_history.Count > MaximumHistoryEntries) _history.RemoveFirst();
             waiters = _waiters.Values.ToArray();
@@ -149,7 +238,7 @@ internal sealed class DebuggerObservationStore
         lock (_sync)
         {
             PruneExpired(_utcNow());
-            immediate = EvaluateHistory(request);
+            immediate = _closed ? new(DebuggerObservationWaitStatus.ProviderDisconnected) : EvaluateHistory(request);
             if (immediate is null && afterSequence > _sequence)
                 immediate = new(DebuggerObservationWaitStatus.InvalidCursor);
             if (immediate is null && _waiters.Count >= MaximumWaiters)
@@ -185,12 +274,18 @@ internal sealed class DebuggerObservationStore
         if (_history.Count == 0 && request.AfterSequence < _sequence)
             return new(DebuggerObservationWaitStatus.EventHistoryExpired, OldestAvailableSequence: _sequence + 1);
 
+        // cursor より後に gap があれば、gap より前の一致だけを認め、gap 以降は欠落の可能性として失効を返す。
+        var firstGap = _gaps.FirstOrDefault(gap => gap > request.AfterSequence);
         foreach (var observation in _history)
         {
             if (observation.Sequence <= request.AfterSequence) continue;
+            if (firstGap != 0 && observation.Sequence > firstGap)
+                return new(DebuggerObservationWaitStatus.EventHistoryExpired, OldestAvailableSequence: firstGap + 1);
             var result = EvaluateObservation(request, observation);
             if (result is not null) return result;
         }
+        if (firstGap != 0)
+            return new(DebuggerObservationWaitStatus.EventHistoryExpired, OldestAvailableSequence: firstGap + 1);
 
         if (request.DebugSessionId is not null && _history.Last is { } last &&
             last.Value.DebugSessionId is not null && last.Value.DebugSessionId != request.DebugSessionId)

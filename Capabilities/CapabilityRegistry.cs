@@ -32,6 +32,18 @@ internal static class CapabilityRuntimeContext
         }
     }
 
+    /// <summary>この server instance の識別子。未初期化なら null。</summary>
+    public static string? ServerInstanceId
+    {
+        get { lock (Sync) return _serverInstanceId; }
+    }
+
+    /// <summary>この server の世代。execution operation の server generation として使う。</summary>
+    public static Guid? ServerEpoch
+    {
+        get { lock (Sync) return _serverEpoch; }
+    }
+
     public static void SetProvider(ProviderCapabilityObservation observation)
     {
         lock (Sync)
