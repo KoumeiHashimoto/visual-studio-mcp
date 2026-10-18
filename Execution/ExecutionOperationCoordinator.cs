@@ -45,6 +45,7 @@ internal sealed class ExecutionOperationCoordinator
         var startCore = false;
         lock (_sync)
         {
+            SettleOverdueLocked();
             PruneCompletedLocked();
             if (_byRequestId.TryGetValue(request.RequestId, out var existing))
             {
@@ -156,8 +157,10 @@ internal sealed class ExecutionOperationCoordinator
                     "The action may have changed the target; its outcome remains uncertain.", true,
                     observation.DebugSessionId, observation.ProcessSetSnapshotId);
             var result = ToResult(record, observation);
+            var settleLater = false;
             lock (_sync)
             {
+                record.DispatchReturned = true;
                 if (record.DispatchSettled && record.PendingObservation is { } pending)
                 {
                     observation = pending;
@@ -171,10 +174,14 @@ internal sealed class ExecutionOperationCoordinator
                     if (IsTerminal(record.State)) record.CompletedAt = _utcNow();
                     if (IsTerminal(record.State)) ReleaseLeaseLocked(record);
                 }
+                // accepted / uncertain のまま観測されない操作は実行期限で確定させ、lease を保持し続けない。
+                SettleOverdueLocked();
+                settleLater = !IsSettled(record);
                 result = record.Current;
                 PruneCompletedLocked();
             }
             record.Ready.TrySetResult(result);
+            if (settleLater) _ = SettleAtDeadlineAsync(record);
         }
         catch (OperationCanceledException) when (preDispatchCancellation.IsCancellationRequested)
         {
@@ -220,6 +227,7 @@ internal sealed class ExecutionOperationCoordinator
     {
         lock (_sync)
         {
+            SettleOverdueLocked();
             PruneCompletedLocked();
             if (!_byOperationId.TryGetValue(operationId, out var record) ||
                 record.TargetProcessId != targetProcessId || record.ServerInstanceId != serverInstanceId ||
@@ -237,6 +245,7 @@ internal sealed class ExecutionOperationCoordinator
     {
         lock (_sync)
         {
+            SettleOverdueLocked();
             if (!_byOperationId.TryGetValue(operationId, out var record) || record.TargetProcessId != targetProcessId ||
                 record.TargetProcessStartUtcTicks != targetProcessStartUtcTicks || record.ServerInstanceId != serverInstanceId || record.ServerEpoch != serverEpoch)
                 return Denied("operation_not_found", Message("operation_not_found"), targetProcessId, serverInstanceId, serverEpoch);
@@ -356,7 +365,47 @@ internal sealed class ExecutionOperationCoordinator
 
     private TimeSpan Remaining(OperationRecord record) => record.ExecutionDeadlineUtc - _utcNow();
 
-    private int ActiveCountLocked() => _byOperationId.Values.Count(r => !IsTerminal(r.State));
+    private int ActiveCountLocked() => _byOperationId.Values.Count(r => !IsSettled(r));
+
+    /// <summary>dispatch が戻った後も観測されない操作を実行期限で確定させる（期限は最大 30 秒）。</summary>
+    private async Task SettleAtDeadlineAsync(OperationRecord record)
+    {
+        try
+        {
+            var delay = Remaining(record);
+            if (delay > TimeSpan.Zero) await Task.Delay(delay).ConfigureAwait(false);
+        }
+        catch (Exception) { /* 遅延の失敗は次の照会時の確定に任せる。 */ }
+        lock (_sync) SettleOverdueLocked();
+    }
+
+    /// <summary>
+    /// 実行期限を過ぎた accepted / uncertain の操作を result_unknown として確定し、workspace lease を解放する。
+    /// 記録は照会のために残し、後から届いた正確な観測はその記録だけを更新できる。再送はしない。
+    /// </summary>
+    private void SettleOverdueLocked()
+    {
+        var now = _utcNow();
+        foreach (var record in _byOperationId.Values)
+        {
+            if (IsSettled(record) || !record.DispatchReturned || now < record.ExecutionDeadlineUtc) continue;
+            record.State = ExecutionState.Uncertain;
+            record.DeadlineSettled = true;
+            record.Current = record.Current with
+            {
+                Success = false,
+                Code = "result_unknown",
+                Message = "The action was not observed before its execution deadline. The workspace lease was released; inspect Visual Studio before retrying. The operation is not replayed.",
+                State = StateText(ExecutionState.Uncertain),
+                MayHaveChanged = true
+            };
+            record.CompletedAt = now;
+            ReleaseLeaseLocked(record);
+            record.Ready.TrySetResult(record.Current);
+        }
+    }
+
+    private static bool IsSettled(OperationRecord record) => IsTerminal(record.State) || record.DeadlineSettled;
 
     private static IExecutionMutationLease? TryAcquireWorkspaceLease()
     {
@@ -374,8 +423,8 @@ internal sealed class ExecutionOperationCoordinator
     private void PruneCompletedLocked()
     {
         var cutoff = _utcNow() - CompletedRetention;
-        foreach (var record in _byOperationId.Values.Where(r => IsTerminal(r.State) && r.CompletedAt <= cutoff).ToArray()) RemoveLocked(record);
-        var completed = _byOperationId.Values.Where(r => IsTerminal(r.State)).OrderBy(r => r.CompletedAt).ToArray();
+        foreach (var record in _byOperationId.Values.Where(r => IsSettled(r) && r.CompletedAt <= cutoff).ToArray()) RemoveLocked(record);
+        var completed = _byOperationId.Values.Where(IsSettled).OrderBy(r => r.CompletedAt).ToArray();
         foreach (var record in completed.Take(Math.Max(0, completed.Length - MaxRetainedCompleted))) RemoveLocked(record);
     }
 
@@ -444,6 +493,10 @@ internal sealed class ExecutionOperationCoordinator
         public ExecutionState State { get; set; } = ExecutionState.Validating;
         public bool DispatchStarted { get; set; }
         public bool DispatchSettled { get; set; }
+        /// <summary>dispatch の待機が戻り、状態が設定された。</summary>
+        public bool DispatchReturned { get; set; }
+        /// <summary>観測されないまま実行期限で確定した。lease は解放済み。</summary>
+        public bool DeadlineSettled { get; set; }
         public ExecutionDispatchObservation? PendingObservation { get; set; }
         public DateTimeOffset? CompletedAt { get; set; }
         public ExecutionOperationResult Current { get; set; } = new(false, "execution_pending", "The operation is being validated.", operationId, "validating", false, targetProcessId, serverInstanceId, serverEpoch, null, null);

@@ -211,6 +211,60 @@ foreach (var item in deniedCases)
     Check(stop.State == "observed", "launch blockers do not block an exact-session stop");
 }
 
+// 観測されない accepted / uncertain の操作は実行期限で確定し、workspace lease を解放する（#61 実機不具合の回帰）。
+{
+    var released = 0;
+    var clock = DateTimeOffset.UtcNow;
+    var adapter = new FakeAdapter(target)
+    {
+        DispatchTask = Task.FromResult(new ExecutionDispatchObservation(ExecutionState.Accepted, "launch_accepted", "accepted", true))
+    };
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, () => clock, () => new FakeLease(() => released++));
+    var accepted = await coordinator.ExecuteAsync(Request("accepted-never-observed"));
+    Check(accepted.State == "accepted" && released == 0, "accepted launch keeps the lease before its execution deadline");
+    clock = clock.AddSeconds(29);
+    Check(coordinator.Query(accepted.OperationId!, 41, 1001, "server-instance", epoch).State == "accepted" && released == 0,
+        "accepted launch is not settled before its execution deadline");
+    clock = clock.AddSeconds(2);
+    var settled = coordinator.Query(accepted.OperationId!, 41, 1001, "server-instance", epoch);
+    Check(settled.Code == "result_unknown" && settled.State == "uncertain" && settled.MayHaveChanged && released == 1 && adapter.DispatchCount == 1,
+        "unobserved accepted launch settles as result_unknown at the execution deadline and releases the lease");
+    var retry = await coordinator.ExecuteAsync(Request("accepted-never-observed"));
+    Check(retry.OperationId == accepted.OperationId && adapter.DispatchCount == 1, "a settled operation is never replayed for the same requestId");
+    var next = await coordinator.ExecuteAsync(Request("after-deadline"));
+    Check(next.OperationId != accepted.OperationId && adapter.DispatchCount == 2, "a new operation can acquire the lease after deadline settlement");
+    var late = coordinator.ReportObservation(accepted.OperationId!, 41, 1001, "server-instance", epoch,
+        new ExecutionDispatchObservation(ExecutionState.Observed, "debug_session_started", "observed late", true));
+    Check(late.State == "observed" && late.Code == "debug_session_started", "a late exact observation still updates the settled record");
+}
+
+{
+    var released = 0;
+    var clock = DateTimeOffset.UtcNow;
+    var adapter = new FakeAdapter(target)
+    {
+        DispatchTask = Task.FromException<ExecutionDispatchObservation>(new ExecutionDispatchException("cleanup uncertain", true))
+    };
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, () => clock, () => new FakeLease(() => released++));
+    var uncertain = await coordinator.ExecuteAsync(Request("uncertain-deadline"));
+    clock = clock.AddSeconds(31);
+    var settled = coordinator.Query(uncertain.OperationId!, 41, 1001, "server-instance", epoch);
+    Check(uncertain.State == "uncertain" && settled.Code == "result_unknown" && released == 1,
+        "uncertain dispatch releases the lease at the execution deadline");
+}
+
+{
+    var adapter = new FakeAdapter(target)
+    {
+        DispatchTask = Task.FromResult(new ExecutionDispatchObservation(ExecutionState.Failed, "build_failed", "The pre-launch build failed.", false))
+    };
+    var released = 0;
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, acquireWorkspaceLease: () => new FakeLease(() => released++));
+    var failed = await coordinator.ExecuteAsync(Request("build-failed"));
+    Check(failed.State == "failed" && failed.Code == "build_failed" && released == 1,
+        "provider-reported build failure settles immediately and releases the lease");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
