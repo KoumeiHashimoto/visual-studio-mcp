@@ -19,6 +19,7 @@ using ModelContextProtocol.Server;
 using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.ConnectionKeys;
 using VisualStudioMcpServer.Workspace;
+using VisualStudioMcpServer.Providers;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -48,7 +49,7 @@ internal static class Program
                 return 0;
             }
 
-            Console.Error.WriteLine("Usage: VisualStudioMcpServer.exe [stdio [--parent-pid PID --parent-start-ticks TICKS] | http --parent-pid PID --parent-start-ticks TICKS --endpoint-file PATH]");
+            Console.Error.WriteLine("Usage: VisualStudioMcpServer.exe [stdio [--parent-pid PID --parent-start-ticks TICKS] | http --parent-pid PID --parent-start-ticks TICKS --endpoint-file PATH [--provider-bootstrap-file PATH]]");
             return 2;
         }
         catch (Exception ex)
@@ -83,6 +84,10 @@ internal static class Program
     private static async Task RunHttpAsync(string[] args)
     {
         var options = HttpOptions.Parse(args);
+        var providerBootstrap = ProviderClient.ReadBootstrap(options.ProviderBootstrapFile);
+        if (providerBootstrap is not null && (providerBootstrap.VisualStudioPid != options.ParentPid ||
+            providerBootstrap.VisualStudioStartTicks != options.ParentStartTicks))
+            throw new InvalidDataException("The provider bootstrap does not match the Visual Studio parent identity.");
         using var parent = Process.GetProcessById(options.ParentPid);
         if (parent.StartTime.ToUniversalTime().Ticks != options.ParentStartTicks)
         {
@@ -239,15 +244,34 @@ internal static class Program
             JsonSerializer.Serialize(endpoint), new UTF8Encoding(false));
 
         using var monitorCancellation = new CancellationTokenSource();
+        using var providerCancellation = new CancellationTokenSource();
         var parentMonitor = MonitorParentAsync(parent, app.Lifetime, monitorCancellation.Token);
+        var providerTask = providerBootstrap is null ? null :
+            ProviderClient.RunAsync(providerBootstrap, serverInstanceId, providerCancellation.Token);
         try
         {
-            await app.WaitForShutdownAsync();
+            var shutdownTask = app.WaitForShutdownAsync();
+            if (providerTask is null) await shutdownTask;
+            else
+            {
+                var completed = await Task.WhenAny(shutdownTask, providerTask);
+                if (completed == providerTask)
+                {
+                    await providerTask;
+                    app.Lifetime.StopApplication();
+                }
+                await shutdownTask;
+            }
         }
         finally
         {
             monitorCancellation.Cancel();
+            providerCancellation.Cancel();
             try { await parentMonitor; } catch (OperationCanceledException) { }
+            if (providerTask is not null)
+            {
+                try { await providerTask; } catch (OperationCanceledException) { }
+            }
             connectionKeys.RevokeAll();
             ProjectInventoryTools.SnapshotStore.InvalidateAll();
             ActiveWorkspaceSnapshotStoreAccessor.Clear(workspaceSnapshots);
@@ -344,7 +368,7 @@ internal static class Program
     private sealed record ServerEndpoint(int SchemaVersion, int ParentPid, string ParentStartTicks,
         int ServerPid, string ServerInstanceId, string Url, string Token);
 
-    private sealed record HttpOptions(int ParentPid, long ParentStartTicks, string EndpointFile)
+    private sealed record HttpOptions(int ParentPid, long ParentStartTicks, string EndpointFile, string? ProviderBootstrapFile)
     {
         public static (int ProcessId, long StartTicks)? ParseOptionalParentIdentity(string[] args)
         {
@@ -378,7 +402,9 @@ internal static class Program
                 throw new ArgumentException("HTTP mode requires --parent-pid, --parent-start-ticks, and --endpoint-file.");
             }
 
-            return new HttpOptions(pid, startTicks, Path.GetFullPath(Value("--endpoint-file")!));
+            var bootstrapFile = Value("--provider-bootstrap-file");
+            return new HttpOptions(pid, startTicks, Path.GetFullPath(Value("--endpoint-file")!),
+                string.IsNullOrWhiteSpace(bootstrapFile) ? null : Path.GetFullPath(bootstrapFile));
         }
     }
 }
