@@ -10,6 +10,7 @@ internal static class VisualStudioConnector
     public static SolutionInfo? Solution { get; set; } = new();
     public static List<ErrorItem> Errors { get; set; } = new();
     public static List<string> Panes { get; set; } = new();
+    public static List<VisualStudioMcpServer.Output.OutputPaneInfo> OutputPanes { get; set; } = new();
     public static string? Content { get; set; } = "output";
 
     public static object? GetActiveVS()
@@ -32,6 +33,7 @@ internal static class VisualStudioConnector
     public static SolutionInfo? GetSolutionInfo() => Read(Solution);
     public static List<ErrorItem> GetErrorListItems() => Read(Errors);
     public static List<string> GetOutputPaneNames() => Read(Panes);
+    public static List<VisualStudioMcpServer.Output.OutputPaneInfo> GetOutputPanes() => Read(OutputPanes);
     public static string? ReadOutputPane(string paneName, int maxLines) => Read(Content);
 }
 

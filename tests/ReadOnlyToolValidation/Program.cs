@@ -12,7 +12,7 @@ var tools = new (string Name, Func<string> Call)[]
 {
     ("get_solution_info", () => GetSolutionInfoTool.GetSolutionInfo("json")),
     ("get_error_list", () => GetErrorListTool.GetErrorList("json")),
-    ("list_output_panes", ListOutputPanesTool.ListOutputPanes),
+    ("list_output_panes", () => ListOutputPanesTool.ListOutputPanes()),
     ("read_output_pane", () => ReadOutputPaneTool.ReadOutputPane("Build"))
 };
 const string privateDetail = "PRIVATE_SENTINEL /private/path token=DO_NOT_LOG";
@@ -122,7 +122,16 @@ Check(ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLev
 VisualStudioConnector.Errors.Add(new VisualStudioMcpServer.ErrorItem());
 Check(JArray.Parse(GetErrorListTool.GetErrorList("json")).Count == 1, "Successful error JSON must remain an array.");
 VisualStudioConnector.Panes.Add("Build");
-Check(ListOutputPanesTool.ListOutputPanes() == "Available Output Panes (1):\n  - Build", "Successful pane list must remain unchanged.");
+VisualStudioConnector.Panes.Add("Legacy pane");
+VisualStudioConnector.OutputPanes.Add(new VisualStudioMcpServer.Output.OutputPaneInfo("{BUILD-GUID}", "Build", "available"));
+VisualStudioConnector.OutputPanes.Add(new VisualStudioMcpServer.Output.OutputPaneInfo(null, "Legacy pane", "identity_unavailable"));
+Check(ListOutputPanesTool.ListOutputPanes() == "Available Output Panes (2):\n  - Build\n  - Legacy pane", "Successful pane list must remain unchanged.");
+var paneJson = JArray.Parse(ListOutputPanesTool.ListOutputPanes("json"));
+Check(paneJson.Count == 2 && paneJson[0]!.Value<string>("Guid") == "{BUILD-GUID}" &&
+    paneJson[0]!.Value<string>("Name") == "Build" && paneJson[0]!.Value<string>("Availability") == "available",
+    "Structured output pane listing must include GUID, localized display name, and availability.");
+Check(paneJson[1]!["Guid"]!.Type == JTokenType.Null && paneJson[1]!.Value<string>("Availability") == "identity_unavailable",
+    "Structured output pane listing must not invent an identity when GUID is unavailable.");
 Check(ReadOutputPaneTool.ReadOutputPane("Build") == "output", "Successful output text must remain unchanged.");
 VisualStudioConnector.Content = new string('a', 100000);
 Check(ReadOutputPaneTool.ReadOutputPane("Build").Length < 65600, "Successful output must remain bounded.");

@@ -9,6 +9,7 @@ using VisualStudioMcpServer.Workspace;
 using Newtonsoft.Json;
 using VisualStudioMcpServer.Coordination;
 using VisualStudioMcpServer.Diagnostics;
+using VisualStudioMcpServer.Output;
 
 namespace VisualStudioMcpServer;
 
@@ -125,15 +126,36 @@ public static class VisualStudioConnector
         if (dte == null) return new List<string>();
 
         var names = new List<string>();
-        var outputWindow = dte.ToolWindows.OutputWindow;
-
-        foreach (OutputWindowPane pane in outputWindow.OutputWindowPanes)
+        foreach (OutputWindowPane pane in dte.ToolWindows.OutputWindow.OutputWindowPanes)
         {
             names.Add(pane.Name);
             if (names.Count >= 100) break;
         }
-
         return names;
+    }
+
+    /// <summary>
+    /// Gets the bounded Output Window pane identities and display names.
+    /// </summary>
+    internal static List<OutputPaneInfo> GetOutputPanes()
+    {
+        var dte = GetActiveVS();
+        if (dte == null) return new List<OutputPaneInfo>();
+
+        var panes = new List<OutputPaneInfo>();
+        var outputWindow = dte.ToolWindows.OutputWindow;
+
+        foreach (OutputWindowPane pane in outputWindow.OutputWindowPanes)
+        {
+            string? paneGuid;
+            try { paneGuid = pane.Guid; }
+            catch { paneGuid = null; }
+            panes.Add(new OutputPaneInfo(paneGuid, pane.Name,
+                string.IsNullOrWhiteSpace(paneGuid) ? "identity_unavailable" : "available"));
+            if (panes.Count >= 100) break;
+        }
+
+        return panes;
     }
 
     /// <summary>

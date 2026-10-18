@@ -12,6 +12,7 @@
     <PackageReference Include="envdte80" Version="17.*" />
     <Compile Include="../../Tools/ReadOnlyToolInvocation.cs" Link="ReadOnlyToolInvocation.cs" />
     <Compile Include="../../Diagnostics/ErrorListSeverityMapper.cs" Link="ErrorListSeverityMapper.cs" />
+    <Compile Include="../../Output/OutputPaneInfo.cs" Link="OutputPaneInfo.cs" />
     <Compile Include="../../Tools/McpOutputBounds.cs" Link="McpOutputBounds.cs" />
     <Compile Include="../../Tools/GetSolutionInfoTool.cs" Link="GetSolutionInfoTool.cs" />
     <Compile Include="../../Tools/GetErrorListTool.cs" Link="GetErrorListTool.cs" />
