@@ -113,6 +113,9 @@ internal static class Program
         ConnectionKeyStore? connectionKeys = null;
         var workspaceSnapshots = new ActiveWorkspaceSnapshotStore(options.ParentPid, options.ParentStartTicks);
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
+        // 標準出力は VSIX の Output pane に転記される。要求ごとの情報 log を出さず、警告以上だけを残す。
+        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        builder.Logging.AddFilter("Microsoft.Hosting.Lifetime", LogLevel.Warning);
         builder.WebHost.ConfigureKestrel(server => server.Limits.MaxRequestBodySize = 1024 * 1024);
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Services.AddMcpServer()
