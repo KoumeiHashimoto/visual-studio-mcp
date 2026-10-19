@@ -340,6 +340,28 @@ foreach (var item in deniedCases)
     Check(exact.State == "observed" && tenth.Code != "operation_store_full", "an exact late observation frees a retained uncertain slot");
 }
 
+{
+    // 独立レビュー: 待機が切れた後に dispatch が戻った場合、保留していた正確な観測をその操作に適用する。
+    var release = new TaskCompletionSource<ExecutionDispatchObservation>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var adapter = new FakeAdapter(target) { DispatchTask = release.Task };
+    var released = 0;
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, acquireWorkspaceLease: () => new FakeLease(() => released++));
+    var pending = await coordinator.ExecuteAsync(Request("late-dispatch") with { ExecutionDeadlineUtc = DateTimeOffset.UtcNow.AddMilliseconds(300), CallerWaitTimeoutMilliseconds = 100 });
+    Check(pending.Code == "execution_pending", "a slow dispatch returns a queryable pending operation");
+    await Task.Delay(600);
+    var parked = coordinator.ReportObservation(pending.OperationId!, 41, 1001, "server-instance", epoch,
+        new ExecutionDispatchObservation(ExecutionState.Observed, "debug_session_started", "observed", true, "session-late"));
+    Check(parked.State == "uncertain" && coordinator.Query(pending.OperationId!, 41, 1001, "server-instance", epoch).State == "uncertain",
+        "an exact observation before dispatch cleanup settles stays parked as uncertain");
+    release.SetResult(new ExecutionDispatchObservation(ExecutionState.Accepted, "launch_accepted", "accepted", true));
+    var settleDeadline = DateTime.UtcNow.AddSeconds(5);
+    while (coordinator.Query(pending.OperationId!, 41, 1001, "server-instance", epoch).State != "observed" && DateTime.UtcNow < settleDeadline)
+        await Task.Delay(20);
+    var late = coordinator.Query(pending.OperationId!, 41, 1001, "server-instance", epoch);
+    Check(late.State == "observed" && late.Code == "debug_session_started" && late.DebugSessionId == "session-late" && adapter.DispatchCount == 1,
+        "the parked observation is applied when the late dispatch finally returns, without any replay");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter

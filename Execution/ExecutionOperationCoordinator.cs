@@ -157,6 +157,12 @@ internal sealed class ExecutionOperationCoordinator
                 observation = new ExecutionDispatchObservation(ExecutionState.Uncertain, "result_unknown",
                     "The action may have changed the target; its outcome remains uncertain.", true,
                     observation.DebugSessionId, observation.ProcessSetSnapshotId);
+            // 待機が先に切れた dispatch が後で戻ったら、保留していた正確な観測を適用できるようにする。
+            bool dispatchPending;
+            lock (_sync) dispatchPending = !record.DispatchSettled;
+            if (dispatchPending && dispatchTask is not null)
+                _ = dispatchTask.ContinueWith(_ => OnLateDispatchSettled(record), CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             var result = ToResult(record, observation);
             var settleLater = false;
             lock (_sync)
@@ -191,6 +197,28 @@ internal sealed class ExecutionOperationCoordinator
         catch
         {
             RemoveDenied(record, "operation_failed", request);
+        }
+    }
+
+    /// <summary>
+    /// 待機が切れた後に dispatch が戻った。dispatch の後始末が確定したので、それまで保留していた正確な終端観測を
+    /// その操作だけに適用する（再送はしない）。観測が来ていなければ、状態は結果不明のまま変えない。
+    /// </summary>
+    private void OnLateDispatchSettled(OperationRecord record)
+    {
+        lock (_sync)
+        {
+            record.DispatchSettled = true;
+            if (record.PendingObservation is not { } pending || IsTerminal(record.State)) return;
+            record.PendingObservation = null;
+            record.Current = ToResult(record, pending);
+            record.State = pending.State;
+            if (IsTerminal(pending.State))
+            {
+                record.CompletedAt = _utcNow();
+                ReleaseLeaseLocked(record);
+            }
+            record.Ready.TrySetResult(record.Current);
         }
     }
 
