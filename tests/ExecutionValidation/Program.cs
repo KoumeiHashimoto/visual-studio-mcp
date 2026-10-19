@@ -297,6 +297,48 @@ foreach (var item in deniedCases)
         "operation query returns the same per-process outcomes");
 }
 
+{
+    // 独立レビュー: 期限で結果不明と確定した記録は、保持期間や完了件数の上限で追い出さず、再 dispatch も起こさない。
+    var clock = DateTimeOffset.UtcNow;
+    var adapter = new FakeAdapter(target)
+    {
+        DispatchTask = Task.FromResult(new ExecutionDispatchObservation(ExecutionState.Accepted, "launch_accepted", "accepted", true))
+    };
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, () => clock, () => new FakeLease());
+    var first = await coordinator.ExecuteAsync(Request("retained-uncertain"));
+    clock = clock.AddSeconds(31);
+    Check(coordinator.Query(first.OperationId!, 41, 1001, "server-instance", epoch).Code == "result_unknown", "deadline settles the unobserved operation as uncertain");
+    clock = clock.AddMinutes(10);
+    var after = coordinator.Query(first.OperationId!, 41, 1001, "server-instance", epoch);
+    var repeat = await coordinator.ExecuteAsync(Request("retained-uncertain"));
+    Check(after.Code == "result_unknown" && repeat.OperationId == first.OperationId && adapter.DispatchCount == 1,
+        "an uncertain operation survives the retention period and its requestId is never dispatched again");
+    var okAdapter = new FakeAdapter(target);
+    var busy = new ExecutionOperationCoordinator(okAdapter, () => true, () => clock, () => new FakeLease());
+    var keep = new FakeAdapter(target)
+    {
+        DispatchTask = Task.FromResult(new ExecutionDispatchObservation(ExecutionState.Uncertain, "result_unknown", "uncertain", true))
+    };
+    var pile = new ExecutionOperationCoordinator(keep, () => true, () => clock, () => new FakeLease());
+    var ids = new List<string>();
+    for (var index = 0; index < 8; index++)
+    {
+        var made = await pile.ExecuteAsync(Request("pile-" + index));
+        ids.Add(made.OperationId!);
+        clock = clock.AddSeconds(31);
+        pile.Query(made.OperationId!, 41, 1001, "server-instance", epoch);
+    }
+    clock = clock.AddMinutes(10);
+    var ninth = await pile.ExecuteAsync(Request("pile-8"));
+    Check(ninth.Code == "operation_store_full" && keep.DispatchCount == 8 &&
+        ids.All(id => pile.Query(id, 41, 1001, "server-instance", epoch).Code == "result_unknown"),
+        "eight retained uncertain operations occupy the bounded slots, stay queryable and block a ninth dispatch");
+    var exact = pile.ReportObservation(ids[0], 41, 1001, "server-instance", epoch,
+        new ExecutionDispatchObservation(ExecutionState.Observed, "debug_session_ended", "observed", true));
+    var tenth = await pile.ExecuteAsync(Request("pile-9"));
+    Check(exact.State == "observed" && tenth.Code != "operation_store_full", "an exact late observation frees a retained uncertain slot");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter

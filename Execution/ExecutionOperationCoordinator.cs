@@ -387,7 +387,11 @@ internal sealed class ExecutionOperationCoordinator
 
     private TimeSpan Remaining(OperationRecord record) => record.ExecutionDeadlineUtc - _utcNow();
 
-    private int ActiveCountLocked() => _byOperationId.Values.Count(r => !IsSettled(r));
+    /// <summary>
+    /// 実行中の操作と、期限で結果不明として確定した操作を数える。後者は lease を解放済みだが、結果が分からないため
+    /// store から追い出さず（追い出すと同じ requestId の再 dispatch や照会の operation_not_found を招く）、枠を保持する。
+    /// </summary>
+    private int ActiveCountLocked() => _byOperationId.Values.Count(r => !IsSettled(r) || IsRetainedUncertain(r));
 
     /// <summary>dispatch が戻った後も観測されない操作を実行期限で確定させる（期限は最大 30 秒）。</summary>
     private async Task SettleAtDeadlineAsync(OperationRecord record)
@@ -429,6 +433,9 @@ internal sealed class ExecutionOperationCoordinator
 
     private static bool IsSettled(OperationRecord record) => IsTerminal(record.State) || record.DeadlineSettled;
 
+    /// <summary>期限で結果不明として確定したまま、正確な観測で終端していない記録。再送を防ぐため保持し続ける。</summary>
+    private static bool IsRetainedUncertain(OperationRecord record) => record.DeadlineSettled && !IsTerminal(record.State);
+
     private static IExecutionMutationLease? TryAcquireWorkspaceLease()
     {
         if (!WorkspaceMutationGate.Shared.TryAcquire()) return null;
@@ -447,8 +454,9 @@ internal sealed class ExecutionOperationCoordinator
     private void PruneCompletedLocked()
     {
         var cutoff = _utcNow() - CompletedRetention;
-        foreach (var record in _byOperationId.Values.Where(r => IsSettled(r) && r.CompletedAt <= cutoff).ToArray()) RemoveLocked(record);
-        var completed = _byOperationId.Values.Where(IsSettled).OrderBy(r => r.CompletedAt).ToArray();
+        foreach (var record in _byOperationId.Values.Where(r => IsSettled(r) && !IsRetainedUncertain(r) && r.CompletedAt <= cutoff).ToArray())
+            RemoveLocked(record);
+        var completed = _byOperationId.Values.Where(r => IsSettled(r) && !IsRetainedUncertain(r)).OrderBy(r => r.CompletedAt).ToArray();
         foreach (var record in completed.Take(Math.Max(0, completed.Length - MaxRetainedCompleted))) RemoveLocked(record);
     }
 
