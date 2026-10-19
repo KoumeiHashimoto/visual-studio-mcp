@@ -234,7 +234,7 @@ using (var replacementOwner = TargetMutationOwner.TryAcquire(current.Id, ownerId
 var pipeName = "provider-validation-" + Guid.NewGuid().ToString("N");
 var bootstrapPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".json");
 var pipeSecret = Enumerable.Range(32, 32).Select(static value => (byte)value).ToArray();
-var bootstrapJson = JsonSerializer.Serialize(new ProviderBootstrap
+var bootstrapJson = JsonSerializer.Serialize(new
 {
     PipeName = pipeName,
     SecretBase64 = Convert.ToBase64String(pipeSecret),
@@ -244,6 +244,32 @@ var bootstrapJson = JsonSerializer.Serialize(new ProviderBootstrap
 await File.WriteAllTextAsync(bootstrapPath, bootstrapJson);
 var loadedBootstrap = ProviderClient.ReadBootstrap(bootstrapPath)!;
 Check(loadedBootstrap.PipeName == pipeName && !File.Exists(bootstrapPath), "bootstrap is bounded, loaded, and deleted");
+// 独立レビュー（#54）: 秘密は string ではなく消去可能な byte[] として復号される。
+Check(loadedBootstrap.Secret.SequenceEqual(pipeSecret) && typeof(ProviderBootstrap).GetProperties().All(static property => property.PropertyType != typeof(string) || property.Name == "PipeName"),
+    "bootstrap secret is decoded into a clearable byte buffer without a string copy");
+{
+    var good = "{\"pipeName\":\"p\",\"secretBase64\":\"" + Convert.ToBase64String(pipeSecret) + "\",\"visualStudioPid\":5,\"visualStudioStartTicks\":7}";
+    var parsed = ProviderClient.ParseBootstrap(System.Text.Encoding.UTF8.GetBytes(good));
+    Check(parsed.PipeName == "p" && parsed.VisualStudioPid == 5 && parsed.VisualStudioStartTicks == 7 && parsed.Secret.Length == 32, "bootstrap parser accepts the writer's JSON shape");
+    System.Security.Cryptography.CryptographicOperations.ZeroMemory(parsed.Secret);
+    Check(parsed.Secret.All(static value => value == 0), "bootstrap secret buffer can be cleared in place");
+    foreach (var (name, bad) in new (string, string)[]
+    {
+        ("unknown member", good.Replace("}", ",\"extra\":1}")),
+        ("duplicate member", good.Replace("\"visualStudioPid\":5", "\"visualStudioPid\":5,\"visualStudioPid\":6")),
+        ("short secret", good.Replace(Convert.ToBase64String(pipeSecret), Convert.ToBase64String(pipeSecret.Take(16).ToArray()))),
+        ("escaped secret", good.Replace("secretBase64\":\"", "secretBase64\":\"\u0041")),
+        ("bad pipe name", good.Replace("\"p\"", "\"a/b\"")),
+        ("negative pid", good.Replace(":5,", ":-5,")),
+        ("trailing content", good + "{}")
+    })
+    {
+        var threw = false;
+        try { ProviderClient.ParseBootstrap(System.Text.Encoding.UTF8.GetBytes(bad)); }
+        catch (Exception ex) when (ex is InvalidDataException or JsonException) { threw = true; }
+        Check(threw, "bootstrap parser rejects " + name);
+    }
+}
 var serverInstance = "CCCCCCCCCCCCCCCCCCCCCC";
 var epoch = Guid.NewGuid().ToString("N");
 await using (var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,

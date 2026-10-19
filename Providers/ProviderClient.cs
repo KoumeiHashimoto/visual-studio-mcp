@@ -12,7 +12,8 @@ namespace VisualStudioMcpServer.Providers;
 internal sealed class ProviderBootstrap
 {
     public string PipeName { get; init; } = string.Empty;
-    public string SecretBase64 { get; init; } = string.Empty;
+    /// <summary>bootstrap secret。不変の string にせず、使い終えたら <see cref="System.Security.Cryptography.CryptographicOperations.ZeroMemory"/> で消去する。</summary>
+    public byte[] Secret { get; init; } = [];
     public int VisualStudioPid { get; init; }
     public long VisualStudioStartTicks { get; init; }
 }
@@ -23,14 +24,6 @@ internal sealed record ProviderHandshakeResult(ProviderFrame Identity, ProviderS
 
 internal static class ProviderClient
 {
-    private static readonly JsonSerializerOptions BootstrapJson = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = false,
-        MaxDepth = 4,
-        UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
-    };
-
     private static ProviderChannel? _activeChannel;
 
     /// <summary>現在の provider epoch の channel。切断後は null（同一 server での再接続はしない）。</summary>
@@ -51,30 +44,75 @@ internal static class ProviderClient
             throw new InvalidDataException("The provider bootstrap file is missing or exceeds its size limit.");
         try
         {
+            // 秘密は不変の string や DTO にせず、読み取り buffer から直接 byte[] へ復号して消去可能な形でだけ保持する。
             var bytes = File.ReadAllBytes(fullPath);
-            try
-            {
-                var value = JsonSerializer.Deserialize<ProviderBootstrap>(bytes, BootstrapJson)
-                    ?? throw new InvalidDataException("The provider bootstrap file is empty.");
-                if (string.IsNullOrWhiteSpace(value.PipeName) || value.PipeName.Length > 128 ||
-                    value.PipeName.Contains('\\') || value.PipeName.Contains('/') ||
-                    value.VisualStudioPid <= 0 || value.VisualStudioStartTicks <= 0)
-                    throw new InvalidDataException("The provider bootstrap identity is invalid.");
-                var secret = Convert.FromBase64String(value.SecretBase64);
-                if (secret.Length != 32)
-                {
-                    CryptographicOperations.ZeroMemory(secret);
-                    throw new InvalidDataException("The provider bootstrap secret has an invalid size.");
-                }
-                CryptographicOperations.ZeroMemory(secret);
-                return value;
-            }
+            try { return ParseBootstrap(bytes); }
             finally { CryptographicOperations.ZeroMemory(bytes); }
         }
         catch (JsonException) { throw new InvalidDataException("The provider bootstrap file is malformed."); }
         finally
         {
             try { File.Delete(fullPath); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>
+    /// bootstrap JSON を Utf8JsonReader で読む。未知の member、重複、型違い、escape された秘密は拒否する。
+    /// secretBase64 は buffer 内の UTF-8 を直接復号し、string を作らない。
+    /// </summary>
+    internal static ProviderBootstrap ParseBootstrap(ReadOnlySpan<byte> json)
+    {
+        var reader = new Utf8JsonReader(json, new JsonReaderOptions { MaxDepth = 4 });
+        string? pipeName = null;
+        byte[]? secret = null;
+        int? pid = null;
+        long? ticks = null;
+        try
+        {
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) throw new InvalidDataException("The provider bootstrap file is malformed.");
+            while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+            {
+                var name = reader.GetString();
+                if (!reader.Read()) throw new InvalidDataException("The provider bootstrap file is malformed.");
+                switch (name)
+                {
+                    case "pipeName" when pipeName is null && reader.TokenType == JsonTokenType.String:
+                        pipeName = reader.GetString();
+                        break;
+                    case "secretBase64" when secret is null && reader.TokenType == JsonTokenType.String:
+                    {
+                        if (reader.ValueIsEscaped) throw new InvalidDataException("The provider bootstrap secret is malformed.");
+                        var decoded = new byte[32];
+                        if (reader.ValueSpan.Length != 44 ||
+                            System.Buffers.Text.Base64.DecodeFromUtf8(reader.ValueSpan, decoded, out _, out var written) != System.Buffers.OperationStatus.Done ||
+                            written != 32)
+                        {
+                            CryptographicOperations.ZeroMemory(decoded);
+                            throw new InvalidDataException("The provider bootstrap secret has an invalid size.");
+                        }
+                        secret = decoded;
+                        break;
+                    }
+                    case "visualStudioPid" when pid is null && reader.TokenType == JsonTokenType.Number:
+                        pid = reader.GetInt32();
+                        break;
+                    case "visualStudioStartTicks" when ticks is null && reader.TokenType == JsonTokenType.Number:
+                        ticks = reader.GetInt64();
+                        break;
+                    default:
+                        throw new InvalidDataException("The provider bootstrap file is malformed.");
+                }
+            }
+            if (reader.TokenType != JsonTokenType.EndObject || reader.Read() || pipeName is null || secret is null || pid is null || ticks is null ||
+                pipeName.Length is 0 or > 128 || pipeName.Contains('\\') || pipeName.Contains('/') || pid <= 0 || ticks <= 0)
+                throw new InvalidDataException("The provider bootstrap identity is invalid.");
+            var result = new ProviderBootstrap { PipeName = pipeName, Secret = secret, VisualStudioPid = pid.Value, VisualStudioStartTicks = ticks.Value };
+            secret = null;
+            return result;
+        }
+        finally
+        {
+            if (secret is not null) CryptographicOperations.ZeroMemory(secret);
         }
     }
 
@@ -88,7 +126,8 @@ internal static class ProviderClient
     internal static async Task RunAsync(ProviderBootstrap bootstrap, string serverInstanceId,
         CancellationToken cancellationToken, Action<ProviderCapabilityObservation>? statusChanged = null)
     {
-        var secret = Convert.FromBase64String(bootstrap.SecretBase64);
+        // 呼び出し元の bootstrap が持つ buffer をそのまま使い、handshake 後または終了時に消去する。
+        var secret = bootstrap.Secret;
         ProviderFrame? authenticatedIdentity = null;
         ProviderChannel? channel = null;
         void Report(string state, string availability, string reason, ProviderFrame? frame = null)
