@@ -626,7 +626,7 @@ Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAc
     var vsTarget = (101, 638900000000000000L);
     var noChannel = new ProviderExecutionAdapter(() => null, () => vsTarget, () => "AAAAAAAAAAAAAAAAAAAAAA", () => serverEpoch,
         () => "55555555555545558555555555555555");
-    var unavailable = await noChannel.ReadTargetSnapshotAsync(TimeSpan.FromSeconds(1), CancellationToken.None);
+    var unavailable = await noChannel.ReadTargetSnapshotAsync("C:\\fixture\\App.sln", TimeSpan.FromSeconds(1), CancellationToken.None);
     Check(!unavailable.ProviderAvailable && unavailable.ServerEpoch == serverEpoch, "missing provider channel reports provider unavailable without a request");
 
     await using var harness = await Harness.CreateAsync(sessionKeyKat, ["execution.readTarget", "execution.dispatch"], ProviderRuntime.Attach);
@@ -648,6 +648,7 @@ Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAc
     var execute = coordinator.ExecuteAsync(request);
     var targetRequest = await harness.Provider.ReadAsync();
     Check(targetRequest.Operation == "execution.readTarget", "coordinator reads the provider target before dispatch");
+    var targetBody = ProviderProtocol.ParseBody<TargetOnlyRequestBody>(targetRequest.Body);
     await harness.Provider.RespondAsync(targetRequest, "ok", "dispatched", readTarget);
     var dispatchRequest = await harness.Provider.ReadAsync();
     var dispatchBody = ProviderProtocol.ParseBody<ExecutionDispatchRequestBody>(dispatchRequest.Body);
@@ -656,6 +657,9 @@ Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAc
         dispatchBody.PolicyFlags.SequenceEqual(["allowDebuggerControl", "allowBuild"]) && ProviderProtocol.IsUuidN(dispatchBody.OperationId) &&
         dispatchRequest.DeadlineUnixMilliseconds <= DateTimeOffset.UtcNow.AddSeconds(30).ToUnixTimeMilliseconds(),
         "dispatch carries the operation, owner fence, expected snapshot and granted flags within the 30-second ceiling");
+    // 独立レビュー（#54/#55）: 実行系の target は期待する solution path を運び、provider が IDE 側で照合できる。
+    Check(targetBody.Target!.WorkspacePath == "C:\\fixture\\App.sln" && dispatchBody.Target!.WorkspacePath == "C:\\fixture\\App.sln",
+        "execution.readTarget and execution.dispatch carry the expected solution path as the workspace path");
     await harness.Provider.RespondAsync(dispatchRequest, "ok", "dispatched", JsonSerializer.Serialize(new ExecutionDispatchResponseBody
     {
         State = "accepted", Code = "launch_accepted", MayHaveChanged = true, LaunchAccepted = true, ProcessTrackingStatus = "debugger_session"

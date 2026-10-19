@@ -306,6 +306,7 @@ foreach (var item in deniedCases)
     };
     var coordinator = new ExecutionOperationCoordinator(adapter, () => true, () => clock, () => new FakeLease());
     var first = await coordinator.ExecuteAsync(Request("retained-uncertain"));
+    Check(adapter.LastExpectedSolutionPath == solution, "the coordinator passes the expected solution path to the target read");
     clock = clock.AddSeconds(31);
     Check(coordinator.Query(first.OperationId!, 41, 1001, "server-instance", epoch).Code == "result_unknown", "deadline settles the unobserved operation as uncertain");
     clock = clock.AddMinutes(10);
@@ -344,14 +345,16 @@ Console.WriteLine($"{checks} execution checks passed.");
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
 {
     public int SnapshotCount { get; private set; }
+    public string? LastExpectedSolutionPath { get; private set; }
     public int DispatchCount { get; private set; }
     public ExecutionDispatchObservation Observation { get; init; } = new(ExecutionState.Observed, "ok", "Observed.", true);
     public Task<ExecutionTargetSnapshot>? SnapshotTask { get; init; }
     public Task<ExecutionDispatchObservation>? DispatchTask { get; init; }
 
-    public Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    public Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken)
     {
         SnapshotCount++;
+        LastExpectedSolutionPath = expectedSolutionPath;
         return SnapshotTask ?? Task.FromResult(snapshot);
     }
 

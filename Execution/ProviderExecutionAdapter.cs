@@ -29,7 +29,7 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         _ownerFence = ownerFence ?? throw new ArgumentNullException(nameof(ownerFence));
     }
 
-    public async Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    public async Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken)
     {
         var target = _target() ?? throw new InvalidOperationException("The bound Visual Studio identity is unavailable.");
         var serverInstanceId = _serverInstanceId() ?? string.Empty;
@@ -38,7 +38,7 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         if (channel is null || channel.IsTerminated || !channel.ImplementedOperations.Contains("execution.readTarget"))
             return Unavailable(target, serverInstanceId, serverEpoch);
 
-        var call = await channel.SendAsync("execution.readTarget", new TargetOnlyRequestBody { Target = Target(target) }, remaining)
+        var call = await channel.SendAsync("execution.readTarget", new TargetOnlyRequestBody { Target = Target(target, expectedSolutionPath) }, remaining)
             .ConfigureAwait(false);
         var result = await call.Result.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (!result.IsOk)
@@ -77,7 +77,7 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         if (deadline < MinimumDispatchDeadline) deadline = MinimumDispatchDeadline;
         var call = await channel.SendAsync("execution.dispatch", new ExecutionDispatchRequestBody
         {
-            Target = Target(target.Value),
+            Target = Target(target.Value, request.ExpectedSolutionPath),
             OperationId = operationId,
             Action = ActionName(request.Action),
             ExpectedStartupSnapshotId = request.ExpectedStartupSnapshotId,
@@ -176,10 +176,12 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         return flags.ToArray();
     }
 
-    private static ProviderTarget Target((int ProcessId, long StartTicks) target) => new()
+    // 実行系の要求は IDE 側で現在の solution / workspace を照合できるよう、期待する path を必ず運ぶ。
+    private static ProviderTarget Target((int ProcessId, long StartTicks) target, string workspacePath) => new()
     {
         VisualStudioPid = target.ProcessId,
-        VisualStudioStartTicks = target.StartTicks
+        VisualStudioStartTicks = target.StartTicks,
+        WorkspacePath = workspacePath.Length <= 1024 ? workspacePath : null
     };
 
     private static ExecutionTargetSnapshot Unavailable((int ProcessId, long StartTicks) target, string serverInstanceId, Guid serverEpoch) =>

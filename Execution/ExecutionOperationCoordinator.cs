@@ -2,7 +2,8 @@
 
 internal interface IExecutionAdapter
 {
-    Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(TimeSpan remaining, CancellationToken cancellationToken);
+    /// <summary>expectedSolutionPath は provider が IDE 側で workspace を照合するために使う（#54 レビュー）。</summary>
+    Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken);
     /// <summary>1 回だけ dispatch する。remaining は coordinator がこの dispatch を待つ残り時間で、adapter はこれより前に確定させる。</summary>
     Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, TimeSpan remaining, CancellationToken cancellationToken);
 }
@@ -92,7 +93,7 @@ internal sealed class ExecutionOperationCoordinator
             ExecutionTargetSnapshot snapshot;
             try
             {
-                snapshot = await _adapter.ReadTargetSnapshotAsync(remaining, preDispatchCancellation)
+                snapshot = await _adapter.ReadTargetSnapshotAsync(request.ExpectedSolutionPath, remaining, preDispatchCancellation)
                     .WaitAsync(remaining, preDispatchCancellation).ConfigureAwait(false);
             }
             catch (TimeoutException) { RemoveDenied(record, "com_timeout", request); return; }
