@@ -66,7 +66,21 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("escaped quote does not expose quoted pseudovariable", () => ExpressionSensitivityPolicy.Validate("\"text \\\" $env\"", "cpp", false, false), null),
     ("unterminated literal fails closed", () => ExpressionSensitivityPolicy.Validate("\"$env", "cpp", true, false), "unsupported_expression_token"),
     ("bare pseudovariable prefix fails closed", () => ExpressionSensitivityPolicy.Validate("$", "cpp", true, true), "unsupported_expression_token"),
-    ("interpolated string fails closed", () => ExpressionSensitivityPolicy.Validate("$\"{$env}\"", "cpp", true, true), "unsupported_expression_token")
+    ("interpolated string fails closed", () => ExpressionSensitivityPolicy.Validate("$\"{$env}\"", "cpp", true, true), "unsupported_expression_token"),
+    // 独立レビューの回避例（#53）。コメントや verbatim 文字列で $user を隠せてはならない。
+    ("block comments fail closed", () => ExpressionSensitivityPolicy.Validate("/*\"*/$user/*\"*/", "csharp", false, false), "unsupported_expression_token"),
+    ("line comments fail closed", () => ExpressionSensitivityPolicy.Validate("1 // \"\n$user", "csharp", false, false), "unsupported_expression_token"),
+    ("verbatim string hiding a sensitive token fails closed", () => ExpressionSensitivityPolicy.Validate("@\"\\\" == null ? $user : (object)\"\\\"", "csharp", false, false), "unsupported_expression_token"),
+    ("interpolated verbatim string fails closed", () => ExpressionSensitivityPolicy.Validate("$@\"{1}\" + $user", "csharp", false, false), "unsupported_expression_token"),
+    ("reversed interpolated verbatim string fails closed", () => ExpressionSensitivityPolicy.Validate("@$\"{1}\" + $user", "csharp", false, false), "unsupported_expression_token"),
+    ("native raw string fails closed", () => ExpressionSensitivityPolicy.Validate("R\"(\\)\" + $user", "cpp", false, false), "unsupported_expression_token"),
+    ("native raw string with prefix fails closed", () => ExpressionSensitivityPolicy.Validate("u8R\"x(\\)x\" , $env", "cpp", false, false), "unsupported_expression_token"),
+    ("digit separator apostrophe fails closed", () => ExpressionSensitivityPolicy.Validate("1'000 + $user", "cpp", false, false), "unsupported_expression_token"),
+    ("character literal holding a quote does not hide the next token", () => ExpressionSensitivityPolicy.Validate("'\"' + $user + '\"'", "csharp", false, false), "sensitive_read_policy_required"),
+    ("valid character literals are still scanned", () => ExpressionSensitivityPolicy.Validate("'a' == 'b' ? $user : null", "csharp", false, false), "sensitive_read_policy_required"),
+    ("escaped character literals are accepted", () => ExpressionSensitivityPolicy.Validate("'\\x41' + '\\n'", "csharp", false, false), null),
+    ("quoted literal containing comment text is still a literal", () => ExpressionSensitivityPolicy.Validate("\"a // b /* c\"", "csharp", false, false), null),
+    ("division is not a comment", () => ExpressionSensitivityPolicy.Validate("4 / 2 + 1", "csharp", false, false), null)
 };
 
 foreach (var test in cases)

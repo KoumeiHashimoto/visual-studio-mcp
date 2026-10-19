@@ -83,13 +83,27 @@ internal static class ExpressionSensitivityPolicy
                 continue;
             }
 
-            if (current is '\'' or '"')
+            // コメントは評価器が読み飛ばす一方で本スキャナの引用符の対応を壊せるため、fail closed で拒否する。
+            if (current == '/' && index + 1 < expression.Length && expression[index + 1] is '/' or '*')
+                return (values, "Comments are not scanned for pseudovariables safely.");
+            if (current == '\'')
             {
-                if (current == '"' && index > 0 && expression[index - 1] == '$')
-                    return (values, "Interpolated strings are not scanned for pseudovariables safely.");
+                // 有効な文字リテラル（'x'、'\n'、'\x41' など）だけを許す。C++ の桁区切りなど他の用途は引用符の対応を壊すため拒否する。
+                var length = CharLiteralLength(expression, index);
+                if (length == 0) return (values, "An apostrophe that is not a valid character literal is not scanned safely.");
+                index += length - 1;
+                continue;
+            }
+            if (current == '"')
+            {
+                // verbatim・補間 verbatim・C++ raw 文字列は escape 規則が異なり、本スキャナでは境界を決められないため拒否する。
+                if (index > 0 && expression[index - 1] is '$' or '@' or 'R')
+                    return (values, "Interpolated, verbatim, and raw string literals are not scanned for pseudovariables safely.");
                 quote = current;
                 continue;
             }
+            if (current == '@' && index + 1 < expression.Length && expression[index + 1] is '"' or '$')
+                return (values, "Interpolated, verbatim, and raw string literals are not scanned for pseudovariables safely.");
             if (current == '@' && index + 1 < expression.Length && IsIdentifierStart(expression[index + 1]))
                 return (values, "Register and escaped-identifier forms are not classified for sensitive-read access.");
             if (current != '$') continue;
@@ -105,6 +119,21 @@ internal static class ExpressionSensitivityPolicy
 
         if (quote != '\0') return (values, "The expression contains an unterminated string literal.");
         return (values, null);
+    }
+
+    /// <summary>index の位置の引用符から始まる有効な文字リテラルの長さ。有効でなければ 0。</summary>
+    private static int CharLiteralLength(string text, int index)
+    {
+        var next = index + 1;
+        if (next >= text.Length) return 0;
+        if (text[next] != '\\')
+            return text[next] != '\'' && next + 1 < text.Length && text[next + 1] == '\'' ? 3 : 0;
+        // 単純 escape（'\n'）または英数字だけの長い escape（'\x41'、'\u0041'、'\0'）。
+        var end = next + 1;
+        if (end >= text.Length || text[end] == '\'') return 0;
+        end++;
+        while (end < text.Length && char.IsLetterOrDigit(text[end]) && end - next <= 10) end++;
+        return end < text.Length && text[end] == '\'' ? end - index + 1 : 0;
     }
 
     private static bool IsIdentifierStart(char value) => char.IsLetter(value) || value == '_';
