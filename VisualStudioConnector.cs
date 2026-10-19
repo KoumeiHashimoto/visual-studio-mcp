@@ -7,6 +7,9 @@ using EnvDTE80;
 using VisualStudioMcpServer.Tools;
 using VisualStudioMcpServer.Workspace;
 using Newtonsoft.Json;
+using VisualStudioMcpServer.Coordination;
+using VisualStudioMcpServer.Diagnostics;
+using VisualStudioMcpServer.Output;
 
 namespace VisualStudioMcpServer;
 
@@ -123,16 +126,76 @@ public static class VisualStudioConnector
         if (dte == null) return new List<string>();
 
         var names = new List<string>();
-        var outputWindow = dte.ToolWindows.OutputWindow;
-
-        foreach (OutputWindowPane pane in outputWindow.OutputWindowPanes)
+        foreach (OutputWindowPane pane in dte.ToolWindows.OutputWindow.OutputWindowPanes)
         {
             names.Add(pane.Name);
             if (names.Count >= 100) break;
         }
-
         return names;
     }
+
+    /// <summary>
+    /// Gets the bounded Output Window pane identities and display names.
+    /// </summary>
+    internal static List<OutputPaneInfo> GetOutputPanes()
+    {
+        var dte = GetActiveVS();
+        if (dte == null) return new List<OutputPaneInfo>();
+
+        var panes = new List<OutputPaneInfo>();
+        var outputWindow = dte.ToolWindows.OutputWindow;
+
+        foreach (OutputWindowPane pane in outputWindow.OutputWindowPanes)
+        {
+            string? paneGuid;
+            try { paneGuid = pane.Guid; }
+            catch { paneGuid = null; }
+            panes.Add(new OutputPaneInfo(paneGuid, pane.Name,
+                string.IsNullOrWhiteSpace(paneGuid) ? "identity_unavailable" : "available"));
+            if (panes.Count >= 100) break;
+        }
+
+        return panes;
+    }
+
+    /// <summary>
+    /// Reads only the requested bounded tail from a pane selected by its exact GUID.
+    /// </summary>
+    internal static OutputPaneTextSnapshot? ReadOutputPaneSnapshot(string paneGuid, int maxLines, int maxCharacters)
+    {
+        var dte = GetActiveVS();
+        if (dte == null) return null;
+
+        foreach (OutputWindowPane pane in dte.ToolWindows.OutputWindow.OutputWindowPanes)
+        {
+            string currentGuid;
+            try { currentGuid = pane.Guid; }
+            catch { continue; }
+            if (!string.Equals(currentGuid, paneGuid, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var document = pane.TextDocument;
+            var endPoint = document.EndPoint;
+            var firstLine = Math.Max(1, endPoint.Line - maxLines + 1);
+            var lineStart = endPoint.CreateEditPoint();
+            lineStart.MoveToLineAndOffset(firstLine, 1);
+            var characterStart = endPoint.CreateEditPoint();
+            try { characterStart.CharLeft(maxCharacters); }
+            catch { characterStart.MoveToLineAndOffset(1, 1); }
+            var charactersTruncated = IsAfter(characterStart, lineStart);
+            var startPoint = charactersTruncated ? characterStart : lineStart;
+            // CharLeft は CRLF を 1 文字と数えるため、UTF-16 の上限に収め直す（#60 実機で 1 文字超過）。
+            var text = OutputSnapshotText.BoundTail(startPoint.GetText(endPoint), maxCharacters, out var boundedTrim);
+            charactersTruncated |= boundedTrim;
+            var omittedLines = Math.Max(0, startPoint.Line - firstLine);
+            var truncated = firstLine > 1 || charactersTruncated || omittedLines > 0;
+            var linesReturned = string.IsNullOrEmpty(text) ? 0 : endPoint.Line - startPoint.Line + 1;
+            return new OutputPaneTextSnapshot(currentGuid, text, linesReturned, omittedLines, truncated);
+        }
+        return null;
+    }
+
+    private static bool IsAfter(EditPoint candidate, EditPoint other) =>
+        candidate.Line > other.Line || candidate.Line == other.Line && candidate.LineCharOffset > other.LineCharOffset;
 
     /// <summary>
     /// Reads content from a specific output pane.
@@ -170,8 +233,9 @@ public static class VisualStudioConnector
     /// <summary>
     /// Gets all items from the Error List.
     /// </summary>
-    public static List<ErrorItem> GetErrorListItems()
+    public static List<ErrorItem> GetErrorListItems(int maxItems = 500)
     {
+        if (maxItems < 0) throw new ArgumentOutOfRangeException(nameof(maxItems));
         var dte = GetActiveVS();
         if (dte == null) return new List<ErrorItem>();
 
@@ -179,7 +243,7 @@ public static class VisualStudioConnector
         var errorList = dte.ToolWindows.ErrorList;
         var errorItems = errorList.ErrorItems;
 
-        for (int i = 1; i <= Math.Min(errorItems.Count, 500); i++)
+        for (int i = 1; i <= Math.Min(errorItems.Count, maxItems); i++)
         {
             var item = errorItems.Item(i);
             items.Add(new ErrorItem
@@ -198,16 +262,11 @@ public static class VisualStudioConnector
 
     private static string GetSeverityString(EnvDTE80.ErrorItem item)
     {
-        // ErrorItem doesn't have a direct Severity property in all versions
-        // We infer from the error code or default to "Error"
         try
         {
-            var desc = item.Description?.ToLower() ?? "";
-            if (desc.Contains("warning")) return "Warning";
-            if (desc.Contains("message") || desc.Contains("info")) return "Message";
+            return ErrorListSeverityMapper.ToLegacySeverity(item.ErrorLevel);
         }
-        catch { }
-        return "Error";
+        catch { return "Unknown"; }
     }
 
     /// <summary>
@@ -268,16 +327,44 @@ public static class VisualStudioConnector
     /// <summary>
     /// Gets the current debugger state.
     /// </summary>
-    public static DebuggerState GetDebuggerState()
+    public static DebuggerState GetDebuggerState(string? expectedSolutionPath = null)
     {
+        if (!TryGetTargetProcessIdentity(out var targetPid, out var targetStartTicks))
+            return DebuggerState.Unavailable("target_identity_required", "Bind to the invoking Visual Studio process before reading debugger state.");
+        if (string.IsNullOrWhiteSpace(expectedSolutionPath) || !Path.IsPathFullyQualified(expectedSolutionPath))
+            return DebuggerState.Unavailable("expected_solution_required", "An absolute expected solution path is required.", targetPid);
+
+        try
+        {
+            using var target = SystemProcess.GetProcessById(targetPid);
+            if (target.StartTime.ToUniversalTime().Ticks != targetStartTicks)
+                return DebuggerState.Unavailable("stale_target", "The bound Visual Studio process identity is stale.", targetPid);
+        }
+        catch
+        {
+            return DebuggerState.Unavailable("stale_target", "The bound Visual Studio process is unavailable.", targetPid);
+        }
+
         var dte = GetActiveVS();
         if (dte == null)
-            return new DebuggerState { Mode = "Unknown", Message = "No VS instance found" };
+            return DebuggerState.Unavailable("target_unavailable", "The bound Visual Studio instance is unavailable.", targetPid);
+
+        string activeSolution;
+        try { activeSolution = dte.Solution.IsOpen ? Path.GetFullPath(dte.Solution.FullName) : string.Empty; }
+        catch { activeSolution = string.Empty; }
+        if (string.IsNullOrEmpty(activeSolution))
+            return DebuggerState.Unavailable("no_solution", "The bound Visual Studio instance has no open solution.", targetPid);
+        if (!PathsEqual(activeSolution, expectedSolutionPath))
+            return DebuggerState.Unavailable("solution_mismatch", "The active solution does not match expectedSolutionPath.", targetPid, activeSolution);
 
         var mode = dte.Debugger.CurrentMode;
         var state = new DebuggerState
         {
+            Code = "ok",
             Mode = mode.ToString(),
+            State = mode == dbgDebugMode.dbgDesignMode ? "design" : mode == dbgDebugMode.dbgRunMode ? "running" : mode == dbgDebugMode.dbgBreakMode ? "break" : "unknown",
+            TargetProcessId = targetPid,
+            SolutionPath = activeSolution,
             IsDebugging = mode != dbgDebugMode.dbgDesignMode,
             IsRunning = mode == dbgDebugMode.dbgRunMode,
             IsAtBreakpoint = mode == dbgDebugMode.dbgBreakMode
@@ -309,20 +396,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartDebugging()
     {
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
-
-        var mode = dte.Debugger.CurrentMode;
-        if (mode == dbgDebugMode.dbgRunMode)
-            return "Already running";
-        if (mode == dbgDebugMode.dbgBreakMode)
-        {
-            dte.Debugger.Go(false); // Continue from breakpoint
-            return "Continued from breakpoint";
-        }
-
-        dte.Debugger.Go(false);
-        return "Started debugging";
+        return DisabledExecution("start_debugging");
     }
 
     /// <summary>
@@ -330,18 +404,7 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StartWithoutDebugging()
     {
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
-
-        try
-        {
-            dte.ExecuteCommand("Debug.StartWithoutDebugging");
-            return "Started without debugging";
-        }
-        catch (Exception ex)
-        {
-            return $"Error: {ex.Message}";
-        }
+        return DisabledExecution("start_without_debugging");
     }
 
     /// <summary>
@@ -349,15 +412,36 @@ public static class VisualStudioConnector
     /// </summary>
     public static string StopDebugging()
     {
-        var dte = GetActiveVS();
-        if (dte == null) return "Error: No VS instance found";
+        return DisabledExecution("stop_debugging");
+    }
 
-        var mode = dte.Debugger.CurrentMode;
-        if (mode == dbgDebugMode.dbgDesignMode)
-            return "Not currently debugging";
+    private static string DisabledExecution(string action) => JsonConvert.SerializeObject(new
+    {
+        Success = false,
+        Code = "requires_vsix_provider",
+        Message = $"{action} is unavailable through the legacy unguarded stdio entry point. Use a provider-bound execution contract.",
+        OperationId = (string?)null,
+        State = "not_started",
+        MayHaveChanged = false
+    });
 
-        dte.Debugger.Stop(false);
-        return "Stopped debugging";
+    private static bool PathsEqual(string left, string right)
+    {
+        try
+        {
+            var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return string.Equals(NormalizePath(left), NormalizePath(right), comparison);
+        }
+        catch { return false; }
+    }
+
+    private static string NormalizePath(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full);
+        return root is not null && full.Length <= root.Length
+            ? root
+            : full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 
     /// <summary>
@@ -449,6 +533,8 @@ public static class VisualStudioConnector
             file, line, function, condition, allowMutation, allowConditionEvaluation);
         if (validation.Code is not null)
             return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateBreakpointError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         if ((file?.Length ?? 0) > 2048 || (function?.Length ?? 0) > 2048 || (condition?.Length ?? 0) > 2048)
             return CreateBreakpointError("invalid_location", "Breakpoint arguments exceed their size limits.");
@@ -514,6 +600,8 @@ public static class VisualStudioConnector
             id, expectedFile, expectedLine, expectedFunction, expectedCondition, allowMutation);
         if (validation.Code is not null)
             return CreateBreakpointError(validation.Code, validation.Message ?? "The breakpoint removal request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateBreakpointError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         try
         {
@@ -750,7 +838,7 @@ public static class VisualStudioConnector
             for (var index = 1; index <= returned; index++)
             {
                 dynamic frame = frames.Item(index);
-                var frameInfo = ReadDebuggerFrame(index, frame, false);
+                DebuggerFrameInfo frameInfo = ReadDebuggerFrame(index, frame, false);
                 frameInfo.IsCurrent = (requestedThreadId is null || requestedThreadId.Value == currentThreadId) && !markedCurrent &&
                     string.Equals(frameInfo.Function, currentFunction, StringComparison.Ordinal) &&
                     string.Equals(frameInfo.Module, currentModule, StringComparison.Ordinal);
@@ -785,6 +873,8 @@ public static class VisualStudioConnector
     public static DebuggerInspectionResponse SelectDebuggerThread(int threadId)
     {
         if (threadId <= 0) return CreateInspectionError("invalid_thread_id", "Thread ID must be a positive ID from the current thread list.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateInspectionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
@@ -826,6 +916,8 @@ public static class VisualStudioConnector
         if (!BreakpointRequestValidation.IsValidFrameIndex(index) || string.IsNullOrWhiteSpace(expectedFunction) || expectedFunction.Length > 2048 ||
             expectedModule is null || expectedModule.Length > 512 || expectedFrameCount < 1)
             return CreateInspectionError("invalid_frame", "Pass the positive frame index, function, module, and total frame count from the latest stack response.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateInspectionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         try
         {
             var (dte, mode) = GetPausedDebugger();
@@ -833,7 +925,7 @@ public static class VisualStudioConnector
             var count = (int)frames.Count;
             if (index > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(index);
-            var current = ReadDebuggerFrame(index, frame, false);
+            DebuggerFrameInfo current = ReadDebuggerFrame(index, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(index, expectedFrameCount, count,
                 expectedFunction, current.Function, expectedModule, current.Module))
                 return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before selecting a frame.");
@@ -881,7 +973,7 @@ public static class VisualStudioConnector
             var count = (int)frames.Count;
             if (frameIndex > count) return CreateInspectionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(frameIndex);
-            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            DebuggerFrameInfo frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, count,
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateInspectionError("stale_frame", "The stack changed since it was listed. Get the stack again before reading locals.");
@@ -935,6 +1027,8 @@ public static class VisualStudioConnector
         var validation = BreakpointRequestValidation.ValidateDebuggerControl(action, allowDebuggerControl);
         if (validation.Code is not null)
             return CreateDebuggerControlError(action, validation.Code, validation.Message ?? "The debugger control request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateDebuggerControlError(action, "target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
 
         timeoutMilliseconds = Math.Clamp(timeoutMilliseconds, 1000, 10000);
         var startedAt = System.Diagnostics.Stopwatch.StartNew();
@@ -1193,12 +1287,15 @@ public static class VisualStudioConnector
         int expectedFrameCount,
         int expectedThreadId,
         bool allowEvaluation,
-        bool allowSideEffects)
+        bool allowSideEffects,
+        bool allowSensitiveRead)
     {
         var expressionValidation = BreakpointRequestValidation.ValidateExpression(
             expressionText, allowEvaluation, allowSideEffects);
         if (expressionValidation.Code is not null)
             return CreateExpressionError(expressionValidation.Code, expressionValidation.Message ?? "The expression request is invalid.");
+        if (!TargetMutationOwner.IsCurrentOwner)
+            return CreateExpressionError("target_owner_busy", "Another companion owns mutations for this Visual Studio process identity.");
         if (!BreakpointRequestValidation.IsValidFrameIndex(frameIndex) || string.IsNullOrWhiteSpace(expectedFunction) ||
             expectedFunction.Length > 2048 || expectedModule is null || expectedModule.Length > 512 ||
             expectedFrameCount < 1 || expectedThreadId <= 0)
@@ -1214,10 +1311,18 @@ public static class VisualStudioConnector
             if (frameIndex > frameCount)
                 return CreateExpressionError("stale_frame", "The frame index is no longer present. Get the stack again.");
             dynamic frame = frames.Item(frameIndex);
-            var frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
+            DebuggerFrameInfo frameInfo = ReadDebuggerFrame(frameIndex, frame, false);
             if (!BreakpointRequestValidation.MatchesFrameSnapshot(frameIndex, expectedFrameCount, frameCount,
                 expectedFunction, frameInfo.Function, expectedModule, frameInfo.Module))
                 return CreateExpressionError("stale_frame", "The stack changed since it was listed. Get the stack again before evaluating an expression.");
+
+            // frame は dynamic のため、判定結果を tuple で受けると実行時束縛で要素名が失われる。
+            // frameInfo を静的型で保持し、名前付きの判定結果を使う。
+            var sensitivityValidation = ExpressionSensitivityPolicy.ValidateForFrame(
+                expressionText!, frameInfo.Language, allowSensitiveRead, allowSideEffects);
+            if (sensitivityValidation.Code is not null)
+                return CreateExpressionError(sensitivityValidation.Code,
+                    sensitivityValidation.Message ?? "The pseudovariable is not allowed for this request.");
 
             var debugger = (EnvDTE100.Debugger5)dte.Debugger;
             var result = debugger.GetExpression3(
@@ -1278,14 +1383,77 @@ public static class VisualStudioConnector
 
 public class DebuggerState
 {
+    public string Code { get; set; } = "ok";
     public string Mode { get; set; } = "";
+    public string State { get; set; } = "unknown";
     public string Message { get; set; } = "";
+    public int? TargetProcessId { get; set; }
+    public string? SolutionPath { get; set; }
     public bool IsDebugging { get; set; }
     public bool IsRunning { get; set; }
     public bool IsAtBreakpoint { get; set; }
     public string? CurrentFunction { get; set; }
     public string? CurrentFile { get; set; }
     public int CurrentLine { get; set; }
+
+    // ---- v1.3 P13-01 の追加 field（既存 field と値は変えない）----
+    /// <summary>provider から得た状態の可否。supported / requires_vsix_provider / provider_unavailable など。</summary>
+    public string ProviderStateAvailability { get; set; } = "requires_vsix_provider";
+    public string? ProviderStateReason { get; set; }
+    public string? ProviderEpoch { get; set; }
+    public ulong? ProviderSequence { get; set; }
+    /// <summary>wait_for_debugger_state の afterSequence に使う公開 sequence。対応付けられない場合は null。</summary>
+    public long? EventSequence { get; set; }
+    public string? DebugSessionId { get; set; }
+    public string? LaunchOperationId { get; set; }
+    public bool? SessionAgentOwned { get; set; }
+    public string? ProcessSetSnapshotId { get; set; }
+    public List<DebuggedProcessInfo>? Processes { get; set; }
+    public bool? ProcessesTruncated { get; set; }
+    public bool? CurrentThreadAvailable { get; set; }
+    public string? Configuration { get; set; }
+    public string? Platform { get; set; }
+    public StartupSnapshotInfo? StartupSnapshot { get; set; }
+    /// <summary>停止理由・例外・終了コードは mode 通知から得られないため常に unsupported。</summary>
+    public string StopReasonAvailability { get; set; } = "unsupported";
+    /// <summary>operationId 指定時の、その operation だけの結果。不明 ID を別の operation で代用しない。</summary>
+    [JsonProperty("Operation")]
+    internal Execution.ExecutionOperationResult? Operation { get; set; }
+
+    public static DebuggerState Unavailable(string code, string message, int? targetProcessId = null, string? solutionPath = null) => new()
+    {
+        Code = code,
+        Mode = "Unknown",
+        State = "unknown",
+        Message = message,
+        TargetProcessId = targetProcessId,
+        SolutionPath = solutionPath
+    };
+}
+
+public class DebuggedProcessInfo
+{
+    public int ProcessId { get; set; }
+    public long? StartTicks { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public class StartupSnapshotInfo
+{
+    public string SnapshotId { get; set; } = "";
+    public List<StartupProjectInfo> StartupProjects { get; set; } = new();
+    public string ProviderKind { get; set; } = "";
+    public string ProfileStatus { get; set; } = "";
+    public bool LaunchSupported { get; set; }
+    public string? UnsupportedCode { get; set; }
+    public string? UnsupportedReason { get; set; }
+    public bool BuildMayOccur { get; set; }
+}
+
+public class StartupProjectInfo
+{
+    public string UniqueName { get; set; } = "";
+    public string ProviderKind { get; set; } = "";
 }
 
 public class StackFrameInfo

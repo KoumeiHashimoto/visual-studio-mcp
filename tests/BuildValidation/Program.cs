@@ -124,8 +124,42 @@ foreach (var action in Enum.GetValues<BuildAction>())
     var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, TerminalState = false };
     var coordinator = new BuildOperationCoordinator(adapter);
     var result = await coordinator.ExecuteAsync(BuildAction.Clean, validTarget.SolutionPath, 41, 1001, true, 1000);
-    Check(result.Code == "build_wait_timeout" && result.Outcome is null, "nonterminal Done snapshot cannot claim clean success");
+    Check(result.Code is "build_wait_timeout" or "result_unknown" && result.Outcome is null or "unknown", "nonterminal Done snapshot cannot claim clean success");
     Check(coordinator.GetStatus(result.OperationId).State == "unknown", "nonterminal Done snapshot preserves unknown status");
+}
+
+// 非終端の完了 event の後に対象が idle なら、結果不明で確定して所有を解放する（実機 VS 2026 で build_busy が残った回帰）。
+{
+    BuildOperationCoordinator.TerminalRecheckDelay = TimeSpan.FromMilliseconds(50);
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, TerminalState = false };
+    var coordinator = new BuildOperationCoordinator(adapter);
+    var first = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 5000, waitForBuild: false);
+    var released = false;
+    for (var i = 0; i < 100 && !released; i++)
+    {
+        await Task.Delay(50);
+        released = coordinator.GetStatus(first.OperationId).Message.Contains("ownership was released", StringComparison.Ordinal);
+    }
+    var status = coordinator.GetStatus(first.OperationId);
+    Check(released && status.Code == "result_unknown" && status.Outcome == "unknown" && status.BuildSucceeded is null,
+        "nonterminal Done settles as result_unknown once the same target is idle");
+    var second = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 5000, waitForBuild: false);
+    Check(second.Code != "build_busy" && adapter.DispatchCount == 2, "ownership is released for the next build after idle settlement");
+}
+
+{
+    BuildOperationCoordinator.TerminalRecheckDelay = TimeSpan.FromMinutes(10);
+    var adapter = new FakeAdapter(validTarget) { CompleteDuringDispatch = true, TerminalState = false };
+    var coordinator = new BuildOperationCoordinator(adapter);
+    var first = await coordinator.ExecuteAsync(BuildAction.Build, validTarget.SolutionPath, 41, 1001, true, 5000, waitForBuild: false);
+    adapter.TargetOverride = validTarget with { IsBuildInProgress = true };
+    var busy = await coordinator.GetStatusAsync(first.OperationId);
+    Check(busy.Code == "result_unknown" && busy.State == "unknown" && !busy.Message.Contains("released", StringComparison.Ordinal),
+        "status keeps ownership while the target still reports a build in progress");
+    adapter.TargetOverride = null;
+    var idle = await coordinator.GetStatusAsync(first.OperationId);
+    Check(idle.Message.Contains("ownership was released", StringComparison.Ordinal), "a status query settles the operation once the target is idle");
+    BuildOperationCoordinator.TerminalRecheckDelay = TimeSpan.FromSeconds(1);
 }
 
 {

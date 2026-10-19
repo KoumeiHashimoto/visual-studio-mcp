@@ -52,8 +52,10 @@ Authenticated stateful HTTP exposes the following bounded solution, debugger, bu
 
 - `get_solution_info`
 - `get_error_list`
+- `get_diagnostics` (bounded snapshot pages; exact project identity and richer provenance may be unavailable)
 - `list_output_panes`
 - `read_output_pane`
+- `read_output_since` (bounded snapshot fallback; does not claim incremental delta continuity)
 - `list_breakpoints`, `set_breakpoint`, `remove_breakpoint`
 - `list_debugger_threads`, `get_call_stack`, `select_debugger_thread`, `select_debugger_frame`, `get_debugger_locals`
 - `evaluate_expression`, `control_debugger`
@@ -65,7 +67,7 @@ The VSIX supplies an owner bearer token that is restricted to owner routes and t
 
 Build tools require `allowBuild=true`, a matching absolute `expectedSolutionPath`, a live bound Visual Studio process, and design mode. Project registration requires `allowProjectMutation=true`, a matching solution and project path, design mode, no build in progress, and a clean project/source file. `remove_project_file` uses project-system item removal and verifies the physical file remains. Project inventory captures solution registrations only; it never walks arbitrary filesystem paths. Snapshots contain no COM references and are capped by count, size, traversal depth, node count, lifetime, and response length. `open_project_file` opens the captured item in the text editor and does not save or reload an existing dirty buffer.
 
-HTTP requests without a valid owner token or admitted connection key receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. Owner tokens and connection keys are not placed in process arguments or logs. The HTTP allowlist contains 24 unique tool names.
+HTTP requests without a valid owner token or admitted connection key receive 401. A non-loopback Host/connection or an Origin other than absent or HTTP localhost/loopback receives 403. Owner tokens and connection keys are not placed in process arguments or logs. The HTTP allowlist contains 27 unique tool names. A registered tool may still report `dte_unavailable` when no VSIX-owned in-process provider is connected; registration does not establish provider availability.
 
 ## Visual Studio binding and COM
 

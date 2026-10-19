@@ -43,7 +43,45 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("running step is not complete", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("step_into", "dbgRunMode", true, false, false).ToString(), null), "False"),
     ("continue can immediately hit another breakpoint", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", true, true, false).ToString(), null), "True"),
     ("continue cannot reuse an unchanged paused state", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("continue", "dbgBreakMode", false, false, false).ToString(), null), "False"),
-    ("pause observes a new break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("pause", "dbgBreakMode", false, true, false).ToString(), null), "True")
+    ("pause observes a new break event", () => (VisualStudioMcpServer.DebuggerControlCompletion.HasCompleted("pause", "dbgBreakMode", false, true, false).ToString(), null), "True"),
+    ("native environment read requires sensitive policy", () => ExpressionSensitivityPolicy.Validate("$env", "cpp", false, false), "sensitive_read_policy_required"),
+    ("native environment read accepts explicit sensitive policy", () => ExpressionSensitivityPolicy.Validate("$ENV", "cpp", true, false), null),
+    ("native command line read is sensitive", () => ExpressionSensitivityPolicy.Validate("$cmdline", "cpp", false, false), "sensitive_read_policy_required"),
+    ("native current user pseudovariable is sensitive", () => ExpressionSensitivityPolicy.Validate("$user", "cpp", false, false), "sensitive_read_policy_required"),
+    ("current user pseudovariable is sensitive in C sharp", () => ExpressionSensitivityPolicy.Validate("$user", "csharp", false, false), "sensitive_read_policy_required"),
+    ("unclassified native context pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$tid", "cpp", true, true), "unsupported_expression_token"),
+    ("return value pseudovariable is supported in C sharp", () => ExpressionSensitivityPolicy.Validate("$returnvalue", "csharp", false, false), null),
+    ("return value pseudovariable is supported in native", () => ExpressionSensitivityPolicy.Validate("$returnvalue", "cpp", false, false), null),
+    ("exception pseudovariable is supported in Visual Basic", () => ExpressionSensitivityPolicy.Validate("$exception", "basic", false, false), null),
+    ("unknown language rejects pseudovariables", () => ExpressionSensitivityPolicy.Validate("$env", "unknown", true, true), "expression_language_unsupported"),
+    ("unknown pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$mystery", "cpp", true, true), "unsupported_expression_token"),
+    ("C sharp rejects native-only environment pseudovariable", () => ExpressionSensitivityPolicy.Validate("$env", "csharp", true, true), "unsupported_expression_token"),
+    ("native register syntax fails closed", () => ExpressionSensitivityPolicy.Validate("@eax", "cpp", true, true), "unsupported_expression_token"),
+    ("unclassified native context pseudovariable fails closed", () => ExpressionSensitivityPolicy.Validate("$handles", "cpp", true, true), "unsupported_expression_token"),
+    ("sensitive permission does not authorize mutation", () => ExpressionSensitivityPolicy.Validate("$delete", "basic", true, false), "side_effect_policy_required"),
+    ("side-effect permission does not authorize sensitive read", () => ExpressionSensitivityPolicy.Validate("$env", "cpp", false, true), "sensitive_read_policy_required"),
+    ("Basic delete alias remains mutating", () => ExpressionSensitivityPolicy.Validate("$$DELETE", "basic", false, false), "side_effect_policy_required"),
+    ("Basic delete alias accepts explicit side-effect policy", () => ExpressionSensitivityPolicy.Validate("$$delete", "basic", false, true), null),
+    ("pseudovariable text inside a quoted literal is ignored", () => ExpressionSensitivityPolicy.Validate("\"$env\"", "cpp", false, false), null),
+    ("escaped quote does not expose quoted pseudovariable", () => ExpressionSensitivityPolicy.Validate("\"text \\\" $env\"", "cpp", false, false), null),
+    ("unterminated literal fails closed", () => ExpressionSensitivityPolicy.Validate("\"$env", "cpp", true, false), "unsupported_expression_token"),
+    ("bare pseudovariable prefix fails closed", () => ExpressionSensitivityPolicy.Validate("$", "cpp", true, true), "unsupported_expression_token"),
+    ("interpolated string fails closed", () => ExpressionSensitivityPolicy.Validate("$\"{$env}\"", "cpp", true, true), "unsupported_expression_token"),
+    // 独立レビューの回避例（#53）。コメントや verbatim 文字列で $user を隠せてはならない。
+    ("block comments fail closed", () => ExpressionSensitivityPolicy.Validate("/*\"*/$user/*\"*/", "csharp", false, false), "unsupported_expression_token"),
+    ("line comments fail closed", () => ExpressionSensitivityPolicy.Validate("1 // \"\n$user", "csharp", false, false), "unsupported_expression_token"),
+    ("verbatim string hiding a sensitive token fails closed", () => ExpressionSensitivityPolicy.Validate("@\"\\\" == null ? $user : (object)\"\\\"", "csharp", false, false), "unsupported_expression_token"),
+    ("interpolated verbatim string fails closed", () => ExpressionSensitivityPolicy.Validate("$@\"{1}\" + $user", "csharp", false, false), "unsupported_expression_token"),
+    ("reversed interpolated verbatim string fails closed", () => ExpressionSensitivityPolicy.Validate("@$\"{1}\" + $user", "csharp", false, false), "unsupported_expression_token"),
+    ("native raw string fails closed", () => ExpressionSensitivityPolicy.Validate("R\"(\\)\" + $user", "cpp", false, false), "unsupported_expression_token"),
+    ("native raw string with prefix fails closed", () => ExpressionSensitivityPolicy.Validate("u8R\"x(\\)x\" , $env", "cpp", false, false), "unsupported_expression_token"),
+    ("csharp raw string hiding a sensitive token fails closed", () => ExpressionSensitivityPolicy.Validate("\"\"\"\\\"\"\" + $user + \"\\\"\"", "csharp", false, false), "unsupported_expression_token"),
+    ("digit separator apostrophe fails closed", () => ExpressionSensitivityPolicy.Validate("1'000 + $user", "cpp", false, false), "unsupported_expression_token"),
+    ("character literal holding a quote does not hide the next token", () => ExpressionSensitivityPolicy.Validate("'\"' + $user + '\"'", "csharp", false, false), "sensitive_read_policy_required"),
+    ("valid character literals are still scanned", () => ExpressionSensitivityPolicy.Validate("'a' == 'b' ? $user : null", "csharp", false, false), "sensitive_read_policy_required"),
+    ("escaped character literals are accepted", () => ExpressionSensitivityPolicy.Validate("'\\x41' + '\\n'", "csharp", false, false), null),
+    ("quoted literal containing comment text is still a literal", () => ExpressionSensitivityPolicy.Validate("\"a // b /* c\"", "csharp", false, false), null),
+    ("division is not a comment", () => ExpressionSensitivityPolicy.Validate("4 / 2 + 1", "csharp", false, false), null)
 };
 
 foreach (var test in cases)
@@ -55,6 +93,39 @@ foreach (var test in cases)
 }
 
 Console.WriteLine($"Passed {cases.Length} breakpoint validation checks.");
+
+// 実 IDE の EnvDTE frame は dynamic で、frame 由来の値を渡すと呼び出し全体が実行時束縛になる（#53 実機不具合の再現）。
+dynamic dynamicFrame = new DynamicFrameProbe { Language = "cpp" };
+var dynamicChecks = 0;
+try
+{
+    var legacy = ExpressionSensitivityPolicy.Validate("$env", dynamicFrame.Language, false, false);
+    _ = (string?)legacy.Code;
+    throw new InvalidOperationException("The tuple result unexpectedly resolved its element name through dynamic binding.");
+}
+catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException) { dynamicChecks++; }
+foreach (var (expression, sensitive, expected) in new (string, bool, string?)[]
+{
+    ("$env", false, "sensitive_read_policy_required"),
+    ("$env", true, null),
+    ("1 + 1", false, null),
+    ("$returnvalue", false, null),
+})
+{
+    var decision = ExpressionSensitivityPolicy.ValidateForFrame(expression, dynamicFrame.Language, sensitive, false);
+    string? code = decision.Code;
+    if (code != expected) throw new InvalidOperationException($"dynamic frame {expression}: expected '{expected ?? "ok"}', got '{code ?? "ok"}'.");
+    dynamicChecks++;
+}
+dynamic csharpFrame = new DynamicFrameProbe { Language = "csharp" };
+if (ExpressionSensitivityPolicy.ValidateForFrame("$user", csharpFrame.Language, false, false).Code != "sensitive_read_policy_required")
+    throw new InvalidOperationException("dynamic C# frame did not gate $user.");
+dynamicChecks++;
+dynamic missingLanguage = new DynamicFrameProbe { Language = null };
+if (ExpressionSensitivityPolicy.ValidateForFrame("$env", missingLanguage.Language, true, true).Code != "expression_language_unsupported")
+    throw new InvalidOperationException("missing frame language did not fail closed.");
+dynamicChecks++;
+Console.WriteLine($"Passed {dynamicChecks} dynamic-frame expression policy checks.");
 
 if (OperatingSystem.IsWindows())
 {
@@ -143,4 +214,9 @@ if (OperatingSystem.IsWindows())
     VisualStudioMcpServer.StaComDispatcher.Invoke(() => true);
     if (!executionStarted) throw new InvalidOperationException("The dispatcher did not report that the timed-out COM operation had started.");
     Console.WriteLine("Passed 8 Windows STA dispatcher checks.");
+}
+
+internal sealed class DynamicFrameProbe
+{
+    public string? Language { get; set; }
 }

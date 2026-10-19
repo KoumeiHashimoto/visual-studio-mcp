@@ -2,6 +2,8 @@
 using Newtonsoft.Json.Linq;
 using VisualStudioMcpServer;
 using VisualStudioMcpServer.Tools;
+using VisualStudioMcpServer.Diagnostics;
+using EnvDTE80;
 
 if (!OperatingSystem.IsWindows())
     throw new PlatformNotSupportedException("These checks exercise the Windows COM STA dispatcher.");
@@ -10,7 +12,8 @@ var tools = new (string Name, Func<string> Call)[]
 {
     ("get_solution_info", () => GetSolutionInfoTool.GetSolutionInfo("json")),
     ("get_error_list", () => GetErrorListTool.GetErrorList("json")),
-    ("list_output_panes", ListOutputPanesTool.ListOutputPanes),
+    ("get_diagnostics", () => Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: Path.GetFullPath("Sample.sln")))),
+    ("list_output_panes", () => ListOutputPanesTool.ListOutputPanes()),
     ("read_output_pane", () => ReadOutputPaneTool.ReadOutputPane("Build"))
 };
 const string privateDetail = "PRIVATE_SENTINEL /private/path token=DO_NOT_LOG";
@@ -109,16 +112,86 @@ Check(workspaceJson.Value<string>("WorkspaceKind") == "openFolder" &&
     workspaceJson.Value<string>("StartupTargetStatus") == "unsupported" &&
     workspaceJson.Value<string>("StartupTargetReason") == "fixture startup target reason",
     "Open Folder JSON must preserve workspace and unsupported metadata.");
+Check(JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedWorkspaceRoot: "C:\\fixtures\\open-folder")))
+    .Value<string>("Code") == "unsupported", "DTE diagnostics must explicitly reject Open Folder.");
 VisualStudioConnector.Solution = null;
 Error(GetSolutionInfoTool.GetSolutionInfo(), "no_solution");
 Check(GetErrorListTool.GetErrorList() == "No errors or warnings in the Error List.", "Empty error list text must remain unchanged.");
-VisualStudioConnector.Errors.Add(new ErrorItem());
+Check(ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelHigh) == "Error" &&
+    ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelMedium) == "Warning" &&
+    ErrorListSeverityMapper.ToLegacySeverity(vsBuildErrorLevel.vsBuildErrorLevelLow) == "Message" &&
+    ErrorListSeverityMapper.ToLegacySeverity((vsBuildErrorLevel)0) == "Unknown",
+    "Error List severity must come from the public enum, with unknown values left unknown.");
+VisualStudioConnector.Errors.Add(new VisualStudioMcpServer.ErrorItem());
 Check(JArray.Parse(GetErrorListTool.GetErrorList("json")).Count == 1, "Successful error JSON must remain an array.");
+var expectedSolutionPath = Path.GetFullPath("Sample.sln");
+VisualStudioConnector.Solution = new SolutionInfo { SolutionPath = expectedSolutionPath };
+VisualStudioConnector.Errors = new List<VisualStudioMcpServer.ErrorItem>
+{
+    new VisualStudioMcpServer.ErrorItem { Severity = "Error", Description = "first", FileName = "C:\\fixtures\\a.cs" },
+    new VisualStudioMcpServer.ErrorItem { Severity = "Warning", Description = "second", FileName = "C:\\fixtures\\b.cs" }
+};
+var diagnosticsFirst = JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, pageSize: 1)));
+Check(diagnosticsFirst.Value<int>("Total") == 2 && diagnosticsFirst.Value<int>("Returned") == 1 &&
+    diagnosticsFirst.Value<bool>("CaptureComplete") && diagnosticsFirst.Value<string>("OperationCorrelation") == "not_requested",
+    "Diagnostics first page carries bounded snapshot and unknown provenance metadata.");
+var diagnosticsCursor = diagnosticsFirst.Value<string>("NextCursor");
+VisualStudioConnector.Errors = new List<VisualStudioMcpServer.ErrorItem> { new() { Description = "replacement" } };
+var diagnosticsSecond = JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, pageSize: 1, cursor: diagnosticsCursor)));
+Check(diagnosticsSecond.Value<int>("Total") == 2 && diagnosticsSecond["Items"]![0]!["Description"]!.Value<string>() == "second",
+    "Diagnostics cursor pages the original immutable capture after live rows change.");
+Check(JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, severity: "Warning", pageSize: 1, cursor: diagnosticsCursor)))
+    .Value<string>("Code") == "cursor_filter_mismatch", "Diagnostics cursor is bound to filters.");
+Check(JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: expectedSolutionPath, projectId: "unknown")))
+    .Value<string>("Code") == "project_filter_unavailable", "Unavailable stable project identity is explicit.");
+Check(JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: Path.GetFullPath("Other.sln"))))
+    .Value<string>("Code") == "target_mismatch", "Diagnostics request cannot read a different solution.");
+Check(JObject.Parse(Await(GetDiagnosticsTool.GetDiagnostics(expectedSolutionPath: "relative.sln")))
+    .Value<string>("Code") == "invalid_workspace_identity", "Diagnostics requires an absolute solution identity.");
 VisualStudioConnector.Panes.Add("Build");
-Check(ListOutputPanesTool.ListOutputPanes() == "Available Output Panes (1):\n  - Build", "Successful pane list must remain unchanged.");
+VisualStudioConnector.Panes.Add("Legacy pane");
+VisualStudioConnector.OutputPanes.Add(new VisualStudioMcpServer.Output.OutputPaneInfo("{BUILD-GUID}", "Build", "available"));
+VisualStudioConnector.OutputPanes.Add(new VisualStudioMcpServer.Output.OutputPaneInfo(null, "Legacy pane", "identity_unavailable"));
+Check(ListOutputPanesTool.ListOutputPanes() == "Available Output Panes (2):\n  - Build\n  - Legacy pane", "Successful pane list must remain unchanged.");
+var paneJson = JArray.Parse(ListOutputPanesTool.ListOutputPanes("json"));
+Check(paneJson.Count == 2 && paneJson[0]!.Value<string>("Guid") == "{BUILD-GUID}" &&
+    paneJson[0]!.Value<string>("Name") == "Build" && paneJson[0]!.Value<string>("Availability") == "available",
+    "Structured output pane listing must include GUID, localized display name, and availability.");
+Check(paneJson[1]!["Guid"]!.Type == JTokenType.Null && paneJson[1]!.Value<string>("Availability") == "identity_unavailable",
+    "Structured output pane listing must not invent an identity when GUID is unavailable.");
+VisualStudioConnector.OutputSnapshot = new VisualStudioMcpServer.Output.OutputPaneTextSnapshot("{BUILD-GUID}", "snapshot text", 1, 3, true);
+var initialOutput = JObject.Parse(Await(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}")));
+Check(initialOutput.Value<string>("Mode") == "snapshot" && initialOutput.Value<bool>("IncrementalSupported") == false &&
+    initialOutput.Value<bool>("Gap") == false && initialOutput.Value<bool>("Reset") == false &&
+    initialOutput.Value<string>("Text") == "snapshot text" && !string.IsNullOrWhiteSpace(initialOutput.Value<string>("Cursor")),
+    "First output read returns an identified bounded snapshot with an opaque cursor and no delta claim.");
+var nextOutput = JObject.Parse(Await(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", initialOutput.Value<string>("Cursor"))));
+Check(nextOutput.Value<bool>("Gap") == true && nextOutput.Value<bool>("Reset") == true &&
+    nextOutput.Value<bool>("IncrementalSupported") == false,
+    "Follow-up output read requests a fresh snapshot when delta continuity is unproven.");
+Check(JObject.Parse(Await(ReadOutputSinceTool.ReadOutputSince("{OTHER-GUID}", initialOutput.Value<string>("Cursor"))))
+    .Value<string>("Code") == "invalid_cursor", "Cursor cannot be reused for another pane identity.");
+Check(JObject.Parse(Await(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", maxCharacters: 32769)))
+    .Value<string>("Code") == "invalid_max_characters", "Snapshot character request is bounded before provider dispatch.");
+VisualStudioConnector.OutputSnapshot = new VisualStudioMcpServer.Output.OutputPaneTextSnapshot("{BUILD-GUID}", new string('"', 32768), 1, 0, false);
+var boundedOutput = Await(ReadOutputSinceTool.ReadOutputSince("{BUILD-GUID}", maxCharacters: 32768));
+Check(boundedOutput.Length <= 65536 && JObject.Parse(boundedOutput).Value<bool>("Truncated"),
+    "Serialized output snapshots remain valid JSON within the response limit.");
 Check(ReadOutputPaneTool.ReadOutputPane("Build") == "output", "Successful output text must remain unchanged.");
 VisualStudioConnector.Content = new string('a', 100000);
 Check(ReadOutputPaneTool.ReadOutputPane("Build").Length < 65600, "Successful output must remain bounded.");
 VisualStudioConnector.Content = null;
 Check(ReadOutputPaneTool.ReadOutputPane("missing").StartsWith("Error: Could not find output pane"), "Missing pane must remain distinct from missing DTE.");
+ProviderReadChecks.RunDiagnostics(Check, expectedSolutionPath);
+ProviderReadChecks.RunOutput(Check);
+// DTE 末尾テキストの文字数上限（CRLF を 1 文字と数える CharLeft の補正）。
+var crlfTail = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail(new string('y', 1000) + "\r\n", 1000, out var crlfTrimmed);
+Check(crlfTail.Length == 1000 && crlfTrimmed && crlfTail.EndsWith("\r\n", StringComparison.Ordinal), "DTE tail text is bounded to maxCharacters UTF-16 units when it ends with CRLF.");
+var splitCrlf = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("ab\r\ncd", 3, out _);
+Check(splitCrlf == "cd", "A bounded tail never starts inside a CRLF pair.");
+var surrogate = VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("x\U0001F600yz", 3, out _);
+Check(surrogate == "yz", "A bounded tail never starts with a low surrogate.");
+Check(VisualStudioMcpServer.Output.OutputSnapshotText.BoundTail("short", 10, out var untouched) == "short" && !untouched, "Text within the limit is unchanged.");
 Console.WriteLine($"Passed {assertions} read-only tool assertions, including injected failures on the Windows STA. No live DTE was used.");
+
+static string Await(Task<string> task) => task.GetAwaiter().GetResult();

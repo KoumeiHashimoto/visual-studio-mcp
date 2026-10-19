@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Providers/ProviderProtocol.cs" Link="ProviderProtocol.cs" />
+    <Compile Include="../../Providers/ProviderClient.cs" Link="ProviderClient.cs" />
+    <Compile Include="../../Coordination/TargetMutationOwner.cs" Link="TargetMutationOwner.cs" />
+    <Compile Include="../../Capabilities/CapabilityModels.cs" Link="CapabilityModels.cs" />
+    <Compile Include="../../Providers/ProviderRuntime.cs" Link="ProviderRuntime.cs" />
+    <Compile Include="../../Providers/ProviderExecutionContracts.cs" Link="ProviderExecutionContracts.cs" />
+    <Compile Include="../../Observation/DebuggerObservationStore.cs" Link="DebuggerObservationStore.cs" />
+    <Compile Include="../../Execution/ExecutionModels.cs" Link="ExecutionModels.cs" />
+    <Compile Include="../../Execution/ExecutionOperationCoordinator.cs" Link="ExecutionOperationCoordinator.cs" />
+    <Compile Include="../../Execution/ProviderExecutionAdapter.cs" Link="ProviderExecutionAdapter.cs" />
+    <Compile Include="../../WorkspaceMutationGate.cs" Link="WorkspaceMutationGate.cs" />
+  </ItemGroup>
+</Project>
