@@ -144,7 +144,7 @@ internal static class ProviderClient
                     VisualStudioPid = bootstrap.VisualStudioPid,
                     VisualStudioStartTicks = bootstrap.VisualStudioStartTicks
                 };
-                var decision = await ProviderOwnershipReconciler.ReconcileAsync(channel, target, null).ConfigureAwait(false);
+                var decision = await ProviderOwnershipReconciler.ReconcileAsync(channel, target, null, quarantined).ConfigureAwait(false);
                 if (quarantined && decision.Release) TargetMutationOwner.TryReleaseCurrentQuarantine();
             }
 
@@ -757,12 +757,13 @@ internal sealed record ProviderReconcileDecision(bool Release, string Reason);
 internal static class ProviderOwnershipReconciler
 {
     internal static async Task<ProviderReconcileDecision> ReconcileAsync(ProviderChannel channel, ProviderTarget target,
-        string? previousServerInstanceId)
+        string? previousServerInstanceId, bool quarantined = false)
     {
         var call = await channel.SendAsync("ownership.reconcile", new OwnershipReconcileRequestBody
         {
             Target = target,
-            PreviousServerInstanceId = previousServerInstanceId
+            PreviousServerInstanceId = previousServerInstanceId,
+            Quarantined = quarantined
         }, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
         return Evaluate(await call.Result.ConfigureAwait(false));
     }

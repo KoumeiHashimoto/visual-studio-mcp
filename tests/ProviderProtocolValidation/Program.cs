@@ -201,6 +201,15 @@ Check(probeBody.VisualStudioVersion == "18.11.12306.390" && probeBody.Features i
 Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("\"supported\"", "\"maybe\"")), "capabilities.probe rejects an unknown availability");
 Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("\"providerVersion\"", "\"extra\"")), "capabilities.probe rejects unknown members");
 Violation(() => ProviderBodyRules.ParseCapabilitiesProbeResponse(probeWire.Replace("2026-10-19T00:00:00.0000000Z", "not-a-time")), "capabilities.probe rejects an invalid observation time");
+// 独立レビュー（#54）: reconcile 要求は quarantine 中かどうかを運び、親 repository と同じ wire 形になる。
+const string ReconcileWire = "{\"target\":{\"visualStudioPid\":101,\"visualStudioStartTicks\":638900000000000000,\"workspacePath\":null},\"previousServerInstanceId\":null,\"quarantined\":true}";
+Check(ProviderProtocol.SerializeBody(new OwnershipReconcileRequestBody
+{
+    Target = new ProviderTarget { VisualStudioPid = 101, VisualStudioStartTicks = 638900000000000000 }, Quarantined = true
+}) == ReconcileWire, "ownership.reconcile request matches the shared wire literal with the quarantined flag");
+Check(ProviderBodyRules.TryValidateRequest("ownership.reconcile", ReconcileWire, out _) &&
+    ProviderBodyRules.TryValidateRequest("ownership.reconcile", ReconcileWire.Replace(",\"quarantined\":true", ""), out _),
+    "ownership.reconcile accepts the quarantined flag and its absence");
 var refused = ProviderOwnershipReconciler.Evaluate(new ProviderCallResult(Epoch, "ownership.reconcile", "error", "unsupported_operation", "notDispatched", null, null));
 Check(!refused.Release && refused.Reason == "user_action_required", "unsupported reconcile keeps quarantine with user_action_required");
 

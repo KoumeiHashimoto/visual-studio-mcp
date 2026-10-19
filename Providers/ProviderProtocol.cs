@@ -520,6 +520,8 @@ internal sealed record OwnershipReconcileRequestBody
 {
     public ProviderTarget? Target { get; init; }
     public string? PreviousServerInstanceId { get; init; }
+    /// <summary>companion が abandoned な owner mutex を取得して quarantine 中であるか（clarification、catalog 変更なし）。</summary>
+    public bool Quarantined { get; init; }
 }
 
 internal sealed record DocumentsListRequestBody
