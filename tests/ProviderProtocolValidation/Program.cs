@@ -669,6 +669,18 @@ Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAc
         SolutionPath = "C:\\fixture\\App.sln", Configuration = "Debug", Platform = "Any CPU", StartupSnapshotId = startupSnapshot,
         State = "design", ProviderAvailable = true, BuildMayOccur = true
     }, ProviderProtocol.BodyJsonOptions);
+    // 独立レビューの修正後も、別の solution を期待する要求は solution_mismatch で dispatch 前に拒否される。
+    {
+        var mismatch = new ExecutionRequest("mismatch-1", ExecutionAction.StartDebugging, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch,
+            "C:\\other\\Other.sln", startupSnapshot, null, null, AllowDebuggerControl: true, AllowBuild: true, CallerWaitTimeoutMilliseconds: 10_000);
+        var pendingMismatch = coordinator.ExecuteAsync(mismatch);
+        var mismatchRead = await harness.Provider.ReadAsync();
+        await harness.Provider.RespondAsync(mismatchRead, "error", "notDispatched", "{\"code\":\"target_mismatch\",\"message\":\"\"}");
+        var mismatchResult = await pendingMismatch.WaitAsync(TimeSpan.FromSeconds(10));
+        Check(mismatchResult.Code == "solution_mismatch" && mismatchResult.OperationId is null,
+            "a provider target_mismatch on the target read is reported as solution_mismatch without dispatch");
+        released = 0; // 拒否で解放された lease は、以降の launch の検査に数えない。
+    }
     var request = new ExecutionRequest("launch-1", ExecutionAction.StartDebugging, 101, 638900000000000000, "AAAAAAAAAAAAAAAAAAAAAA", serverEpoch,
         "C:\\fixture\\App.sln", startupSnapshot, null, null, AllowDebuggerControl: true, AllowBuild: true, CallerWaitTimeoutMilliseconds: 10_000);
     var execute = coordinator.ExecuteAsync(request);

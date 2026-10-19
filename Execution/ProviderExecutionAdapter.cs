@@ -47,6 +47,11 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
             if (result.Code is ProviderErrorCodes.UnsupportedOperation or ProviderErrorCodes.ProviderDisconnected or
                 ProviderErrorCodes.ProviderUnavailable)
                 return Unavailable(target, serverInstanceId, serverEpoch);
+            // provider が期待する solution と現在の workspace の不一致を報告した。同一性は確認できているため、
+            // solution の欠落として返し、coordinator が従来どおり solution_mismatch で dispatch 前に拒否する。
+            if (result.Code == ProviderErrorCodes.TargetMismatch)
+                return new ExecutionTargetSnapshot(target.ProcessId, target.StartTicks, serverInstanceId, serverEpoch, null, null, null, null,
+                    null, null, "unknown", ProviderAvailable: true, BuildMayOccur: true, SessionAgentOwned: false);
             if (result.Code is ProviderErrorCodes.ProviderTimeout or ProviderErrorCodes.UiThreadTimeout)
                 throw new TimeoutException("The provider target snapshot did not complete within its deadline.");
             throw new InvalidOperationException("The provider target snapshot failed: " + result.Code);
