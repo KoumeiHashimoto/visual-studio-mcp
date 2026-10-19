@@ -616,6 +616,21 @@ internal sealed record ExecutionObservedEventBody
     public string? Code { get; init; }
     public string? DebugSessionId { get; init; }
     public string? ProcessSetSnapshotId { get; init; }
+    /// <summary>停止 operation だけが持つ、検証済み process 集合の process ごとの結果。それ以外は null。</summary>
+    public ProcessOutcomeBody[]? ProcessOutcomes { get; init; }
+}
+
+/// <summary>
+/// 停止した session の process ごとの結果（execution.observed の processOutcomes）。PID と開始時刻で同一 instance を表す。
+/// outcome は exited（終了を観測、exitCode は取得できた場合だけ）、detached（debugger 終了後の有限待機の後も同一 instance が生存）、
+/// unknown（同一 instance を検証できない、または観測できない）のいずれか。
+/// </summary>
+internal sealed record ProcessOutcomeBody
+{
+    public int ProcessId { get; init; }
+    public long? StartTicks { get; init; }
+    public string Outcome { get; init; } = string.Empty;
+    public int? ExitCode { get; init; }
 }
 
 internal sealed record ProviderFeatureAvailabilityEntry
@@ -750,7 +765,8 @@ internal static class ProviderBodyRules
                 IsTimestamp(value.ObservedAtUtc),
             ExecutionObservedEventBody value => ProviderProtocol.IsUuidN(value.OperationId) &&
                 value.State is "observed" or "failed" or "uncertain" && IsOptionalToken(value.Code, 64) &&
-                IsOptionalToken(value.DebugSessionId, 64) && IsOptionalToken(value.ProcessSetSnapshotId, 64),
+                IsOptionalToken(value.DebugSessionId, 64) && IsOptionalToken(value.ProcessSetSnapshotId, 64) &&
+                IsValidProcessOutcomes(value.ProcessOutcomes),
             ProviderFeatureAvailabilityEventBody value => value.Features is { Length: <= 16 } &&
                 value.Features.All(static feature => feature is not null && IsToken(feature.FeatureKey, 64) &&
                     IsToken(feature.Availability, 32) && IsToken(feature.Reason, 128) && IsTimestamp(feature.ObservedAtUtc)),
@@ -761,6 +777,12 @@ internal static class ProviderBodyRules
         if (!valid) throw new ProviderProtocolViolationException("The provider event body is out of range.");
         return result;
     }
+
+    /// <summary>processOutcomes の検査。null（停止以外）か、32 件以下で値域内の要素だけを許す。終了以外に exitCode は付かない。</summary>
+    internal static bool IsValidProcessOutcomes(ProcessOutcomeBody[]? outcomes) =>
+        outcomes is null || (outcomes.Length <= 32 && outcomes.All(static outcome => outcome is not null &&
+            outcome.ProcessId > 0 && (outcome.StartTicks is null || outcome.StartTicks > 0) &&
+            outcome.Outcome is "exited" or "detached" or "unknown" && (outcome.ExitCode is null || outcome.Outcome == "exited")));
 
     internal static ProviderErrorBody ParseError(string body)
     {

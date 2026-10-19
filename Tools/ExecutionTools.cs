@@ -70,7 +70,7 @@ public sealed class ExecutionHttpTools
 
     /// <summary>指定した debugger session と process set だけを停止します。</summary>
     [McpServerTool]
-    [Description("Stops the exact current debugger session through the guarded VSIX provider (Debugger.Stop). Requires allowDebuggerControl=true, the DebugSessionId and ProcessSetSnapshotId from a fresh get_debugger_state, a client requestId, and allowStopExistingSession=true for a session this server did not launch. Reports debugger end separately from process exit; it does not stop the MCP server or applications started without debugging.")]
+    [Description("Stops the exact current debugger session through the guarded VSIX provider (Debugger.Stop). Requires allowDebuggerControl=true, the DebugSessionId and ProcessSetSnapshotId from a fresh get_debugger_state, a client requestId, and allowStopExistingSession=true for a session this server did not launch. Reports debugger end separately from process exit: within the caller wait it returns ProcessOutcomes, one per process of the validated set identified by PID and start time, as exited (with ExitCode when available), detached (still running after a bounded wait once the session ended), or unknown. It does not stop the MCP server or applications started without debugging.")]
     public static Task<string> StopDebugging(
         [Description("Absolute path of the solution expected in the bound Visual Studio instance.")] string expectedSolutionPath,
         [Description("DebugSessionId from a fresh get_debugger_state(format='json').")] string expectedDebugSessionId,
@@ -101,7 +101,8 @@ internal sealed record ExecutionToolResponse(
     string Action,
     string RequestId,
     long? EventSequence,
-    string? ProviderEpoch);
+    string? ProviderEpoch,
+    IReadOnlyList<ExecutionProcessOutcome>? ProcessOutcomes = null);
 
 internal sealed record DebuggerWaitResult(
     bool Success,
@@ -225,10 +226,20 @@ internal static class ExecutionToolImplementation
             expectedSolutionPath ?? string.Empty, Blank(expectedStartupSnapshotId), Blank(expectedDebugSessionId),
             Blank(expectedProcessSetSnapshotId), allowDebuggerControl, allowLaunch, allowBuild, allowStopExistingSession,
             CallerWaitTimeoutMilliseconds: timeoutMilliseconds);
+        var waitBudget = System.Diagnostics.Stopwatch.StartNew();
         var result = await ExecutionRuntime.Coordinator.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
+        if (action == ExecutionAction.StopDebugging && result.State == "accepted" && result.OperationId is { } operationId)
+        {
+            // 停止は debugger の終了と process ごとの結果で確定する。呼び出し元の待機時間の残りだけ確定を待ち、
+            // 確定しなければ受理時点の結果を返す（操作は取り消さず、operationId で後から照会できる）。
+            var remaining = TimeSpan.FromMilliseconds(Math.Clamp(timeoutMilliseconds, 1, 30_000)) - waitBudget.Elapsed;
+            result = await ExecutionRuntime.Coordinator.WaitForSettlementAsync(operationId, remaining, cancellationToken)
+                .ConfigureAwait(false) ?? result;
+        }
         var response = new ExecutionToolResponse(result.Success, result.Code, result.Message, result.OperationId, result.State,
             result.MayHaveChanged, result.TargetProcessId, result.ServerInstanceId, result.ServerEpoch, result.DebugSessionId,
-            result.ProcessSetSnapshotId, ProviderExecutionAdapter.ActionName(action), Bound(requestId), eventSequence, store?.ProviderEpoch);
+            result.ProcessSetSnapshotId, ProviderExecutionAdapter.ActionName(action), Bound(requestId), eventSequence, store?.ProviderEpoch,
+            result.ProcessOutcomes);
         return JsonConvert.SerializeObject(response, Formatting.None);
     }
 

@@ -557,6 +557,33 @@ const string DispatchWire = "{\"state\":\"accepted\",\"code\":\"launch_accepted\
 var sharedDispatch = ProviderExecutionBodies.ParseDispatch(DispatchWire);
 Check(sharedDispatch.LaunchAccepted && sharedDispatch.ProcessTrackingStatus == "unsupported" && sharedDispatch.Code == "launch_accepted",
     "execution.dispatch shared wire literal parses with the same members");
+// #61: 停止の execution.observed は検証済み process 集合の process ごとの結果を持つ（親 repository と同じ wire 形）。
+const string StopObservedWire = "{\"operationId\":\"66666666666646668666666666666666\",\"state\":\"observed\",\"code\":\"debug_session_ended\",\"debugSessionId\":\"44444444444444448444444444444444\",\"processSetSnapshotId\":\"55555555555545558555555555555555\",\"processOutcomes\":[{\"processId\":10,\"startTicks\":5,\"outcome\":\"exited\",\"exitCode\":0},{\"processId\":11,\"startTicks\":6,\"outcome\":\"detached\",\"exitCode\":null},{\"processId\":12,\"startTicks\":null,\"outcome\":\"unknown\",\"exitCode\":null}]}";
+var stopObserved = (ExecutionObservedEventBody)ProviderBodyRules.ParseEvent("execution.observed", StopObservedWire);
+Check(stopObserved.ProcessOutcomes is { Length: 3 } outcomesWire && outcomesWire[0] == new ProcessOutcomeBody { ProcessId = 10, StartTicks = 5, Outcome = "exited", ExitCode = 0 } &&
+    outcomesWire[1].Outcome == "detached" && outcomesWire[1].ExitCode is null && outcomesWire[2].StartTicks is null && outcomesWire[2].Outcome == "unknown",
+    "stop execution.observed shared wire literal parses per-process outcomes");
+Check(((ExecutionObservedEventBody)ProviderBodyRules.ParseEvent("execution.observed",
+    "{\"operationId\":\"66666666666646668666666666666666\",\"state\":\"observed\",\"code\":\"debug_session_started\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"processOutcomes\":null}")).ProcessOutcomes is null,
+    "non-stop execution.observed carries null processOutcomes");
+string ObservedWith(string outcomes) => "{\"operationId\":\"66666666666646668666666666666666\",\"state\":\"observed\",\"code\":\"debug_session_ended\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"processOutcomes\":" + outcomes + "}";
+Violation(() => ProviderBodyRules.ParseEvent("execution.observed", ObservedWith("[{\"processId\":11,\"startTicks\":6,\"outcome\":\"detached\",\"exitCode\":3}]")),
+    "an exit code on a non-exited outcome is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("execution.observed", ObservedWith("[{\"processId\":11,\"startTicks\":6,\"outcome\":\"killed\",\"exitCode\":null}]")),
+    "an outcome outside exited/detached/unknown is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("execution.observed", ObservedWith("[{\"processId\":0,\"startTicks\":6,\"outcome\":\"unknown\",\"exitCode\":null}]")),
+    "a non-positive process ID in an outcome is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("execution.observed", ObservedWith("[" + string.Join(",", Enumerable.Range(1, 33).Select(static pid =>
+    "{\"processId\":" + pid + ",\"startTicks\":null,\"outcome\":\"unknown\",\"exitCode\":null}")) + "]")),
+    "more than 32 process outcomes is a violation");
+var mappedStop = ProviderExecutionAdapter.MapObserved(stopObserved);
+Check(mappedStop.State == ExecutionState.Observed && mappedStop.ProcessOutcomes is { Count: 3 } mappedOutcomes &&
+    mappedOutcomes[0] == new ExecutionProcessOutcome(10, 5, "exited", 0) && mappedOutcomes[1] == new ExecutionProcessOutcome(11, 6, "detached", null) &&
+    mappedStop.Message.Contains("1 exited, 1 detached", StringComparison.Ordinal) && mappedStop.Message.Contains("1 unknown", StringComparison.Ordinal),
+    "observed stop maps per-process outcomes and reports them separately from the debugger end");
+var mappedLegacy = ProviderExecutionAdapter.MapObserved(stopObserved with { ProcessOutcomes = null });
+Check(mappedLegacy.ProcessOutcomes is null && mappedLegacy.Message == "The provider observed the requested debugger transition.",
+    "an observation without processOutcomes claims no per-process evidence");
 // ---- 本番 execution adapter: 応答の写像 ----
 ProviderCallResult Ok(string operation, string body) => new(Guid.NewGuid().ToString("N"), operation, "ok", null, "dispatched", body, null);
 ProviderCallResult Err(string code, string dispatchState) => new(Guid.NewGuid().ToString("N"), "execution.dispatch", "error", code, dispatchState, null, "m");

@@ -47,7 +47,14 @@ internal sealed record ExecutionDispatchObservation(
     string Message,
     bool MayHaveChanged,
     string? DebugSessionId = null,
-    string? ProcessSetSnapshotId = null);
+    string? ProcessSetSnapshotId = null,
+    IReadOnlyList<ExecutionProcessOutcome>? ProcessOutcomes = null);
+
+/// <summary>
+/// stop 後の process ごとの結果。PID と開始時刻で同一 instance を表し、PID だけでは判定しない。
+/// Outcome は exited / detached / unknown。ExitCode は終了を観測し公開 API で取得できた場合だけ値を持つ。
+/// </summary>
+internal sealed record ExecutionProcessOutcome(int ProcessId, long? StartTicks, string Outcome, int? ExitCode);
 
 internal sealed record ExecutionOperationResult(
     bool Success,
@@ -60,7 +67,8 @@ internal sealed record ExecutionOperationResult(
     string? ServerInstanceId,
     Guid? ServerEpoch,
     string? DebugSessionId,
-    string? ProcessSetSnapshotId);
+    string? ProcessSetSnapshotId,
+    IReadOnlyList<ExecutionProcessOutcome>? ProcessOutcomes = null);
 
 internal sealed record ExecutionPolicy(bool AllowDebuggerControl, bool AllowLaunch, bool AllowBuild, bool AllowStopExistingSession)
 {

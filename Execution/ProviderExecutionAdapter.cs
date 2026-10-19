@@ -130,16 +130,34 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         };
     }
 
-    /// <summary>execution.observed を coordinator の観測へ写す。</summary>
-    internal static ExecutionDispatchObservation MapObserved(ExecutionObservedEventBody body) => body.State switch
+    /// <summary>execution.observed を coordinator の観測へ写す。停止の process ごとの結果はそのまま保持する。</summary>
+    internal static ExecutionDispatchObservation MapObserved(ExecutionObservedEventBody body)
     {
-        "observed" => new ExecutionDispatchObservation(ExecutionState.Observed, body.Code ?? "observed",
-            "The provider observed the requested debugger transition.", true, body.DebugSessionId, body.ProcessSetSnapshotId),
-        "failed" => new ExecutionDispatchObservation(ExecutionState.Failed, body.Code ?? "failed",
-            "The provider observed that the action failed.", true, body.DebugSessionId, body.ProcessSetSnapshotId),
-        _ => new ExecutionDispatchObservation(ExecutionState.Uncertain, body.Code ?? "result_unknown",
-            "The provider could not confirm the action outcome.", true, body.DebugSessionId, body.ProcessSetSnapshotId)
-    };
+        var outcomes = MapOutcomes(body.ProcessOutcomes);
+        return body.State switch
+        {
+            "observed" => new ExecutionDispatchObservation(ExecutionState.Observed, body.Code ?? "observed",
+                outcomes is null ? "The provider observed the requested debugger transition." : OutcomeMessage(outcomes),
+                true, body.DebugSessionId, body.ProcessSetSnapshotId, outcomes),
+            "failed" => new ExecutionDispatchObservation(ExecutionState.Failed, body.Code ?? "failed",
+                "The provider observed that the action failed.", true, body.DebugSessionId, body.ProcessSetSnapshotId, outcomes),
+            _ => new ExecutionDispatchObservation(ExecutionState.Uncertain, body.Code ?? "result_unknown",
+                "The provider could not confirm the action outcome.", true, body.DebugSessionId, body.ProcessSetSnapshotId, outcomes)
+        };
+    }
+
+    private static IReadOnlyList<ExecutionProcessOutcome>? MapOutcomes(ProcessOutcomeBody[]? outcomes) =>
+        outcomes?.Select(static outcome => new ExecutionProcessOutcome(outcome.ProcessId, outcome.StartTicks, outcome.Outcome,
+            outcome.ExitCode)).ToArray();
+
+    /// <summary>debugger の終了と process ごとの結果を分けて述べる。detached は生存の観測であり、停止の主張ではない。</summary>
+    internal static string OutcomeMessage(IReadOnlyList<ExecutionProcessOutcome> outcomes)
+    {
+        var exited = outcomes.Count(static outcome => outcome.Outcome == "exited");
+        var detached = outcomes.Count(static outcome => outcome.Outcome == "detached");
+        var unknown = outcomes.Count - exited - detached;
+        return $"The debugger session ended. Per-process outcomes: {exited} exited, {detached} detached (still running after the bounded wait), {unknown} unknown.";
+    }
 
     internal static string ActionName(ExecutionAction action) => action switch
     {

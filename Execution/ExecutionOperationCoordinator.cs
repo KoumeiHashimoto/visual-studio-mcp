@@ -240,6 +240,28 @@ internal sealed class ExecutionOperationCoordinator
         }
     }
 
+    /// <summary>
+    /// 保持中の operation が確定する（終端、実行期限による結果不明、または dispatch 前の拒否）まで最大 wait だけ待ち、
+    /// その時点の結果を返す。待機は操作を取り消さず再送もしない。不明な operation ID は null を返す。
+    /// </summary>
+    public async Task<ExecutionOperationResult?> WaitForSettlementAsync(string operationId, TimeSpan wait, CancellationToken cancellationToken)
+    {
+        OperationRecord? record;
+        lock (_sync) _byOperationId.TryGetValue(operationId, out record);
+        if (record is null) return null;
+        if (wait > TimeSpan.Zero)
+        {
+            try { await record.Settled.Task.WaitAsync(wait, cancellationToken).ConfigureAwait(false); }
+            catch (TimeoutException) { }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        }
+        lock (_sync)
+        {
+            SettleOverdueLocked();
+            return record.Current;
+        }
+    }
+
     public ExecutionOperationResult ReportObservation(string operationId, int targetProcessId, long targetProcessStartUtcTicks,
         string serverInstanceId, Guid serverEpoch, ExecutionDispatchObservation observation)
     {
@@ -298,7 +320,7 @@ internal sealed class ExecutionOperationCoordinator
         new(observation.State is ExecutionState.Accepted or ExecutionState.Observed,
             observation.Code, Limit(observation.Message), record.OperationId, StateText(observation.State),
             observation.MayHaveChanged, record.TargetProcessId, record.ServerInstanceId, record.ServerEpoch,
-            observation.DebugSessionId, observation.ProcessSetSnapshotId);
+            observation.DebugSessionId, observation.ProcessSetSnapshotId, observation.ProcessOutcomes);
 
     private ExecutionOperationResult Denied(string code, string message, int? pid, string? serverInstanceId, Guid? epoch) =>
         new(false, code, message, null, "not_started", false, pid, serverInstanceId, epoch, null, null);
@@ -413,11 +435,13 @@ internal sealed class ExecutionOperationCoordinator
         return new WorkspaceLease(WorkspaceMutationGate.Shared);
     }
 
+    /// <summary>操作の確定時に lease を解放し、確定を待つ呼び出し元（WaitForSettlementAsync）へ知らせる。</summary>
     private static void ReleaseLeaseLocked(OperationRecord record)
     {
         var lease = record.WorkspaceLease;
         record.WorkspaceLease = null;
         lease?.Dispose();
+        record.Settled.TrySetResult(true);
     }
 
     private void PruneCompletedLocked()
@@ -501,6 +525,8 @@ internal sealed class ExecutionOperationCoordinator
         public DateTimeOffset? CompletedAt { get; set; }
         public ExecutionOperationResult Current { get; set; } = new(false, "execution_pending", "The operation is being validated.", operationId, "validating", false, targetProcessId, serverInstanceId, serverEpoch, null, null);
         public TaskCompletionSource<ExecutionOperationResult> Ready { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>終端・期限確定・拒否のいずれかで確定した。</summary>
+        public TaskCompletionSource<bool> Settled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public IExecutionMutationLease? WorkspaceLease { get; set; }
     }
 

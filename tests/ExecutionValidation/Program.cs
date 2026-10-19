@@ -265,6 +265,38 @@ foreach (var item in deniedCases)
         "provider-reported build failure settles immediately and releases the lease");
 }
 
+{
+    // #61: stop は debugger の終了後に process ごとの結果（exited / detached / unknown）で確定し、確定を待つ呼び出し元へ返す。
+    var stopTarget = target with { State = "break", SessionAgentOwned = true };
+    var adapter = new FakeAdapter(stopTarget)
+    {
+        Observation = new ExecutionDispatchObservation(ExecutionState.Accepted, "stop_requested", "Stop requested.", true, "debug-session", "process-set")
+    };
+    var released = 0;
+    var coordinator = new ExecutionOperationCoordinator(adapter, () => true, acquireWorkspaceLease: () => new FakeLease(() => released++));
+    var accepted = await coordinator.ExecuteAsync(Request("stop-outcomes", ExecutionAction.StopDebugging));
+    Check(accepted.State == "accepted" && accepted.ProcessOutcomes is null && released == 0,
+        "accepted stop carries no per-process claim before the session end is observed");
+    var notYet = await coordinator.WaitForSettlementAsync(accepted.OperationId!, TimeSpan.FromMilliseconds(50), CancellationToken.None);
+    Check(notYet?.State == "accepted" && notYet.ProcessOutcomes is null, "bounded settlement wait returns the accepted result without cancelling");
+    Check(await coordinator.WaitForSettlementAsync("ffffffffffffffffffffffffffffffff", TimeSpan.FromMilliseconds(10), CancellationToken.None) is null,
+        "settlement wait never substitutes an unknown operation");
+    var waiter = coordinator.WaitForSettlementAsync(accepted.OperationId!, TimeSpan.FromSeconds(10), CancellationToken.None);
+    var observed = new ExecutionDispatchObservation(ExecutionState.Observed, "debug_session_ended", "Session ended.", true,
+        "debug-session", "process-set",
+        [new ExecutionProcessOutcome(10, 5, "exited", -1), new ExecutionProcessOutcome(11, 6, "detached", null),
+            new ExecutionProcessOutcome(12, null, "unknown", null)]);
+    coordinator.ReportObservation(accepted.OperationId!, 41, 1001, "server-instance", epoch, observed);
+    var settled = await waiter;
+    Check(settled is { State: "observed", Code: "debug_session_ended", ProcessOutcomes.Count: 3 } && released == 1 &&
+        settled.ProcessOutcomes[0] == new ExecutionProcessOutcome(10, 5, "exited", -1) &&
+        settled.ProcessOutcomes[1] == new ExecutionProcessOutcome(11, 6, "detached", null) &&
+        settled.ProcessOutcomes[2] == new ExecutionProcessOutcome(12, null, "unknown", null),
+        "observed stop settles with exact per-process exited/detached/unknown outcomes and releases the lease");
+    Check(coordinator.Query(accepted.OperationId!, 41, 1001, "server-instance", epoch).ProcessOutcomes?.Count == 3,
+        "operation query returns the same per-process outcomes");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
