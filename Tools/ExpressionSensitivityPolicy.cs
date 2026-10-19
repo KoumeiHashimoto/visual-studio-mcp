@@ -99,6 +99,9 @@ internal static class ExpressionSensitivityPolicy
                 // verbatim・補間 verbatim・C++ raw 文字列は escape 規則が異なり、本スキャナでは境界を決められないため拒否する。
                 if (index > 0 && expression[index - 1] is '$' or '@' or 'R')
                     return (values, "Interpolated, verbatim, and raw string literals are not scanned for pseudovariables safely.");
+                // C# 11 の raw 文字列（"""）は escape 規則が異なり境界を決められないため、連続する 3 個以上の引用符を拒否する。
+                if (index + 2 < expression.Length && expression[index + 1] == '"' && expression[index + 2] == '"')
+                    return (values, "Interpolated, verbatim, and raw string literals are not scanned for pseudovariables safely.");
                 quote = current;
                 continue;
             }

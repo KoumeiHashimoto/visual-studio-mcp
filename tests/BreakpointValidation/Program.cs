@@ -75,6 +75,7 @@ var cases = new (string Name, Func<(string? Code, string? Message)> Run, string?
     ("reversed interpolated verbatim string fails closed", () => ExpressionSensitivityPolicy.Validate("@$\"{1}\" + $user", "csharp", false, false), "unsupported_expression_token"),
     ("native raw string fails closed", () => ExpressionSensitivityPolicy.Validate("R\"(\\)\" + $user", "cpp", false, false), "unsupported_expression_token"),
     ("native raw string with prefix fails closed", () => ExpressionSensitivityPolicy.Validate("u8R\"x(\\)x\" , $env", "cpp", false, false), "unsupported_expression_token"),
+    ("csharp raw string hiding a sensitive token fails closed", () => ExpressionSensitivityPolicy.Validate("\"\"\"\\\"\"\" + $user + \"\\\"\"", "csharp", false, false), "unsupported_expression_token"),
     ("digit separator apostrophe fails closed", () => ExpressionSensitivityPolicy.Validate("1'000 + $user", "cpp", false, false), "unsupported_expression_token"),
     ("character literal holding a quote does not hide the next token", () => ExpressionSensitivityPolicy.Validate("'\"' + $user + '\"'", "csharp", false, false), "sensitive_read_policy_required"),
     ("valid character literals are still scanned", () => ExpressionSensitivityPolicy.Validate("'a' == 'b' ? $user : null", "csharp", false, false), "sensitive_read_policy_required"),
