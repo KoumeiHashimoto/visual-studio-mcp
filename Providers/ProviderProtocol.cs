@@ -78,7 +78,7 @@ internal static class ProviderCatalog
 {
     internal const string CompanionToVisualStudio = "c2v";
     internal const string VisualStudioToCompanion = "v2c";
-    internal const string CanonicalHeader = "vsdmcp-provider-catalog-v2";
+    internal const string CanonicalHeader = "vsdmcp-provider-catalog-v3";
     internal const int MaxEventBytes = 16 * 1024;
 
     internal static readonly IReadOnlyList<ProviderCatalogEntry> Entries =
@@ -168,7 +168,7 @@ internal static class ProviderErrorCodes
 
 internal static class ProviderProtocol
 {
-    internal const int CurrentVersion = 2;
+    internal const int CurrentVersion = 3;
     internal const int MaxRequestBytes = 64 * 1024;
     internal const int MaxResponseBytes = 256 * 1024;
     internal const int MaxQueuedRequests = 8;

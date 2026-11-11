@@ -46,19 +46,19 @@ if (args.Length == 6 && args[0] == "--interop-client")
 }
 
 // 両 repository の検証で同じ値を検査する。catalog を変えたら版を上げ、両方を同時に更新する。
-const string ExpectedCatalogHash = "cb847c6f323a206531b1c12e3e5d37ce7c867504a7dd8d463a86b02e1589337b";
-const string ExpectedSessionKeyHex = "85b5f15f2406437ea7058f5f04ec5980fbeaa465122e0642f1c094b4f435fbde";
-const string ExpectedResponseProof = "3FD5QGOUGmYyEDHEAW2bZQlemT7W48XWclHB8ZX2SI4=";
+const string ExpectedCatalogHash = "f356ef67ae3f0e79a933258846d14efce959998e32ee8446f6f49a28a46fe599";
+const string ExpectedSessionKeyHex = "7b98a65e84172d093c3ca14efc11eebb17184a4b1ed30cf3a7343d55a2e48234";
+const string ExpectedResponseProof = "3fdvp8OBYSzNSruq9Dr5jA744yNVueWoz5AxUhw1CNs=";
 const string Epoch = "22222222222242228222222222222222";
-const string ExpectedHelloProof = "ktml8W09ZUToqC2glKVR9Y2p0Ruw2WUsKPgikbTZa3M=";
+const string ExpectedHelloProof = "ODUhcXnr7Z36/Zfy8FbKNcStFSAzS387EHNYmDh5ZKM=";
 
 var passed = 0;
 var secret = Enumerable.Range(0, 32).Select(static value => (byte)value).ToArray();
 
 // ---- catalog と既知解ベクトル ----
-Check(ProviderProtocol.CurrentVersion == 2, "protocol version is 2");
+Check(ProviderProtocol.CurrentVersion == 3, "protocol version is 3");
 Check(ProviderCatalog.Hash == ExpectedCatalogHash, "catalog hash matches the frozen literal");
-Check(ProviderCatalog.CanonicalText.StartsWith("vsdmcp-provider-catalog-v2\ncapabilities.probe|read|c2v|65536|262144\n", StringComparison.Ordinal) &&
+Check(ProviderCatalog.CanonicalText.StartsWith("vsdmcp-provider-catalog-v3\ncapabilities.probe|read|c2v|65536|262144\n", StringComparison.Ordinal) &&
     !ProviderCatalog.CanonicalText.EndsWith('\n'), "canonical catalog text is header-prefixed, sorted and newline-joined");
 Check(ProviderCatalog.Entries.Count(static entry => entry.Kind != ProviderOperationKind.Event) == 10 &&
     ProviderCatalog.Entries.Count(static entry => entry.Kind == ProviderOperationKind.Event) == 4, "catalog has 10 operations and 4 events");
