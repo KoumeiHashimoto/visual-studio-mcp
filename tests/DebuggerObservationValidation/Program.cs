@@ -163,6 +163,25 @@ Check((await closingWait.WaitAsync(TimeSpan.FromSeconds(5))).Status == DebuggerO
     stopStore.Publish(sessionD, null, DebuggerObservedState.Running, 5);
     Check(stopStore.LastEndedSession is null, "outcomes are cleared when the next session is observed");
 
+    // refinement: 同じ break に理由と例外を後から補う。新しい sequence は作らず、provider sequence は同じ観測へ対応付く。
+    var refStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var refSession = Guid.NewGuid().ToString("N");
+    refStore.Publish(refSession, null, DebuggerObservedState.Running, 1);
+    var firstBreak = refStore.Publish(refSession, null, DebuggerObservedState.Break, 2);
+    var refinedBreak = refStore.Publish(refSession, null, DebuggerObservedState.Break, 3, "exception_unhandled", null, null, refinement: true);
+    Check(refinedBreak.Sequence == firstBreak.Sequence && refStore.CurrentSequence == firstBreak.Sequence, "a refinement does not create a new public sequence");
+    Check(refStore.FindBySequence(firstBreak.Sequence)?.StopReason == "exception_unhandled", "the refinement fills the reason of the published break");
+    Check(refStore.TryGetSequenceForProviderSequence(2, out var s2) && s2 == firstBreak.Sequence &&
+          refStore.TryGetSequenceForProviderSequence(3, out var s3) && s3 == firstBreak.Sequence, "both provider sequences map to the refined break");
+    Check(refStore.LastProviderSequence == 3, "the last provider sequence advances with the refinement");
+    var withException = refStore.Publish(refSession, null, DebuggerObservedState.Break, 4, "exception_unhandled", exception, null, refinement: true);
+    Check(withException.Exception == exception && withException.Sequence == firstBreak.Sequence && refStore.FindBySequence(firstBreak.Sequence)?.StopReason == "exception_unhandled",
+        "a later refinement adds the exception and keeps the reason");
+    var stepAgain = refStore.Publish(refSession, null, DebuggerObservedState.Break, 5, "step");
+    Check(stepAgain.Sequence == firstBreak.Sequence + 1, "a break without the refinement flag is a new transition");
+    var orphan = refStore.Publish(Guid.NewGuid().ToString("N"), null, DebuggerObservedState.Break, 6, "step", null, null, refinement: true);
+    Check(orphan.Sequence == stepAgain.Sequence + 1, "a refinement of another session is a new transition");
+
     var hidden = StopInfoProjection.Exception(exception, false);
     Check(hidden is { Description: null, DescriptionAvailability: "requires_allowSensitiveRead", Code: 5, TypeName: "T" },
         "the description is withheld without allowSensitiveRead");

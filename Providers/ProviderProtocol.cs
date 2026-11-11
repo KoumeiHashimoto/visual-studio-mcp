@@ -639,6 +639,8 @@ internal sealed record DebuggerModeChangedEventBody
     public ExceptionInfoBody? Exception { get; init; }
     /// <summary>v1.4: session が自然に終わった design 遷移の、process ごとの結果。design 以外では null。</summary>
     public ProcessOutcomeBody[]? ProcessOutcomes { get; init; }
+    /// <summary>v1.4: 既に公開した同じ break に、後から届いた停止理由と例外を補う通知（新しい遷移ではない）。</summary>
+    public bool? Refinement { get; init; }
 }
 
 /// <summary>v1.4: 停止した例外の情報。Description は認証済み pipe を通り、companion が方針で公開可否を決める。</summary>
@@ -839,7 +841,8 @@ internal static class ProviderBodyRules
                 StopReasons.IsValidException(value.Exception) &&
                 (value.Exception is null || value.State == "break" &&
                     value.StopReason is "exception_thrown" or "exception_unhandled") &&
-                IsValidProcessOutcomes(value.ProcessOutcomes) && (value.ProcessOutcomes is null || value.State == "design"),
+                IsValidProcessOutcomes(value.ProcessOutcomes) && (value.ProcessOutcomes is null || value.State == "design") &&
+                (value.Refinement is null or false || value.State == "break" && value.StopReason is not null),
             ExecutionObservedEventBody value => ProviderProtocol.IsUuidN(value.OperationId) &&
                 value.State is "observed" or "failed" or "uncertain" && IsOptionalToken(value.Code, 64) &&
                 IsOptionalToken(value.DebugSessionId, 64) && IsOptionalToken(value.ProcessSetSnapshotId, 64) &&

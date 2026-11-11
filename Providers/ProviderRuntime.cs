@@ -90,7 +90,7 @@ internal static class ProviderRuntime
                 };
                 store.Publish(ProviderProtocol.IsUuidN(mode.DebugSessionId) ? mode.DebugSessionId : null,
                     ProviderProtocol.IsUuidN(mode.LaunchOperationId) ? mode.LaunchOperationId : null, state, mode.ProviderSequence,
-                    mode.StopReason, mode.Exception, mode.ProcessOutcomes);
+                    mode.StopReason, mode.Exception, mode.ProcessOutcomes, mode.Refinement == true);
                 break;
             }
             case ProviderEventsDroppedEventBody:

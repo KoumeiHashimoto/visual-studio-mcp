@@ -247,6 +247,9 @@ const string OutcomeWire = ",\"processOutcomes\":[{\"processId\":11,\"startTicks
 Check(((DebuggerModeChangedEventBody)ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("design", OutcomeWire))).ProcessOutcomes is { Length: 1 } outs && outs[0].ExitCode == 3, "design mode event carries process outcomes");
 Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", OutcomeWire)), "process outcomes outside design are a violation");
 Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("design", ",\"processOutcomes\":[{\"processId\":11,\"startTicks\":6,\"outcome\":\"detached\",\"exitCode\":3}]")), "exit code on a non-exited outcome in a mode event is a violation");
+Check(ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"exception_unhandled\",\"refinement\":true")) is DebuggerModeChangedEventBody { Refinement: true }, "a refinement carries a stop reason on a break");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"refinement\":true")), "a refinement without a stop reason is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("running", ",\"refinement\":true")), "a refinement outside break is a violation");
 Check(ProviderProtocol.CurrentVersion == 3, "v1.4 bodies travel on protocol version 3");
 Violation(() => ProviderBodyRules.ParseError("{\"code\":\"internal_error\",\"message\":\"" + new string('x', 513) + "\"}"), "error message above 512 characters is a violation");
 

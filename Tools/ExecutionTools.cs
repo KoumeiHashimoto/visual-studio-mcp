@@ -192,6 +192,25 @@ internal static class DebuggerObservationTools
         var result = await store.WaitAsync(desired, afterSequence, expectedDebugSessionId, operationId, timeout, cancellationToken)
             .ConfigureAwait(false);
         var observation = result.Observation;
+        // v1.4: 停止理由は break の mode 通知の少し後に届くことがある。一致した break に理由がなければ短時間だけ待つ。
+        if (result.Status == DebuggerObservationWaitStatus.Matched && observation is { State: DebuggerObservedState.Break } pending &&
+            (pending.StopReason is null || pending.StopReason is "exception_thrown" or "exception_unhandled" && pending.Exception is null))
+        {
+            var refineStart = DateTime.UtcNow;
+            var refineDeadline = refineStart + TimeSpan.FromMilliseconds(pending.StopReason is null ? 500 : 2500);
+            while (DateTime.UtcNow < refineDeadline && !cancellationToken.IsCancellationRequested)
+            {
+                if (store.FindBySequence(observation.Sequence) is { StopReason: not null } refined)
+                {
+                    observation = refined;
+                    if (refined.StopReason is not ("exception_thrown" or "exception_unhandled") || refined.Exception is not null) break;
+                    // 例外の停止は、理由の後に例外情報が届く。理由が届いた後も例外情報を待つ。
+                    var extended = refineStart + TimeSpan.FromMilliseconds(2500);
+                    if (refineDeadline < extended) refineDeadline = extended;
+                }
+                await Task.Delay(20, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
         var (success, code, message) = result.Status switch
         {
             DebuggerObservationWaitStatus.Matched => (true, "ok", "A fresh matching debugger transition was observed."),

@@ -28,7 +28,8 @@ internal sealed record DebuggerObservation(
     ulong ProviderSequence = 0,
     string? StopReason = null,
     Providers.ExceptionInfoBody? Exception = null,
-    IReadOnlyList<Providers.ProcessOutcomeBody>? ProcessOutcomes = null);
+    IReadOnlyList<Providers.ProcessOutcomeBody>? ProcessOutcomes = null,
+    ulong FirstProviderSequence = 0);
 
 internal sealed record EndedSessionOutcomes(string DebugSessionId, IReadOnlyList<Providers.ProcessOutcomeBody> ProcessOutcomes);
 
@@ -176,7 +177,8 @@ internal sealed class DebuggerObservationStore
             }
             foreach (var observation in _history)
             {
-                if (observation.ProviderSequence != providerSequence) continue;
+                var first = observation.FirstProviderSequence != 0 ? observation.FirstProviderSequence : observation.ProviderSequence;
+                if (providerSequence < first || providerSequence > observation.ProviderSequence) continue;
                 sequence = observation.Sequence;
                 return true;
             }
@@ -213,7 +215,8 @@ internal sealed class DebuggerObservationStore
         ulong providerSequence = 0,
         string? stopReason = null,
         Providers.ExceptionInfoBody? exception = null,
-        IReadOnlyList<Providers.ProcessOutcomeBody>? processOutcomes = null)
+        IReadOnlyList<Providers.ProcessOutcomeBody>? processOutcomes = null,
+        bool refinement = false)
     {
         if (debugSessionId is not null && !ProviderEpochIsValid(debugSessionId))
             throw new ArgumentException("Debug session ID must be a lowercase UUID-N v4 value.", nameof(debugSessionId));
@@ -228,6 +231,21 @@ internal sealed class DebuggerObservationStore
         {
             var now = _utcNow();
             PruneExpired(now);
+            // v1.4: 公開済みの同じ break に理由だけを補う通知は、新しい sequence を作らず最後の観測を置き換える。
+            if (refinement && state == DebuggerObservedState.Break && _history.Last is { } lastNode &&
+                lastNode.Value.State == DebuggerObservedState.Break && lastNode.Value.DebugSessionId == debugSessionId)
+            {
+                var refined = lastNode.Value with
+                {
+                    ProviderSequence = providerSequence,
+                    FirstProviderSequence = lastNode.Value.FirstProviderSequence != 0 ? lastNode.Value.FirstProviderSequence : lastNode.Value.ProviderSequence,
+                    StopReason = stopReason ?? lastNode.Value.StopReason,
+                    Exception = exception ?? lastNode.Value.Exception
+                };
+                lastNode.Value = refined;
+                if (providerSequence > _lastProviderSequence) _lastProviderSequence = providerSequence;
+                return refined;
+            }
             observation = new DebuggerObservation(_providerEpoch, checked(++_sequence), debugSessionId,
                 launchOperationId, state, now, providerSequence, stopReason, exception, processOutcomes);
             if (state == DebuggerObservedState.Design && processOutcomes is not null && debugSessionId is not null)
