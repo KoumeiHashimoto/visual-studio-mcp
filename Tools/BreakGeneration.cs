@@ -53,6 +53,10 @@ internal static class BreakGeneration
         return null;
     }
 
+    /// <summary>操作の直前と直後に同じ世代であることを確かめる。変わっていれば拒否（code, message）。</summary>
+    internal static (string Code, string Message)? Recheck(long? expected, DebuggerObservationStore? store) =>
+        expected is null ? null : Guard(expected, store);
+
     /// <summary>
     /// 現在の break の世代。IDE が break を報告していて、観測が break をまだ記録していなければ短時間だけ待つ。
     /// 待っても break が記録されなければ最新の sequence をそのまま返す（理由は unknown になる）。
@@ -64,9 +68,9 @@ internal static class BreakGeneration
         var waited = TimeSpan.Zero;
         while (true)
         {
-            var latest = store.Latest();
+            var (latest, current) = store.LatestWithSequence();
             if (!settle || latest is { State: DebuggerObservedState.Break } || waited >= SettleWait)
-                return (store.CurrentSequence, latest is { State: DebuggerObservedState.Break } ? latest : null);
+                return (current, latest is { State: DebuggerObservedState.Break } ? latest : null);
             if (delay is null) Thread.Sleep(SettleStep); else delay(SettleStep).GetAwaiter().GetResult();
             waited += SettleStep;
         }
@@ -113,6 +117,11 @@ internal static class BreakGeneration
         else if (includeLocals && maxLocals == 0) localsAvailability = "not_requested";
 
         // 読み取りの間に世代が進んだ（step・continue など）。混ざった状態を返さない。
+        // 通知は IDE の状態より少し遅れ得るため、短く待ってから世代を再確認する。
+        if (availability == "available")
+        {
+            if (delay is null) Thread.Sleep(SettleStep); else delay(SettleStep).GetAwaiter().GetResult();
+        }
         var after = availability == "available" ? store!.CurrentSequence : (long?)null;
         if (availability == "available" && after != sequence)
             return new BreakSnapshotResponse

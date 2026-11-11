@@ -162,6 +162,22 @@ Check((await closingWait.WaitAsync(TimeSpan.FromSeconds(5))).Status == DebuggerO
     var sessionD = Guid.NewGuid().ToString("N");
     stopStore.Publish(sessionD, null, DebuggerObservedState.Running, 5);
     Check(stopStore.LastEndedSession is null, "outcomes are cleared when the next session is observed");
+    stopStore.Publish(sessionD, null, DebuggerObservedState.Design, 6, null, null, outcomes);
+    Check(stopStore.LastEndedSession is not null, "a natural end records its outcomes");
+    var sessionE = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionE, null, DebuggerObservedState.Running, 7);
+    stopStore.Publish(sessionE, null, DebuggerObservedState.Design, 8);
+    Check(stopStore.LastEndedSession is null, "an end without outcomes (agent stop) does not keep an older session's outcomes");
+
+    // 履歴の欠落をはさんだ refinement は、前の break に付けず新しい観測になる。
+    var refGapStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var refGapSession = Guid.NewGuid().ToString("N");
+    refGapStore.Publish(refGapSession, null, DebuggerObservedState.Running, 1);
+    var breakA = refGapStore.Publish(refGapSession, null, DebuggerObservedState.Break, 2, "step");
+    refGapStore.MarkHistoryGap();
+    var lateRefinement = refGapStore.Publish(refGapSession, null, DebuggerObservedState.Break, 3, "exception_unhandled", null, null, refinement: true);
+    Check(lateRefinement.Sequence > breakA.Sequence && refGapStore.FindBySequence(breakA.Sequence)?.StopReason == "step",
+        "a refinement after a history gap does not overwrite the earlier break");
 
     // refinement: 同じ break に理由と例外を後から補う。新しい sequence は作らず、provider sequence は同じ観測へ対応付く。
     var refStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);

@@ -197,7 +197,7 @@ Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", "{\"provide
     Check(LaunchOverrideRules.Validate("a\0b", null, null) is not null, "arguments with NUL are invalid");
     Check(LaunchOverrideRules.Validate(null, "relative\\dir", null) is not null, "a relative working directory is invalid");
     Check(LaunchOverrideRules.Validate(null, "", null) is not null, "an empty working directory is invalid");
-    Check(LaunchOverrideRules.Validate(null, "\\\\server\\share\\dir", null) is null, "a UNC working directory is accepted");
+    Check(LaunchOverrideRules.Validate(null, "\\\\server\\share\\dir", null) is not null && LaunchOverrideRules.Validate(null, "\\\\?\\C:\\dir", null) is not null, "UNC and device working directories are refused");
     Check(LaunchOverrideRules.Validate(null, new string('d', 1025), null) is not null, "a working directory above 1024 characters is invalid");
     var many = Enumerable.Range(0, 33).ToDictionary(i => "K" + i, i => "v");
     Check(LaunchOverrideRules.Validate(null, null, many) is not null, "more than 32 environment keys are invalid");

@@ -93,7 +93,7 @@ internal static class LaunchOverrideRules
         else builder.Append(tag).Append(':').Append(value.Length).Append(':').Append(value).Append('\n');
     }
 
+    // 絶対パスはドライブ文字のものだけを受け付ける。UNC とデバイスパスは UI thread で応答を待たされ、外部へ接続も起こし得るため拒否する。
     private static bool IsAbsoluteWindowsPath(string path) =>
-        path.Length >= 3 && (path[1] == ':' && path[2] is '\\' or '/' && char.IsLetter(path[0]) ||
-            path.StartsWith("\\\\", StringComparison.Ordinal) && !path.StartsWith("\\\\?\\", StringComparison.Ordinal) && path.Length > 3);
+        path.Length >= 3 && char.IsLetter(path[0]) && path[1] == ':' && path[2] is '\\' or '/';
 }

@@ -110,6 +110,12 @@ internal sealed class DebuggerObservationStore
         get { lock (_sync) return _lastEndedSession; }
     }
 
+    /// <summary>最新の観測と公開 sequence を同じ lock で読む。</summary>
+    internal (DebuggerObservation? Latest, long Sequence) LatestWithSequence()
+    {
+        lock (_sync) return (_history.Last?.Value, _sequence);
+    }
+
     /// <summary>現在の公開 sequence に最も近い（最新の）観測。履歴が空なら null。</summary>
     internal DebuggerObservation? Latest()
     {
@@ -233,7 +239,8 @@ internal sealed class DebuggerObservationStore
             PruneExpired(now);
             // v1.4: 公開済みの同じ break に理由だけを補う通知は、新しい sequence を作らず最後の観測を置き換える。
             if (refinement && state == DebuggerObservedState.Break && _history.Last is { } lastNode &&
-                lastNode.Value.State == DebuggerObservedState.Break && lastNode.Value.DebugSessionId == debugSessionId)
+                lastNode.Value.State == DebuggerObservedState.Break && lastNode.Value.DebugSessionId == debugSessionId &&
+                lastNode.Value.Sequence == _sequence)
             {
                 var refined = lastNode.Value with
                 {
@@ -248,8 +255,8 @@ internal sealed class DebuggerObservationStore
             }
             observation = new DebuggerObservation(_providerEpoch, checked(++_sequence), debugSessionId,
                 launchOperationId, state, now, providerSequence, stopReason, exception, processOutcomes);
-            if (state == DebuggerObservedState.Design && processOutcomes is not null && debugSessionId is not null)
-                _lastEndedSession = new EndedSessionOutcomes(debugSessionId, processOutcomes);
+            if (state == DebuggerObservedState.Design)
+                _lastEndedSession = processOutcomes is not null && debugSessionId is not null ? new EndedSessionOutcomes(debugSessionId, processOutcomes) : null;
             else if (state != DebuggerObservedState.Design && debugSessionId is not null && _lastEndedSession is { } ended && ended.DebugSessionId != debugSessionId)
                 _lastEndedSession = null;
             if (providerSequence > _lastProviderSequence) _lastProviderSequence = providerSequence;

@@ -28,8 +28,18 @@ public static class DebuggerExpressionTool
         [Description("Explicit permission to read sensitive debugger or process pseudovariables. Defaults to false.")] bool allowSensitiveRead = false,
         [Description("Optional EventSequence from get_call_stack or get_break_snapshot. When supplied, the call is refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
         (BreakGeneration.Guard(expectedEventSequence, Providers.ProviderRuntime.ObservationStore) is { } refusal
-            ? SerializeError(refusal.Code, refusal.Message) : null) ?? Invoke(() => VisualStudioConnector.EvaluateDebuggerExpression(expression, frameIndex, expectedFunction,
-            expectedModule, totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead));
+            ? SerializeError(refusal.Code, refusal.Message) : null) ?? Invoke(() =>
+        {
+            var store = Providers.ProviderRuntime.ObservationStore;
+            if (BreakGeneration.Recheck(expectedEventSequence, store) is { } before)
+                return new DebuggerExpressionResponse { Success = false, Code = before.Code, Message = before.Message };
+            var result = VisualStudioConnector.EvaluateDebuggerExpression(expression, frameIndex, expectedFunction,
+                expectedModule, totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead);
+            // 評価の副作用は取り消せない。直後に世代が変わっていた場合は、別の break の値を返さず stale として知らせる。
+            return BreakGeneration.Recheck(expectedEventSequence, store) is { } after
+                ? new DebuggerExpressionResponse { Success = false, Code = after.Code, Message = after.Message }
+                : result;
+        });
 
     private static string Invoke(Func<DebuggerExpressionResponse> operation)
     {

@@ -20,11 +20,18 @@ public static class DebuggerInspectionTool
     /// <summary>Lists stack frames in the bound paused debugger.</summary>
     public static string GetDebuggerStack(int? threadId = null) => Invoke(() =>
     {
+        var store = Providers.ProviderRuntime.ObservationStore;
+        // v1.4: 後続の選択・locals・式評価が照合できるよう、読み取った break の世代を返す。読み取りの前後で世代が変わった結果は返さない。
+        var (sequence, observation) = BreakGeneration.Current(store, settle: true);
         var response = VisualStudioConnector.GetDebuggerStack(threadId);
         if (response.Success)
         {
-            // v1.4: 後続の選択・locals・式評価が照合できるよう、読み取った break の世代を返す。
-            var (sequence, observation) = BreakGeneration.Current(Providers.ProviderRuntime.ObservationStore, settle: true);
+            if (sequence is not null && store is not null && store.CurrentSequence != sequence)
+                return new DebuggerInspectionResponse
+                {
+                    Success = false, Code = BreakGeneration.StaleCode,
+                    Message = "The debugger moved while the stack was being read; read it again."
+                };
             response.EventSequence = sequence;
             response.DebugSessionId = observation?.DebugSessionId;
         }
@@ -72,7 +79,7 @@ public static class DebuggerInspectionTool
         [Description("Expected module name from that frame; pass an empty string when the debugger reports no module.")] string expectedModule,
         [Description("TotalCount from the latest get_call_stack response.")] int totalFrameCount,
         [Description("Optional EventSequence from get_call_stack or get_break_snapshot. When supplied, the call is refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
-        Guarded(expectedEventSequence) ?? Invoke(() => VisualStudioConnector.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount));
+        Guarded(expectedEventSequence) ?? Invoke(() => Pinned(expectedEventSequence, () => VisualStudioConnector.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount)));
 
     /// <summary>Reads locals from a current, snapshot-validated stack frame.</summary>
     [McpServerTool]
@@ -88,13 +95,25 @@ public static class DebuggerInspectionTool
         [Description("Maximum total locals and member values, clamped to 1 through 40.")] int maxItems = 40,
         [Description("Explicit permission to expand member values. Defaults to false.")] bool allowMemberExpansion = false,
         [Description("Optional EventSequence from get_call_stack or get_break_snapshot. When supplied, the call is refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
-        Guarded(expectedEventSequence) ?? Invoke(() => VisualStudioConnector.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
-            totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion));
+        Guarded(expectedEventSequence) ?? Invoke(() => Pinned(expectedEventSequence, () => VisualStudioConnector.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
+            totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion)));
 
     /// <summary>v1.4: expectedEventSequence の照合。通れば null、拒否なら直列化した失敗応答。</summary>
     private static string? Guarded(long? expectedEventSequence) =>
         BreakGeneration.Guard(expectedEventSequence, Providers.ProviderRuntime.ObservationStore) is { } refusal
             ? SerializeError(refusal.Code, refusal.Message) : null;
+
+    /// <summary>STA 上で操作の直前と直後に世代を照合する。直後に変わっていれば、読んだ結果は返さない。</summary>
+    private static DebuggerInspectionResponse Pinned(long? expected, Func<DebuggerInspectionResponse> operation)
+    {
+        var store = Providers.ProviderRuntime.ObservationStore;
+        if (BreakGeneration.Recheck(expected, store) is { } before)
+            return new DebuggerInspectionResponse { Success = false, Code = before.Code, Message = before.Message };
+        var result = operation();
+        if (BreakGeneration.Recheck(expected, store) is { } after)
+            return new DebuggerInspectionResponse { Success = false, Code = after.Code, Message = after.Message };
+        return result;
+    }
 
     private static string Invoke(Func<DebuggerInspectionResponse> operation)
     {
