@@ -18,7 +18,6 @@ public static class DebugControlTool
         [Description("Output format: 'text' for human-readable or 'json' for structured data. Defaults to 'text'.")]
         string format = "text")
     {
-        return McpOutputBounds.Limit(JsonConvert.SerializeObject(
-            StaComDispatcher.Invoke(() => VisualStudioConnector.GetDebuggerStack(threadId)), Formatting.None));
+        return DebuggerInspectionTool.GetDebuggerStack(threadId);
     }
 }

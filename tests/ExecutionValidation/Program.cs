@@ -362,12 +362,65 @@ foreach (var item in deniedCases)
         "the parked observation is applied when the late dispatch finally returns, without any replay");
 }
 
+// ---- v1.4: project 指定と起動上書き ----
+{
+    const string marker = "SECRET-MARKER-VALUE";
+    var env = new Dictionary<string, string> { ["V14_PROBE"] = marker };
+    ExecutionLaunchOverrides Overrides() => new("--flag " + marker, Path.GetFullPath("."), env,
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    var withOverrides = Request("ovr-1") with { LaunchOverrides = Overrides(), AllowLaunchOverrides = true };
+
+    var policyAdapter = new FakeAdapter(target);
+    var denied = await Coordinator(policyAdapter).ExecuteAsync(Request("ovr-policy") with { LaunchOverrides = Overrides() });
+    Check(denied.Code == "launch_override_policy_required" && policyAdapter.DispatchCount == 0 && policyAdapter.SnapshotCount == 0,
+        "launch overrides without allowLaunchOverrides are refused before any inspection or dispatch");
+
+    var okAdapter = new FakeAdapter(target with { LaunchBlockedCode = "unsupported", LaunchBlockedReason = "launch_profile_unidentified" });
+    var launched = await Coordinator(okAdapter).ExecuteAsync(withOverrides);
+    Check(launched.Success && okAdapter.DispatchCount == 1, "a launch profile that cannot be identified does not block an override launch");
+
+    var blockedAdapter = new FakeAdapter(target with { LaunchBlockedCode = "unsupported", LaunchBlockedReason = "launch_profile_unidentified" });
+    var blocked = await Coordinator(blockedAdapter).ExecuteAsync(Request("ovr-noprofile"));
+    Check(blocked.Code == "unsupported" && blockedAdapter.DispatchCount == 0, "the same blocked profile still blocks a launch without overrides");
+
+    var otherBlocked = new FakeAdapter(target with { LaunchBlockedCode = "unsupported", LaunchBlockedReason = "multiple_startup_projects" });
+    var otherResult = await Coordinator(otherBlocked).ExecuteAsync(Request("ovr-multi") with { LaunchOverrides = Overrides(), AllowLaunchOverrides = true });
+    Check(otherResult.Code == "unsupported" && otherBlocked.DispatchCount == 0, "other blocked reasons still block an override launch");
+
+    var projectAdapter = new FakeAdapter(target);
+    var projectResult = await Coordinator(projectAdapter).ExecuteAsync(Request("proj-1") with { ProjectUniqueName = "Second\\Second.csproj" });
+    Check(projectResult.Success && projectAdapter.LastProjectUniqueName == "Second\\Second.csproj",
+        "the selected project reaches the target read");
+
+    var fingerprintA = ExecutionRequestIdentity.Fingerprint(Request("fp"));
+    var fingerprintB = ExecutionRequestIdentity.Fingerprint(Request("fp") with { ProjectUniqueName = "Second\\Second.csproj" });
+    var fingerprintC = ExecutionRequestIdentity.Fingerprint(withOverrides);
+    var fingerprintD = ExecutionRequestIdentity.Fingerprint(withOverrides with { LaunchOverrides = withOverrides.LaunchOverrides! with { Hash = "0000000000000000000000000000000000000000000000000000000000000002" } });
+    Check(fingerprintA != fingerprintB && fingerprintA != fingerprintC && fingerprintC != fingerprintD,
+        "the project and the override hash are part of the request fingerprint");
+    Check(!fingerprintC.Contains(marker) && !withOverrides.LaunchOverrides!.ToString().Contains(marker) &&
+        !withOverrides.ToString().Contains(marker), "no override value appears in the fingerprint or in any string form of the request");
+
+    var conflictAdapter = new FakeAdapter(target);
+    var conflictCoordinator = Coordinator(conflictAdapter);
+    var first = await conflictCoordinator.ExecuteAsync(Request("same-id"));
+    var second = await conflictCoordinator.ExecuteAsync(Request("same-id") with { ProjectUniqueName = "Second\\Second.csproj" });
+    Check(first.Success && second.Code == "request_id_conflict" && conflictAdapter.DispatchCount == 1,
+        "reusing a request id with another project is a conflict");
+
+    var retained = Coordinator(new FakeAdapter(target));
+    var retainedResult = await retained.ExecuteAsync(withOverrides);
+    var serialized = System.Text.Json.JsonSerializer.Serialize(retainedResult);
+    Check(!serialized.Contains(marker), "the operation result never contains override values");
+}
+
 Console.WriteLine($"{checks} execution checks passed.");
 
 sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
 {
     public int SnapshotCount { get; private set; }
     public string? LastExpectedSolutionPath { get; private set; }
+    public string? LastProjectUniqueName { get; private set; }
     public int DispatchCount { get; private set; }
     public ExecutionDispatchObservation Observation { get; init; } = new(ExecutionState.Observed, "ok", "Observed.", true);
     public Task<ExecutionTargetSnapshot>? SnapshotTask { get; init; }
@@ -378,6 +431,12 @@ sealed class FakeAdapter(ExecutionTargetSnapshot snapshot) : IExecutionAdapter
         SnapshotCount++;
         LastExpectedSolutionPath = expectedSolutionPath;
         return SnapshotTask ?? Task.FromResult(snapshot);
+    }
+
+    public Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, string? projectUniqueName, TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        LastProjectUniqueName = projectUniqueName;
+        return ReadTargetSnapshotAsync(expectedSolutionPath, remaining, cancellationToken);
     }
 
     public Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, TimeSpan remaining, CancellationToken cancellationToken)

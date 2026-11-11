@@ -13,6 +13,43 @@ public class ProjectInventoryTools
     private const int MaxResponseCharacters = 65536;
     internal static ProjectSnapshotStore SnapshotStore => Snapshots;
 
+    /// <summary>
+    /// v1.4: start_debugging / start_without_debugging / get_debugger_state が指定する project を、get_project_info と同じ手順で
+    /// 再検証して UniqueName にする。2 つの引数は一緒に指定する。失敗は code と固定文を返す（project の内容は含めない）。
+    /// </summary>
+    internal static (string? UniqueName, string? Code, string? Message) ResolveLaunchProject(string? projectSnapshotId, string? projectId,
+        string? expectedSolutionPath, CancellationToken cancellationToken)
+    {
+        var hasSnapshot = !string.IsNullOrWhiteSpace(projectSnapshotId);
+        var hasProject = !string.IsNullOrWhiteSpace(projectId);
+        if (!hasSnapshot && !hasProject) return (null, null, null);
+        if (hasSnapshot != hasProject)
+            return (null, "launch_override_invalid", "projectSnapshotId and projectId must be supplied together.");
+        if (!VisualStudioConnector.TryGetTargetProcessIdentity(out var pid, out var ticks))
+            return (null, "target_identity_required", "The bound Visual Studio process identity is required.");
+        if (!Snapshots.TryGetProject(projectSnapshotId!, out var snapshot) || snapshot is null ||
+            snapshot.TargetProcessId != pid || snapshot.TargetProcessStartUtcTicks != ticks)
+            return (null, "project_not_found", "The project snapshot is unknown, expired or belongs to another Visual Studio process.");
+        var selected = snapshot.Projects.FirstOrDefault(project => project.ProjectId == projectId);
+        if (selected is null) return (null, "project_not_found", "The project ID is not part of the project snapshot.");
+        if (selected.IsSolutionFolder || string.IsNullOrWhiteSpace(selected.UniqueName) || selected.UniqueName!.Length >= 256 ||
+            selected.IsLoaded == false)
+            return (null, "project_not_launchable", "The selected project is a solution folder, is not loaded, or has no usable unique name.");
+        if (!string.IsNullOrWhiteSpace(expectedSolutionPath) && !(expectedSolutionPath.Length <= 2048 && Path.IsPathFullyQualified(expectedSolutionPath)))
+            return (null, "invalid_argument", "Expected solution path must be absolute.");
+        try
+        {
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            var current = StaComDispatcher.Invoke(() => Connector.ReadProjectInfo(snapshot, selected, expectedSolutionPath, pid, ticks,
+                deadline, cancellationToken), deadline - DateTimeOffset.UtcNow, cancellationToken);
+            if (current is null) return (null, "project_not_found", "The project no longer matches its captured path and logical ancestry.");
+            return (selected.UniqueName, null, null);
+        }
+        catch (ProjectWorkspaceException) { return (null, "project_not_found", "The project could not be revalidated."); }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception) { return (null, "target_unavailable", "The project could not be revalidated in the bound Visual Studio instance."); }
+    }
+
     [McpServerTool]
     [System.ComponentModel.Description("Lists a bounded snapshot of projects in the explicitly bound Visual Studio solution. Pass the returned projectSnapshotId to get_project_info and list_project_files. This reads IDE registration only; it does not scan the disk or load projects.")]
     public static Task<string> ListSolutionProjects(string? expectedSolutionPath = null, int pageSize = 100,

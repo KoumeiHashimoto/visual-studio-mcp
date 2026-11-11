@@ -143,6 +143,83 @@ Check((await closingWait.WaitAsync(TimeSpan.FromSeconds(5))).Status == DebuggerO
     DebuggerObservationWaitStatus.ProviderDisconnected && closingStore.IsClosed,
     "channel loss ends current and later waits as provider_disconnected");
 
+// ---- v1.4: 停止理由・例外・終了結果の観測 ----
+{
+    var stopStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var sessionC = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionC, null, DebuggerObservedState.Running);
+    var exception = new VisualStudioMcpServer.Providers.ExceptionInfoBody { Kind = "unhandled", Category = "Managed", TypeName = "T", Code = 5, Description = "secret" };
+    var reasoned = stopStore.Publish(sessionC, null, DebuggerObservedState.Break, 2, "exception_unhandled", exception);
+    Check(reasoned.StopReason == "exception_unhandled" && reasoned.Exception == exception, "stop reason and exception are kept on the break observation");
+    Check(stopStore.FindBySequence(reasoned.Sequence) == reasoned && stopStore.FindBySequence(99) is null, "observations are found by public sequence");
+    var resumed = stopStore.Publish(sessionC, null, DebuggerObservedState.Running, 3);
+    Check(resumed.StopReason is null && resumed.Exception is null, "a run observation carries no stop reason");
+    Check(stopStore.LastEndedSession is null, "no ended session before a design observation with outcomes");
+    var outcomes = new[] { new VisualStudioMcpServer.Providers.ProcessOutcomeBody { ProcessId = 7, StartTicks = 9, Outcome = "exited", ExitCode = 3 } };
+    stopStore.Publish(sessionC, null, DebuggerObservedState.Design, 4, null, null, outcomes);
+    Check(stopStore.LastEndedSession is { DebugSessionId: var endedId } && endedId == sessionC, "the last ended session keeps its process outcomes");
+    Check(stopStore.LastEndedSession!.ProcessOutcomes.Single().ExitCode == 3, "the exit code is retained");
+    var sessionD = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionD, null, DebuggerObservedState.Running, 5);
+    Check(stopStore.LastEndedSession is null, "outcomes are cleared when the next session is observed");
+    stopStore.Publish(sessionD, null, DebuggerObservedState.Design, 6, null, null, outcomes);
+    Check(stopStore.LastEndedSession is not null, "a natural end records its outcomes");
+    var sessionE = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionE, null, DebuggerObservedState.Running, 7);
+    stopStore.Publish(sessionE, null, DebuggerObservedState.Design, 8);
+    Check(stopStore.LastEndedSession is null, "an end without outcomes (agent stop) does not keep an older session's outcomes");
+
+    // 履歴の欠落をはさんだ refinement は、前の break に付けず新しい観測になる。
+    var refGapStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var refGapSession = Guid.NewGuid().ToString("N");
+    refGapStore.Publish(refGapSession, null, DebuggerObservedState.Running, 1);
+    var breakA = refGapStore.Publish(refGapSession, null, DebuggerObservedState.Break, 2, "step");
+    refGapStore.MarkHistoryGap();
+    var lateRefinement = refGapStore.Publish(refGapSession, null, DebuggerObservedState.Break, 3, "exception_unhandled", null, null, refinement: true);
+    Check(lateRefinement.Sequence > breakA.Sequence && refGapStore.FindBySequence(breakA.Sequence)?.StopReason == "step",
+        "a refinement after a history gap does not overwrite the earlier break");
+
+    // refinement: 同じ break に理由と例外を後から補う。新しい sequence は作らず、provider sequence は同じ観測へ対応付く。
+    var refStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var refSession = Guid.NewGuid().ToString("N");
+    refStore.Publish(refSession, null, DebuggerObservedState.Running, 1);
+    var firstBreak = refStore.Publish(refSession, null, DebuggerObservedState.Break, 2);
+    var refinedBreak = refStore.Publish(refSession, null, DebuggerObservedState.Break, 3, "exception_unhandled", null, null, refinement: true);
+    Check(refinedBreak.Sequence == firstBreak.Sequence && refStore.CurrentSequence == firstBreak.Sequence, "a refinement does not create a new public sequence");
+    Check(refStore.FindBySequence(firstBreak.Sequence)?.StopReason == "exception_unhandled", "the refinement fills the reason of the published break");
+    Check(refStore.TryGetSequenceForProviderSequence(2, out var s2) && s2 == firstBreak.Sequence &&
+          refStore.TryGetSequenceForProviderSequence(3, out var s3) && s3 == firstBreak.Sequence, "both provider sequences map to the refined break");
+    Check(refStore.LastProviderSequence == 3, "the last provider sequence advances with the refinement");
+    var withException = refStore.Publish(refSession, null, DebuggerObservedState.Break, 4, "exception_unhandled", exception, null, refinement: true);
+    Check(withException.Exception == exception && withException.Sequence == firstBreak.Sequence && refStore.FindBySequence(firstBreak.Sequence)?.StopReason == "exception_unhandled",
+        "a later refinement adds the exception and keeps the reason");
+    var stepAgain = refStore.Publish(refSession, null, DebuggerObservedState.Break, 5, "step");
+    Check(stepAgain.Sequence == firstBreak.Sequence + 1, "a break without the refinement flag is a new transition");
+    var orphan = refStore.Publish(Guid.NewGuid().ToString("N"), null, DebuggerObservedState.Break, 6, "step", null, null, refinement: true);
+    Check(orphan.Sequence == stepAgain.Sequence + 1, "a refinement of another session is a new transition");
+
+    var hidden = StopInfoProjection.Exception(exception, false);
+    Check(hidden is { Description: null, DescriptionAvailability: "requires_allowSensitiveRead", Code: 5, TypeName: "T" },
+        "the description is withheld without allowSensitiveRead");
+    var shown = StopInfoProjection.Exception(exception, true);
+    Check(shown is { Description: "secret", DescriptionAvailability: "available" }, "the description is returned with allowSensitiveRead");
+    var long1 = StopInfoProjection.Exception(exception with { Description = new string('x', 3000) }, true);
+    Check(long1!.Description!.Length == 1024 && long1.Truncated, "a long description is bounded and marked truncated");
+    Check(StopInfoProjection.Exception(exception with { Description = null }, true) is { DescriptionAvailability: "unavailable" },
+        "a missing description is unavailable");
+    Check(StopInfoProjection.Availability(false, "break", reasoned) == "unsupported", "no provider means unsupported");
+    Check(StopInfoProjection.Availability(true, "break", reasoned) == "available", "a recorded reason is available");
+    Check(StopInfoProjection.Availability(true, "break", null) == "unknown", "a provider-backed break without a reason is unknown");
+    var view = StopInfoProjection.View(true, "break", reasoned.Sequence, sessionC, stopStore, false);
+    Check(view.StopReason == "exception_unhandled" && view.Exception?.Description is null && view.Availability == "available",
+        "get_debugger_state projects the stop reason and hides the description by default");
+    var json = System.Text.Json.JsonSerializer.Serialize(view);
+    Check(!json.Contains("secret"), "the serialized view never contains the description without allowSensitiveRead");
+    var lastView = StopInfoProjection.View(true, "design", null, null, stopStore, false);
+    Check(lastView.LastSessionId is null, "no ended session is reported before one has ended");
+    Check(StopInfoProjection.View(false, "break", reasoned.Sequence, sessionC, stopStore, true).Availability == "unsupported",
+        "the view is unsupported without a provider");
+}
 Console.WriteLine($"Debugger observation validation: {passed} checks passed.");
 
 void Check(bool condition, string description)

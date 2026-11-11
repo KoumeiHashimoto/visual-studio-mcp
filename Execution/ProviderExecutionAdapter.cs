@@ -29,7 +29,11 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         _ownerFence = ownerFence ?? throw new ArgumentNullException(nameof(ownerFence));
     }
 
-    public async Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken)
+    public Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken) =>
+        ReadTargetSnapshotAsync(expectedSolutionPath, null, remaining, cancellationToken);
+
+    public async Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, string? projectUniqueName,
+        TimeSpan remaining, CancellationToken cancellationToken)
     {
         var target = _target() ?? throw new InvalidOperationException("The bound Visual Studio identity is unavailable.");
         var serverInstanceId = _serverInstanceId() ?? string.Empty;
@@ -38,7 +42,7 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         if (channel is null || channel.IsTerminated || !channel.ImplementedOperations.Contains("execution.readTarget"))
             return Unavailable(target, serverInstanceId, serverEpoch);
 
-        var call = await channel.SendAsync("execution.readTarget", new TargetOnlyRequestBody { Target = Target(target, expectedSolutionPath) }, remaining)
+        var call = await channel.SendAsync("execution.readTarget", new ExecutionReadTargetRequestBody { Target = Target(target, expectedSolutionPath), ProjectUniqueName = projectUniqueName }, remaining)
             .ConfigureAwait(false);
         var result = await call.Result.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (!result.IsOk)
@@ -89,7 +93,15 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
             ExpectedDebugSessionId = request.ExpectedDebugSessionId,
             ExpectedProcessSetSnapshotId = request.ExpectedProcessSetSnapshotId,
             PolicyFlags = PolicyFlags(request),
-            OwnerFence = fence!
+            OwnerFence = fence!,
+            ProjectUniqueName = request.ProjectUniqueName,
+            LaunchOverrides = request.LaunchOverrides is { } overrides ? new LaunchOverridesBody
+            {
+                Arguments = overrides.Arguments,
+                WorkingDirectory = overrides.WorkingDirectory,
+                Environment = overrides.Environment is null ? null : new Dictionary<string, string>(overrides.Environment.ToDictionary(static pair => pair.Key, static pair => pair.Value)),
+                Hash = overrides.Hash
+            } : null
         }, deadline).ConfigureAwait(false);
         var result = await call.Result.ConfigureAwait(false);
         return Map(request.Action, result);
@@ -178,6 +190,7 @@ internal sealed class ProviderExecutionAdapter : IExecutionAdapter
         if (request.AllowLaunch) flags.Add("allowLaunch");
         if (request.AllowBuild) flags.Add("allowBuild");
         if (request.AllowStopExistingSession) flags.Add("allowStopExistingSession");
+        if (request.AllowLaunchOverrides) flags.Add("allowLaunchOverrides");
         return flags.ToArray();
     }
 

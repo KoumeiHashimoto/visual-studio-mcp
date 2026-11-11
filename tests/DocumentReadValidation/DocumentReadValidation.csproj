@@ -10,6 +10,7 @@
     <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <Compile Include="../../Providers/ProviderProtocol.cs" Link="ProviderProtocol.cs" />
+    <Compile Include="../../Providers/LaunchOverrideRules.cs" Link="LaunchOverrideRules.cs" />
     <Compile Include="../../Providers/ProviderReadGateway.cs" Link="ProviderReadGateway.cs" />
     <Compile Include="../../Providers/DocumentProviderBodies.cs" Link="DocumentProviderBodies.cs" />
     <Compile Include="../../Tools/ProviderToolResults.cs" Link="ProviderToolResults.cs" />

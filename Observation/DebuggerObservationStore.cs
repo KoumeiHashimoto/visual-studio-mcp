@@ -25,7 +25,13 @@ internal sealed record DebuggerObservation(
     string? LaunchOperationId,
     DebuggerObservedState State,
     DateTimeOffset ObservedAtUtc,
-    ulong ProviderSequence = 0);
+    ulong ProviderSequence = 0,
+    string? StopReason = null,
+    Providers.ExceptionInfoBody? Exception = null,
+    IReadOnlyList<Providers.ProcessOutcomeBody>? ProcessOutcomes = null,
+    ulong FirstProviderSequence = 0);
+
+internal sealed record EndedSessionOutcomes(string DebugSessionId, IReadOnlyList<Providers.ProcessOutcomeBody> ProcessOutcomes);
 
 internal enum DebuggerObservationWaitStatus
 {
@@ -65,6 +71,7 @@ internal sealed class DebuggerObservationStore
     private long _sequence;
     private ulong _lastProviderSequence;
     private bool _closed;
+    private EndedSessionOutcomes? _lastEndedSession;
 
     internal DebuggerObservationStore(
         string providerEpoch,
@@ -95,6 +102,35 @@ internal sealed class DebuggerObservationStore
     internal bool IsClosed
     {
         get { lock (_sync) return _closed; }
+    }
+
+    /// <summary>v1.4: 最後に自然終了した session の process 結果。次の session の観測まで保持する。</summary>
+    internal EndedSessionOutcomes? LastEndedSession
+    {
+        get { lock (_sync) return _lastEndedSession; }
+    }
+
+    /// <summary>最新の観測と公開 sequence を同じ lock で読む。</summary>
+    internal (DebuggerObservation? Latest, long Sequence) LatestWithSequence()
+    {
+        lock (_sync) return (_history.Last?.Value, _sequence);
+    }
+
+    /// <summary>現在の公開 sequence に最も近い（最新の）観測。履歴が空なら null。</summary>
+    internal DebuggerObservation? Latest()
+    {
+        lock (_sync) return _history.Last?.Value;
+    }
+
+    /// <summary>指定した公開 sequence の観測。履歴から外れていれば null。</summary>
+    internal DebuggerObservation? FindBySequence(long sequence)
+    {
+        lock (_sync)
+        {
+            foreach (var observation in _history)
+                if (observation.Sequence == sequence) return observation;
+            return null;
+        }
     }
 
     /// <summary>
@@ -147,7 +183,8 @@ internal sealed class DebuggerObservationStore
             }
             foreach (var observation in _history)
             {
-                if (observation.ProviderSequence != providerSequence) continue;
+                var first = observation.FirstProviderSequence != 0 ? observation.FirstProviderSequence : observation.ProviderSequence;
+                if (providerSequence < first || providerSequence > observation.ProviderSequence) continue;
                 sequence = observation.Sequence;
                 return true;
             }
@@ -181,7 +218,11 @@ internal sealed class DebuggerObservationStore
         string? debugSessionId,
         string? launchOperationId,
         DebuggerObservedState state,
-        ulong providerSequence = 0)
+        ulong providerSequence = 0,
+        string? stopReason = null,
+        Providers.ExceptionInfoBody? exception = null,
+        IReadOnlyList<Providers.ProcessOutcomeBody>? processOutcomes = null,
+        bool refinement = false)
     {
         if (debugSessionId is not null && !ProviderEpochIsValid(debugSessionId))
             throw new ArgumentException("Debug session ID must be a lowercase UUID-N v4 value.", nameof(debugSessionId));
@@ -196,8 +237,28 @@ internal sealed class DebuggerObservationStore
         {
             var now = _utcNow();
             PruneExpired(now);
+            // v1.4: 公開済みの同じ break に理由だけを補う通知は、新しい sequence を作らず最後の観測を置き換える。
+            if (refinement && state == DebuggerObservedState.Break && _history.Last is { } lastNode &&
+                lastNode.Value.State == DebuggerObservedState.Break && lastNode.Value.DebugSessionId == debugSessionId &&
+                lastNode.Value.Sequence == _sequence)
+            {
+                var refined = lastNode.Value with
+                {
+                    ProviderSequence = providerSequence,
+                    FirstProviderSequence = lastNode.Value.FirstProviderSequence != 0 ? lastNode.Value.FirstProviderSequence : lastNode.Value.ProviderSequence,
+                    StopReason = stopReason ?? lastNode.Value.StopReason,
+                    Exception = exception ?? lastNode.Value.Exception
+                };
+                lastNode.Value = refined;
+                if (providerSequence > _lastProviderSequence) _lastProviderSequence = providerSequence;
+                return refined;
+            }
             observation = new DebuggerObservation(_providerEpoch, checked(++_sequence), debugSessionId,
-                launchOperationId, state, now, providerSequence);
+                launchOperationId, state, now, providerSequence, stopReason, exception, processOutcomes);
+            if (state == DebuggerObservedState.Design)
+                _lastEndedSession = processOutcomes is not null && debugSessionId is not null ? new EndedSessionOutcomes(debugSessionId, processOutcomes) : null;
+            else if (state != DebuggerObservedState.Design && debugSessionId is not null && _lastEndedSession is { } ended && ended.DebugSessionId != debugSessionId)
+                _lastEndedSession = null;
             if (providerSequence > _lastProviderSequence) _lastProviderSequence = providerSequence;
             _history.AddLast(observation);
             while (_history.Count > MaximumHistoryEntries) _history.RemoveFirst();
