@@ -23,9 +23,10 @@ public sealed class ExecutionHttpTools
         [Description("Debugger session ID to bind. Supply exactly one of expectedDebugSessionId or operationId.")] string? expectedDebugSessionId = null,
         [Description("Accepted start_debugging operation ID to bind before its session ID is known.")] string? operationId = null,
         [Description("Observation timeout in milliseconds, clamped to 1000-30000. Defaults to 10000.")] int timeoutMilliseconds = 10_000,
+        [Description("When true, an exception stop may include its bounded description (sensitive). Defaults to false; category, type name and code are always returned.")] bool allowSensitiveRead = false,
         CancellationToken cancellationToken = default) =>
         DebuggerObservationTools.WaitForDebuggerStateAsync(desiredState, afterSequence, expectedDebugSessionId, operationId,
-            timeoutMilliseconds, cancellationToken);
+            timeoutMilliseconds, cancellationToken, allowSensitiveRead: allowSensitiveRead);
 
     /// <summary>bound IDE の debugger 状態を返します。</summary>
     [McpServerTool]
@@ -37,8 +38,10 @@ public sealed class ExecutionHttpTools
         string? expectedSolutionPath = null,
         [Description("Optional operation ID from start_debugging, start_without_debugging, or stop_debugging. Unknown IDs are never replaced by another operation.")]
         string? operationId = null,
+        [Description("When true, an exception stop may include its bounded description (sensitive). Defaults to false; category, type name and code are always returned.")]
+        bool allowSensitiveRead = false,
         CancellationToken cancellationToken = default) =>
-        ExecutionToolImplementation.GetDebuggerStateAsync(format, expectedSolutionPath, operationId, cancellationToken);
+        ExecutionToolImplementation.GetDebuggerStateAsync(format, expectedSolutionPath, operationId, cancellationToken, allowSensitiveRead);
 
     /// <summary>design mode から単一 startup project を debug 起動します。</summary>
     [McpServerTool]
@@ -120,7 +123,10 @@ internal sealed record DebuggerWaitResult(
     DateTimeOffset? ObservedAtUtc,
     long? OldestAvailableSequence,
     long? CurrentSequence,
-    string StopReasonAvailability = "unsupported");
+    string StopReasonAvailability = "unsupported",
+    string? StopReason = null,
+    StopExceptionInfo? Exception = null,
+    IReadOnlyList<StopProcessOutcome>? LastSessionProcessOutcomes = null);
 
 /// <summary>wait_for_debugger_state の実装。workspace lease・UI thread・COM dispatcher を占有しない。</summary>
 internal static class DebuggerObservationTools
@@ -130,7 +136,7 @@ internal static class DebuggerObservationTools
 
     internal static async Task<string> WaitForDebuggerStateAsync(string desiredState, long afterSequence,
         string? expectedDebugSessionId, string? operationId, int timeoutMilliseconds, CancellationToken cancellationToken,
-        DebuggerObservationStore? storeOverride = null, int? targetProcessIdOverride = null)
+        DebuggerObservationStore? storeOverride = null, int? targetProcessIdOverride = null, bool allowSensitiveRead = false)
     {
         var normalized = (desiredState ?? string.Empty).Trim().ToLowerInvariant();
         int? targetPid = targetProcessIdOverride;
@@ -185,7 +191,11 @@ internal static class DebuggerObservationTools
         return Serialize(new DebuggerWaitResult(success, code, message, targetPid, CapabilityRuntimeContext.ServerInstanceId,
             store.ProviderEpoch, normalized, afterSequence, observation?.Sequence, observation is null ? null : StateName(observation.State),
             observation?.DebugSessionId ?? expectedDebugSessionId, observation?.LaunchOperationId ?? operationId,
-            observation?.ObservedAtUtc, result.OldestAvailableSequence, store.CurrentSequence));
+            observation?.ObservedAtUtc, result.OldestAvailableSequence, store.CurrentSequence,
+            StopInfoProjection.Availability(true, observation is null ? null : StateName(observation.State), observation),
+            observation is { State: DebuggerObservedState.Break } ? observation.StopReason : null,
+            observation is { State: DebuggerObservedState.Break } ? StopInfoProjection.Exception(observation.Exception, allowSensitiveRead) : null,
+            observation is { State: DebuggerObservedState.Design } ? StopInfoProjection.Outcomes(observation.ProcessOutcomes) : null));
     }
 
     internal static string StateName(DebuggerObservedState state) => state switch
@@ -248,7 +258,7 @@ internal static class ExecutionToolImplementation
     private static string Bound(string? value) => value is null ? string.Empty : value.Length <= 128 ? value : value[..128];
 
     internal static async Task<string> GetDebuggerStateAsync(string format, string? expectedSolutionPath, string? operationId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool allowSensitiveRead = false)
     {
         DebuggerState state;
         try { state = StaComDispatcher.Invoke(() => VisualStudioConnector.GetDebuggerState(expectedSolutionPath), TimeSpan.FromSeconds(5)); }
@@ -259,12 +269,41 @@ internal static class ExecutionToolImplementation
         }
         catch { state = DebuggerState.Unavailable("target_unavailable", "The bound Visual Studio debugger state is unavailable."); }
 
-        if (state.Code == "ok") await EnrichFromProviderAsync(state, expectedSolutionPath!, cancellationToken).ConfigureAwait(false);
+        if (state.Code == "ok")
+        {
+            await EnrichFromProviderAsync(state, expectedSolutionPath!, cancellationToken).ConfigureAwait(false);
+            ApplyStopInfo(state, ProviderRuntime.ObservationStore, allowSensitiveRead);
+        }
         else state.ProviderStateReason = "debugger_state_unavailable";
         if (operationId is not null) state.Operation = QueryOperation(operationId);
 
         if (format.Equals("json", StringComparison.OrdinalIgnoreCase)) return SerializeBounded(state);
-        return state.Message.Length <= 4096 ? state.Message : state.Message[..4096];
+        var text = state.Message;
+        if (state.StopReason is not null) text += $"\nStop reason: {state.StopReason}";
+        if (state.StopException is { } stopException)
+        {
+            // 説明文はテキストへ出さない。種別・型名・コードだけを示す。
+            text += $"\nException: {stopException.Kind} {stopException.TypeName} (category {stopException.Category}, code {stopException.Code?.ToString() ?? "none"})";
+        }
+        if (state.LastSessionProcessOutcomes is { Count: > 0 } outcomes)
+            text += "\nLast session process outcomes: " + string.Join(", ", outcomes.Select(static outcome =>
+                $"{outcome.ProcessId}:{outcome.Outcome}{(outcome.ExitCode is { } code ? $"({code})" : string.Empty)}"));
+        return text.Length <= 4096 ? text : text[..4096];
+    }
+
+    /// <summary>
+    /// v1.4: provider 経由で得た EventSequence に対応する観測から、停止理由・例外・直近 session の終了結果を状態へ載せる。
+    /// 履歴から外れていれば理由は unknown のまま（推測しない）。provider がなければ unsupported を維持する。
+    /// </summary>
+    internal static void ApplyStopInfo(DebuggerState state, DebuggerObservationStore? store, bool allowSensitiveRead)
+    {
+        var view = StopInfoProjection.View(state.ProviderStateAvailability == "supported", state.State, state.EventSequence,
+            state.DebugSessionId, store, allowSensitiveRead);
+        state.StopReasonAvailability = view.Availability;
+        state.StopReason = view.StopReason;
+        state.StopException = view.Exception;
+        state.LastSessionId = view.LastSessionId;
+        state.LastSessionProcessOutcomes = view.LastSessionProcessOutcomes;
     }
 
     /// <summary>保持中の operation だけを照会する。不明・期限切れ・別世代の ID は operation_not_found のまま返す。</summary>

@@ -184,6 +184,25 @@ Violation(() => ProviderBodyRules.TryValidateRequest("capabilities.probe", "{\"t
 Violation(() => ProviderBodyRules.TryValidateRequest("capabilities.probe", "[]", out _), "non-object body is a violation");
 Violation(() => ProviderProtocol.ValidateObjectBody("{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":1}}}}}}}"), "body deeper than 6 is a violation");
 Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", "{\"providerSequence\":0,\"state\":\"design\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"launchOperationId\":null,\"observedAtUtc\":\"2026-10-18T00:00:00Z\"}"), "mode event sequence 0 is a violation");
+// ---- v1.4: 停止理由・例外・終了結果の mode event ----
+string ModeWire(string state, string extra) => "{\"providerSequence\":1,\"state\":\"" + state + "\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"launchOperationId\":null,\"observedAtUtc\":\"2026-10-18T00:00:00Z\"" + extra + "}";
+const string ExceptionWire = ",\"exception\":{\"kind\":\"unhandled\",\"category\":\"Managed\",\"typeName\":\"System.X\",\"code\":-1,\"description\":\"d\",\"truncated\":false}";
+var reasoned = (DebuggerModeChangedEventBody)ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"exception_unhandled\"" + ExceptionWire));
+Check(reasoned.StopReason == "exception_unhandled" && reasoned.Exception is { Kind: "unhandled", Code: -1, TypeName: "System.X" }, "mode event carries stop reason and exception");
+Check(((DebuggerModeChangedEventBody)ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ""))).StopReason is null, "mode event without a reason is accepted (v1.3 shape)");
+foreach (var reason in new[] { "breakpoint", "step", "exception_thrown", "exception_unhandled", "user_break", "other", "unknown" })
+    Check(ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"" + reason + "\"")) is DebuggerModeChangedEventBody, "stop reason " + reason + " is accepted");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"crashed\"")), "unknown stop reason is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("running", ",\"stopReason\":\"step\"")), "stop reason outside break is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"breakpoint\"" + ExceptionWire)), "exception with a non-exception reason is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"exception_thrown\",\"exception\":{\"kind\":\"other\",\"category\":\"c\",\"typeName\":\"t\"}")), "unknown exception kind is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"exception_thrown\",\"exception\":{\"kind\":\"thrown\",\"category\":\"" + new string('c', 129) + "\",\"typeName\":\"t\"}")), "oversized exception category is a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", ",\"stopReason\":\"exception_thrown\",\"exception\":{\"kind\":\"thrown\",\"category\":\"c\",\"typeName\":\"t\",\"description\":\"" + new string('d', 1025) + "\"}")), "oversized exception description is a violation");
+const string OutcomeWire = ",\"processOutcomes\":[{\"processId\":11,\"startTicks\":6,\"outcome\":\"exited\",\"exitCode\":3}]";
+Check(((DebuggerModeChangedEventBody)ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("design", OutcomeWire))).ProcessOutcomes is { Length: 1 } outs && outs[0].ExitCode == 3, "design mode event carries process outcomes");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("break", OutcomeWire)), "process outcomes outside design are a violation");
+Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", ModeWire("design", ",\"processOutcomes\":[{\"processId\":11,\"startTicks\":6,\"outcome\":\"detached\",\"exitCode\":3}]")), "exit code on a non-exited outcome in a mode event is a violation");
+Check(ProviderProtocol.CurrentVersion == 3, "v1.4 bodies travel on protocol version 3");
 Violation(() => ProviderBodyRules.ParseError("{\"code\":\"internal_error\",\"message\":\"" + new string('x', 513) + "\"}"), "error message above 512 characters is a violation");
 
 // ---- 所有権の照合（fake reconcile 応答） ----

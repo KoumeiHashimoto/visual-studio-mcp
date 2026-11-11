@@ -8,5 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Observation/DebuggerObservationStore.cs" Link="DebuggerObservationStore.cs" />
+    <Compile Include="../../Providers/ProviderProtocol.cs" Link="ProviderProtocol.cs" />
+    <Compile Include="../../Observation/StopInfoProjection.cs" Link="StopInfoProjection.cs" />
   </ItemGroup>
 </Project>

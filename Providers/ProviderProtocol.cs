@@ -609,6 +609,33 @@ internal sealed record DebuggerModeChangedEventBody
     public string? ProcessSetSnapshotId { get; init; }
     public string? LaunchOperationId { get; init; }
     public string ObservedAtUtc { get; init; } = string.Empty;
+    /// <summary>v1.4: break 遷移の停止理由（StopReasons の値）。break 以外では null。</summary>
+    public string? StopReason { get; init; }
+    /// <summary>v1.4: 例外で停止した break の例外情報。それ以外は null。</summary>
+    public ExceptionInfoBody? Exception { get; init; }
+    /// <summary>v1.4: session が自然に終わった design 遷移の、process ごとの結果。design 以外では null。</summary>
+    public ProcessOutcomeBody[]? ProcessOutcomes { get; init; }
+}
+
+/// <summary>v1.4: 停止した例外の情報。Description は認証済み pipe を通り、companion が方針で公開可否を決める。</summary>
+internal sealed record ExceptionInfoBody
+{
+    public string Kind { get; init; } = string.Empty;
+    public string Category { get; init; } = string.Empty;
+    public string TypeName { get; init; } = string.Empty;
+    public int? Code { get; init; }
+    public string? Description { get; init; }
+    public bool Truncated { get; init; }
+}
+
+internal static class StopReasons
+{
+    internal static bool IsValid(string? value) =>
+        value is null or "breakpoint" or "step" or "exception_thrown" or "exception_unhandled" or "user_break" or "other" or "unknown";
+
+    internal static bool IsValidException(ExceptionInfoBody? value) =>
+        value is null || (value.Kind is "thrown" or "unhandled" && value.Category is { Length: <= 128 } &&
+            value.TypeName is { Length: <= 256 } && (value.Description is null || value.Description.Length <= 1024));
 }
 
 internal sealed record ExecutionObservedEventBody
@@ -764,7 +791,12 @@ internal static class ProviderBodyRules
                 value.State is "running" or "break" or "design" && IsOptionalToken(value.DebugSessionId, 64) &&
                 IsOptionalToken(value.ProcessSetSnapshotId, 64) &&
                 (value.LaunchOperationId is null || ProviderProtocol.IsUuidN(value.LaunchOperationId)) &&
-                IsTimestamp(value.ObservedAtUtc),
+                IsTimestamp(value.ObservedAtUtc) &&
+                StopReasons.IsValid(value.StopReason) && (value.StopReason is null || value.State == "break") &&
+                StopReasons.IsValidException(value.Exception) &&
+                (value.Exception is null || value.State == "break" &&
+                    value.StopReason is "exception_thrown" or "exception_unhandled") &&
+                IsValidProcessOutcomes(value.ProcessOutcomes) && (value.ProcessOutcomes is null || value.State == "design"),
             ExecutionObservedEventBody value => ProviderProtocol.IsUuidN(value.OperationId) &&
                 value.State is "observed" or "failed" or "uncertain" && IsOptionalToken(value.Code, 64) &&
                 IsOptionalToken(value.DebugSessionId, 64) && IsOptionalToken(value.ProcessSetSnapshotId, 64) &&

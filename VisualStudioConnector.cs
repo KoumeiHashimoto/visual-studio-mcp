@@ -1416,6 +1416,15 @@ public class DebuggerState
     public StartupSnapshotInfo? StartupSnapshot { get; set; }
     /// <summary>停止理由・例外・終了コードは mode 通知から得られないため常に unsupported。</summary>
     public string StopReasonAvailability { get; set; } = "unsupported";
+    /// <summary>v1.4: break の停止理由。break 以外、または記録がなければ null。</summary>
+    public string? StopReason { get; set; }
+    /// <summary>v1.4: 例外で停止した break の例外情報。</summary>
+    [JsonProperty("Exception")]
+    internal Observation.StopExceptionInfo? StopException { get; set; }
+    /// <summary>v1.4: 直近に自然終了した session の process 結果（次の session の観測まで）。</summary>
+    [JsonProperty("LastSessionProcessOutcomes")]
+    internal IReadOnlyList<Observation.StopProcessOutcome>? LastSessionProcessOutcomes { get; set; }
+    public string? LastSessionId { get; set; }
     /// <summary>operationId 指定時の、その operation だけの結果。不明 ID を別の operation で代用しない。</summary>
     [JsonProperty("Operation")]
     internal Execution.ExecutionOperationResult? Operation { get; set; }

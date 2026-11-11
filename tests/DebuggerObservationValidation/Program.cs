@@ -143,6 +143,48 @@ Check((await closingWait.WaitAsync(TimeSpan.FromSeconds(5))).Status == DebuggerO
     DebuggerObservationWaitStatus.ProviderDisconnected && closingStore.IsClosed,
     "channel loss ends current and later waits as provider_disconnected");
 
+// ---- v1.4: 停止理由・例外・終了結果の観測 ----
+{
+    var stopStore = new DebuggerObservationStore(Guid.NewGuid().ToString("N"), () => now, static (_, _) => Task.CompletedTask);
+    var sessionC = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionC, null, DebuggerObservedState.Running);
+    var exception = new VisualStudioMcpServer.Providers.ExceptionInfoBody { Kind = "unhandled", Category = "Managed", TypeName = "T", Code = 5, Description = "secret" };
+    var reasoned = stopStore.Publish(sessionC, null, DebuggerObservedState.Break, 2, "exception_unhandled", exception);
+    Check(reasoned.StopReason == "exception_unhandled" && reasoned.Exception == exception, "stop reason and exception are kept on the break observation");
+    Check(stopStore.FindBySequence(reasoned.Sequence) == reasoned && stopStore.FindBySequence(99) is null, "observations are found by public sequence");
+    var resumed = stopStore.Publish(sessionC, null, DebuggerObservedState.Running, 3);
+    Check(resumed.StopReason is null && resumed.Exception is null, "a run observation carries no stop reason");
+    Check(stopStore.LastEndedSession is null, "no ended session before a design observation with outcomes");
+    var outcomes = new[] { new VisualStudioMcpServer.Providers.ProcessOutcomeBody { ProcessId = 7, StartTicks = 9, Outcome = "exited", ExitCode = 3 } };
+    stopStore.Publish(sessionC, null, DebuggerObservedState.Design, 4, null, null, outcomes);
+    Check(stopStore.LastEndedSession is { DebugSessionId: var endedId } && endedId == sessionC, "the last ended session keeps its process outcomes");
+    Check(stopStore.LastEndedSession!.ProcessOutcomes.Single().ExitCode == 3, "the exit code is retained");
+    var sessionD = Guid.NewGuid().ToString("N");
+    stopStore.Publish(sessionD, null, DebuggerObservedState.Running, 5);
+    Check(stopStore.LastEndedSession is null, "outcomes are cleared when the next session is observed");
+
+    var hidden = StopInfoProjection.Exception(exception, false);
+    Check(hidden is { Description: null, DescriptionAvailability: "requires_allowSensitiveRead", Code: 5, TypeName: "T" },
+        "the description is withheld without allowSensitiveRead");
+    var shown = StopInfoProjection.Exception(exception, true);
+    Check(shown is { Description: "secret", DescriptionAvailability: "available" }, "the description is returned with allowSensitiveRead");
+    var long1 = StopInfoProjection.Exception(exception with { Description = new string('x', 3000) }, true);
+    Check(long1!.Description!.Length == 1024 && long1.Truncated, "a long description is bounded and marked truncated");
+    Check(StopInfoProjection.Exception(exception with { Description = null }, true) is { DescriptionAvailability: "unavailable" },
+        "a missing description is unavailable");
+    Check(StopInfoProjection.Availability(false, "break", reasoned) == "unsupported", "no provider means unsupported");
+    Check(StopInfoProjection.Availability(true, "break", reasoned) == "available", "a recorded reason is available");
+    Check(StopInfoProjection.Availability(true, "break", null) == "unknown", "a provider-backed break without a reason is unknown");
+    var view = StopInfoProjection.View(true, "break", reasoned.Sequence, sessionC, stopStore, false);
+    Check(view.StopReason == "exception_unhandled" && view.Exception?.Description is null && view.Availability == "available",
+        "get_debugger_state projects the stop reason and hides the description by default");
+    var json = System.Text.Json.JsonSerializer.Serialize(view);
+    Check(!json.Contains("secret"), "the serialized view never contains the description without allowSensitiveRead");
+    var lastView = StopInfoProjection.View(true, "design", null, null, stopStore, false);
+    Check(lastView.LastSessionId is null, "no ended session is reported before one has ended");
+    Check(StopInfoProjection.View(false, "break", reasoned.Sequence, sessionC, stopStore, true).Availability == "unsupported",
+        "the view is unsupported without a provider");
+}
 Console.WriteLine($"Debugger observation validation: {passed} checks passed.");
 
 void Check(bool condition, string description)
