@@ -90,6 +90,12 @@ public sealed class DebuggerInspectionResponse
     /// <summary>Gets or sets the total count before response bounding.</summary>
     public int? TotalCount { get; set; }
 
+    /// <summary>v1.4: break generation (public event sequence) the response was read at. Null without the VSIX provider.</summary>
+    public long? EventSequence { get; set; }
+
+    /// <summary>v1.4: debugger session ID of the observed break. Null without the VSIX provider.</summary>
+    public string? DebugSessionId { get; set; }
+
     /// <summary>Gets or sets debugger threads.</summary>
     public List<DebuggerThreadInfo> Threads { get; set; } = new();
 

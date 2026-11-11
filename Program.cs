@@ -580,8 +580,9 @@ public sealed class DebuggerHttpTools
     public static string SelectDebuggerFrame(
         [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
         [System.ComponentModel.DataAnnotations.Range(1, 128)] int index,
-        string expectedFunction, string expectedModule, int totalFrameCount) =>
-        DebuggerInspectionTool.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount);
+        string expectedFunction, string expectedModule, int totalFrameCount,
+        [System.ComponentModel.Description("Optional EventSequence from get_call_stack or get_break_snapshot; refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
+        DebuggerInspectionTool.SelectDebuggerFrame(index, expectedFunction, expectedModule, totalFrameCount, expectedEventSequence);
 
     /// <summary>Reads bounded local values from a validated frame.</summary>
     [McpServerTool]
@@ -590,9 +591,16 @@ public sealed class DebuggerHttpTools
         [System.ComponentModel.Description("One-based frame index from the latest get_call_stack response, from 1 through 128.")]
         [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
         string expectedFunction, string expectedModule,
-        int totalFrameCount, int threadId, int maxDepth = 1, int maxItems = 40, bool allowMemberExpansion = false) =>
+        int totalFrameCount, int threadId, int maxDepth = 1, int maxItems = 40, bool allowMemberExpansion = false,
+        [System.ComponentModel.Description("Optional EventSequence from get_call_stack or get_break_snapshot; refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
         DebuggerInspectionTool.GetDebuggerLocals(frameIndex, expectedFunction, expectedModule,
-            totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion);
+            totalFrameCount, threadId, maxDepth, maxItems, allowMemberExpansion, expectedEventSequence);
+
+    /// <summary>Reads the break state, top frames and locals of frame 1 in one call.</summary>
+    [McpServerTool]
+    [System.ComponentModel.Description("Reads the paused break in one call: state, stop reason and exception (description only with allowSensitiveRead=true), top stack frames of the current thread and the locals of frame 1. EventSequence is the break generation to pass as expectedEventSequence to select_debugger_frame, get_debugger_locals and evaluate_expression. If the debugger moves during the read, Changed and Partial are true and no frames are returned. Never evaluates expressions or changes the selection.")]
+    public static string GetBreakSnapshot(int maxFrames = 16, bool includeLocals = true, int maxLocals = 40, bool allowSensitiveRead = false) =>
+        DebuggerInspectionTool.GetBreakSnapshot(maxFrames, includeLocals, maxLocals, allowSensitiveRead);
 
     /// <summary>Evaluates an expression with explicit evaluation, sensitive-read, and side-effect policies.</summary>
     [McpServerTool]
@@ -602,9 +610,10 @@ public sealed class DebuggerHttpTools
         [System.ComponentModel.DataAnnotations.Range(1, 128)] int frameIndex,
         string expectedFunction,
         string expectedModule, int totalFrameCount, int threadId, bool allowEvaluation = false, bool allowSideEffects = false,
-        bool allowSensitiveRead = false) =>
+        bool allowSensitiveRead = false,
+        [System.ComponentModel.Description("Optional EventSequence from get_call_stack or get_break_snapshot; refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
         DebuggerExpressionTool.EvaluateExpression(expression, frameIndex, expectedFunction, expectedModule,
-            totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead);
+            totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead, expectedEventSequence);
 
     /// <summary>Controls the bound paused or running debugger with explicit authorization.</summary>
     [McpServerTool]

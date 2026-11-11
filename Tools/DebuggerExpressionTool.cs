@@ -25,8 +25,10 @@ public static class DebuggerExpressionTool
         [Description("CurrentThreadId from the latest get_call_stack response.")] int threadId,
         [Description("Explicit authorization for expression evaluation. Defaults to false.")] bool allowEvaluation = false,
         [Description("Explicit permission for automatic property and function evaluation. Defaults to false.")] bool allowSideEffects = false,
-        [Description("Explicit permission to read sensitive debugger or process pseudovariables. Defaults to false.")] bool allowSensitiveRead = false) =>
-        Invoke(() => VisualStudioConnector.EvaluateDebuggerExpression(expression, frameIndex, expectedFunction,
+        [Description("Explicit permission to read sensitive debugger or process pseudovariables. Defaults to false.")] bool allowSensitiveRead = false,
+        [Description("Optional EventSequence from get_call_stack or get_break_snapshot. When supplied, the call is refused with stale_break_generation if the debugger moved, or generation_unavailable without the VSIX provider.")] long? expectedEventSequence = null) =>
+        (BreakGeneration.Guard(expectedEventSequence, Providers.ProviderRuntime.ObservationStore) is { } refusal
+            ? SerializeError(refusal.Code, refusal.Message) : null) ?? Invoke(() => VisualStudioConnector.EvaluateDebuggerExpression(expression, frameIndex, expectedFunction,
             expectedModule, totalFrameCount, threadId, allowEvaluation, allowSideEffects, allowSensitiveRead));
 
     private static string Invoke(Func<DebuggerExpressionResponse> operation)
