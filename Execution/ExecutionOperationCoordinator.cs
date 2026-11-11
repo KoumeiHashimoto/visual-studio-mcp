@@ -4,6 +4,9 @@ internal interface IExecutionAdapter
 {
     /// <summary>expectedSolutionPath は provider が IDE 側で workspace を照合するために使う（#54 レビュー）。</summary>
     Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, TimeSpan remaining, CancellationToken cancellationToken);
+    /// <summary>v1.4: project を指定した対象の読み取り。既定は startup project の読み取りと同じ。</summary>
+    Task<ExecutionTargetSnapshot> ReadTargetSnapshotAsync(string expectedSolutionPath, string? projectUniqueName, TimeSpan remaining,
+        CancellationToken cancellationToken) => ReadTargetSnapshotAsync(expectedSolutionPath, remaining, cancellationToken);
     /// <summary>1 回だけ dispatch する。remaining は coordinator がこの dispatch を待つ残り時間で、adapter はこれより前に確定させる。</summary>
     Task<ExecutionDispatchObservation> DispatchAsync(ExecutionRequest request, string operationId, TimeSpan remaining, CancellationToken cancellationToken);
 }
@@ -93,7 +96,7 @@ internal sealed class ExecutionOperationCoordinator
             ExecutionTargetSnapshot snapshot;
             try
             {
-                snapshot = await _adapter.ReadTargetSnapshotAsync(request.ExpectedSolutionPath, remaining, preDispatchCancellation)
+                snapshot = await _adapter.ReadTargetSnapshotAsync(request.ExpectedSolutionPath, request.ProjectUniqueName, remaining, preDispatchCancellation)
                     .WaitAsync(remaining, preDispatchCancellation).ConfigureAwait(false);
             }
             catch (TimeoutException) { RemoveDenied(record, "com_timeout", request); return; }
@@ -374,6 +377,7 @@ internal sealed class ExecutionOperationCoordinator
             ExecutionAction.StopDebugging when !request.AllowDebuggerControl => "debugger_policy_required",
             ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when string.IsNullOrWhiteSpace(request.ExpectedStartupSnapshotId) => "startup_snapshot_required",
             ExecutionAction.StopDebugging when string.IsNullOrWhiteSpace(request.ExpectedDebugSessionId) || string.IsNullOrWhiteSpace(request.ExpectedProcessSetSnapshotId) => "debug_session_required",
+            ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when request.LaunchOverrides is not null && !request.AllowLaunchOverrides => "launch_override_policy_required",
             _ => null
         };
     }
@@ -391,7 +395,9 @@ internal sealed class ExecutionOperationCoordinator
             ExecutionAction.StartDebugging when snapshot.State != "design" => "invalid_debugger_state",
             ExecutionAction.StartWithoutDebugging when snapshot.State != "design" => "invalid_debugger_state",
             ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when snapshot.StartupSnapshotId != request.ExpectedStartupSnapshotId => "stale_startup_snapshot",
-            ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when snapshot.LaunchBlockedCode is { } blocked => blocked,
+            // 上書き付きの起動は launchSettings.json の profile を使わないため、profile を識別できないことは拒否の理由にしない。
+            ExecutionAction.StartDebugging or ExecutionAction.StartWithoutDebugging when snapshot.LaunchBlockedCode is { } blocked &&
+                !(request.LaunchOverrides is not null && snapshot.LaunchBlockedReason == "launch_profile_unidentified") => blocked,
             ExecutionAction.StopDebugging when snapshot.State is not "running" and not "break" => "invalid_debugger_state",
             ExecutionAction.StopDebugging when snapshot.DebugSessionId != request.ExpectedDebugSessionId || snapshot.ProcessSetSnapshotId != request.ExpectedProcessSetSnapshotId => "debug_session_mismatch",
             ExecutionAction.StopDebugging when !snapshot.SessionAgentOwned && !request.AllowStopExistingSession => "existing_session_policy_required",
@@ -535,6 +541,11 @@ internal sealed class ExecutionOperationCoordinator
         "cancelled_before_dispatch" => "The caller cancelled before dispatch.",
         "operation_failed" => "The execution request failed before dispatch.",
         "unsupported" => "The startup configuration is not supported for a guarded launch.",
+        "launch_override_policy_required" => "allowLaunchOverrides=true is required for launch overrides.",
+        "launch_override_invalid" => "The launch overrides are out of range or do not name an existing working directory.",
+        "launch_override_unsupported" => "Launch overrides are supported only for SDK-style C# and native C++ MSBuild projects whose output can be resolved.",
+        "project_not_found" => "The selected project is not in the project snapshot; read a fresh project inventory.",
+        "project_not_launchable" => "The selected project cannot be launched (not loaded, a solution folder, or not an executable project).",
         "user_action_required" => "The startup configuration needs user action (for example saving documents) before a guarded launch.",
         _ => "The execution request was rejected before dispatch."
     };

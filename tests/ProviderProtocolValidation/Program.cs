@@ -184,6 +184,51 @@ Violation(() => ProviderBodyRules.TryValidateRequest("capabilities.probe", "{\"t
 Violation(() => ProviderBodyRules.TryValidateRequest("capabilities.probe", "[]", out _), "non-object body is a violation");
 Violation(() => ProviderProtocol.ValidateObjectBody("{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":1}}}}}}}"), "body deeper than 6 is a violation");
 Violation(() => ProviderBodyRules.ParseEvent("debugger.modeChanged", "{\"providerSequence\":0,\"state\":\"design\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"launchOperationId\":null,\"observedAtUtc\":\"2026-10-18T00:00:00Z\"}"), "mode event sequence 0 is a violation");
+// ---- v1.4: 起動上書きの値域と hash（VSIX と companion で同じ既知解を検査する）----
+{
+    var kat = LaunchOverrideRules.ComputeHash("--a b", "C:\\work\\dir", new Dictionary<string, string> { ["V14_PROBE"] = "x", ["Path2"] = "y" });
+    Check(kat == "fbc4bbfccd5c17b1dfb19bc8213598f075068ab2db09c47e38670503e73ebe37", "launch override hash matches the known answer");
+    Check(kat == LaunchOverrideRules.ComputeHash("--a b", "C:\\work\\dir", new Dictionary<string, string> { ["path2"] = "y", ["v14_probe"] = "x" }.ToDictionary(p => p.Key == "path2" ? "Path2" : "V14_PROBE", p => p.Value)),
+        "the hash ignores the key order and case");
+    Check(LaunchOverrideRules.ComputeHash(null, null, null) != LaunchOverrideRules.ComputeHash("", null, null), "null and empty arguments hash differently");
+    Check(LaunchOverrideRules.ComputeHash("a", "C:\\b", null) != LaunchOverrideRules.ComputeHash("a\nw:4:C:\\b", null, null), "length prefixes prevent concatenation collisions");
+    Check(LaunchOverrideRules.Validate("--x", "C:\\dir", new Dictionary<string, string> { ["A_B"] = "v" }) is null, "a normal override is valid");
+    Check(LaunchOverrideRules.Validate(new string('a', 4097), null, null) is not null, "arguments above 4096 characters are invalid");
+    Check(LaunchOverrideRules.Validate("a\0b", null, null) is not null, "arguments with NUL are invalid");
+    Check(LaunchOverrideRules.Validate(null, "relative\\dir", null) is not null, "a relative working directory is invalid");
+    Check(LaunchOverrideRules.Validate(null, "", null) is not null, "an empty working directory is invalid");
+    Check(LaunchOverrideRules.Validate(null, "\\\\server\\share\\dir", null) is null, "a UNC working directory is accepted");
+    Check(LaunchOverrideRules.Validate(null, new string('d', 1025), null) is not null, "a working directory above 1024 characters is invalid");
+    var many = Enumerable.Range(0, 33).ToDictionary(i => "K" + i, i => "v");
+    Check(LaunchOverrideRules.Validate(null, null, many) is not null, "more than 32 environment keys are invalid");
+    Check(LaunchOverrideRules.Validate(null, null, Enumerable.Range(0, 32).ToDictionary(i => "K" + i, i => "v")) is null, "32 environment keys are valid");
+    Check(LaunchOverrideRules.Validate(null, null, new Dictionary<string, string> { ["1BAD"] = "v" }) is not null, "a variable name starting with a digit is invalid");
+    Check(LaunchOverrideRules.Validate(null, null, new Dictionary<string, string> { ["A=B"] = "v" }) is not null, "a variable name with an equals sign is invalid");
+    Check(LaunchOverrideRules.Validate(null, null, new Dictionary<string, string> { ["K"] = new string('v', 8192) }) is not null, "environment above 8192 characters in total is invalid");
+    Check(LaunchOverrideRules.Validate(null, null, new Dictionary<string, string> { ["K"] = "a\0b" }) is not null, "an environment value with NUL is invalid");
+    Check(LaunchOverrideRules.Validate(null, null, new Dictionary<string, string> { ["Key"] = "1", ["KEY"] = "2" }) is not null, "names that differ only by case are invalid");
+    Check(!LaunchOverrideRules.HasAny(null, null, null) && !LaunchOverrideRules.HasAny(null, null, new Dictionary<string, string>()) && LaunchOverrideRules.HasAny("", null, null),
+        "an empty override set is not an override");
+    var message = LaunchOverrideRules.Validate("x", null, new Dictionary<string, string> { ["1SECRETNAME"] = "SECRET-VALUE" });
+    Check(message is not null && !message.Contains("SECRET"), "validation messages never contain override values or names");
+}
+// ---- v1.4: project 指定と起動上書きの要求本文 ----
+{
+    const string tgt = "\"target\":{\"visualStudioPid\":101,\"visualStudioStartTicks\":638900000000000000}";
+    var overridesHash = LaunchOverrideRules.ComputeHash("--x", "C:\\work", new Dictionary<string, string> { ["V14_PROBE"] = "1" });
+    string V14Dispatch(string extra) => "{" + tgt + ",\"operationId\":\"11111111111141118111111111111111\",\"action\":\"startDebugging\",\"expectedStartupSnapshotId\":\"s1\",\"policyFlags\":[\"allowDebuggerControl\"],\"ownerFence\":\"22222222222242228222222222222222\"" + extra + "}";
+    string V14Ovr(string hash) => ",\"projectUniqueName\":\"Second\\\\Second.csproj\",\"launchOverrides\":{\"arguments\":\"--x\",\"workingDirectory\":\"C:\\\\work\",\"environment\":{\"V14_PROBE\":\"1\"},\"hash\":\"" + hash + "\"}";
+    Check(ProviderBodyRules.TryValidateRequest("execution.dispatch", V14Dispatch(V14Ovr(overridesHash)), out _), "dispatch with a project and a matching override hash is valid");
+    Check(!ProviderBodyRules.TryValidateRequest("execution.dispatch", V14Dispatch(V14Ovr(new string('0', 64))), out _), "dispatch with a wrong override hash is invalid");
+    Check(!ProviderBodyRules.TryValidateRequest("execution.dispatch", V14Dispatch(",\"launchOverrides\":{\"hash\":\"" + new string('0', 64) + "\"}"), out _), "an empty override set is invalid");
+    Check(!ProviderBodyRules.TryValidateRequest("execution.dispatch", V14Dispatch(",\"projectUniqueName\":\"" + new string('p', 261) + "\""), out _), "an oversized project name is invalid");
+    Check(ProviderBodyRules.TryValidateRequest("execution.dispatch", V14Dispatch(""), out _), "a v1.3 shaped dispatch body is still valid");
+    Check(ProviderBodyRules.TryValidateRequest("execution.readTarget", "{" + tgt + ",\"projectUniqueName\":\"Second\\\\Second.csproj\"}", out _), "readTarget accepts a project name");
+    Check(ProviderBodyRules.TryValidateRequest("execution.readTarget", "{" + tgt + "}", out _), "readTarget without a project is the v1.3 shape");
+    Check(!ProviderBodyRules.TryValidateRequest("execution.readTarget", "{" + tgt + ",\"projectUniqueName\":\"a\\u0001b\"}", out _), "a project name with control characters is invalid");
+    Check(ProviderBodyRules.TryValidateRequest("debugger.getState", "{" + tgt + ",\"includeStartupSnapshot\":true,\"projectUniqueName\":\"Second\\\\Second.csproj\"}", out _), "getState accepts a project name");
+    Check(new LaunchOverridesBody { Arguments = "SECRET-MARKER" }.ToString() == "LaunchOverrides(redacted)", "the override body redacts its string form");
+}
 // ---- v1.4: 停止理由・例外・終了結果の mode event ----
 string ModeWire(string state, string extra) => "{\"providerSequence\":1,\"state\":\"" + state + "\",\"debugSessionId\":null,\"processSetSnapshotId\":null,\"launchOperationId\":null,\"observedAtUtc\":\"2026-10-18T00:00:00Z\"" + extra + "}";
 const string ExceptionWire = ",\"exception\":{\"kind\":\"unhandled\",\"category\":\"Managed\",\"typeName\":\"System.X\",\"code\":-1,\"description\":\"d\",\"truncated\":false}";
@@ -705,7 +750,7 @@ Check(ProviderExecutionAdapter.PolicyFlags(new ExecutionRequest("r", ExecutionAc
     var execute = coordinator.ExecuteAsync(request);
     var targetRequest = await harness.Provider.ReadAsync();
     Check(targetRequest.Operation == "execution.readTarget", "coordinator reads the provider target before dispatch");
-    var targetBody = ProviderProtocol.ParseBody<TargetOnlyRequestBody>(targetRequest.Body);
+    var targetBody = ProviderProtocol.ParseBody<ExecutionReadTargetRequestBody>(targetRequest.Body);
     await harness.Provider.RespondAsync(targetRequest, "ok", "dispatched", readTarget);
     var dispatchRequest = await harness.Provider.ReadAsync();
     var dispatchBody = ProviderProtocol.ParseBody<ExecutionDispatchRequestBody>(dispatchRequest.Body);

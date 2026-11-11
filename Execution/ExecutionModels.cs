@@ -21,7 +21,23 @@ internal sealed record ExecutionRequest(
     bool AllowBuild = false,
     bool AllowStopExistingSession = false,
     DateTimeOffset? ExecutionDeadlineUtc = null,
-    int CallerWaitTimeoutMilliseconds = 10_000);
+    int CallerWaitTimeoutMilliseconds = 10_000,
+    string? ProjectUniqueName = null,
+    ExecutionLaunchOverrides? LaunchOverrides = null,
+    bool AllowLaunchOverrides = false);
+
+/// <summary>
+/// v1.4: 1 回限りの起動上書き。値（引数・作業ディレクトリ・環境変数）はログ・応答・台帳へ出さないため ToString を伏せる。
+/// request ID の衝突検出には <see cref="Hash"/>（正準形の SHA-256）だけを使う。
+/// </summary>
+internal sealed record ExecutionLaunchOverrides(
+    string? Arguments,
+    string? WorkingDirectory,
+    IReadOnlyDictionary<string, string>? Environment,
+    string Hash)
+{
+    public override string ToString() => "ExecutionLaunchOverrides(redacted)";
+}
 
 internal sealed record ExecutionTargetSnapshot(
     int TargetProcessId,
@@ -95,6 +111,10 @@ internal static class ExecutionRequestIdentity
             request.ExpectedStartupSnapshotId,
             request.ExpectedDebugSessionId,
             request.ExpectedProcessSetSnapshotId,
+            // v1.4: project 指定と上書きの hash（値そのものは入れない）。
+            request.ProjectUniqueName,
+            OverrideHash = request.LaunchOverrides?.Hash,
+            request.AllowLaunchOverrides,
             Policy = ExecutionPolicy.From(request),
             ExecutionDeadlineUtc = request.ExecutionDeadlineUtc?.ToUniversalTime().Ticks
         };

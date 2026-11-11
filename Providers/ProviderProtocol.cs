@@ -502,6 +502,26 @@ internal sealed record DebuggerGetStateRequestBody
 {
     public ProviderTarget? Target { get; init; }
     public bool IncludeStartupSnapshot { get; init; }
+    /// <summary>v1.4: 起動対象として評価する project の UniqueName。null なら startup project。</summary>
+    public string? ProjectUniqueName { get; init; }
+}
+
+/// <summary>v1.4: execution.readTarget の要求。ProjectUniqueName で startup project 以外を評価する。</summary>
+/// <remarks>capabilities.probe は引き続き <see cref="TargetOnlyRequestBody"/> を使う。</remarks>
+internal sealed record ExecutionReadTargetRequestBody
+{
+    public ProviderTarget? Target { get; init; }
+    public string? ProjectUniqueName { get; init; }
+}
+
+/// <summary>v1.4: 起動上書きの値。hash は値の正準形の SHA-256 で、VSIX が再計算して照合する。値はログへ出さない。</summary>
+internal sealed record LaunchOverridesBody
+{
+    public string? Arguments { get; init; }
+    public string? WorkingDirectory { get; init; }
+    public Dictionary<string, string>? Environment { get; init; }
+    public string Hash { get; init; } = string.Empty;
+    public override string ToString() => "LaunchOverrides(redacted)";
 }
 
 internal sealed record ExecutionDispatchRequestBody
@@ -514,6 +534,10 @@ internal sealed record ExecutionDispatchRequestBody
     public string? ExpectedProcessSetSnapshotId { get; init; }
     public string[] PolicyFlags { get; init; } = [];
     public string OwnerFence { get; init; } = string.Empty;
+    /// <summary>v1.4: 起動対象 project の UniqueName。null なら startup project。</summary>
+    public string? ProjectUniqueName { get; init; }
+    /// <summary>v1.4: 1 回限りの起動上書き。null なら上書きなし。</summary>
+    public LaunchOverridesBody? LaunchOverrides { get; init; }
 }
 
 internal sealed record OwnershipReconcileRequestBody
@@ -691,6 +715,16 @@ internal static class ProviderBodyRules
 
     internal static bool IsOptionalToken(string? value, int maxLength) => value is null || IsToken(value, maxLength);
 
+    /// <summary>v1.4: project の UniqueName。260 文字以下で制御文字を含まない（path を含み得るため token 形式にはしない）。</summary>
+    internal static bool IsValidProjectUniqueName(string? value) =>
+        value is null || value.Length is > 0 and <= 260 && !value.Any(static character => char.IsControl(character));
+
+    /// <summary>v1.4: 起動上書きの値域と hash。値の内容は検査結果にも含めない。</summary>
+    internal static bool IsValidLaunchOverrides(LaunchOverridesBody? value) =>
+        value is null || LaunchOverrideRules.Validate(value.Arguments, value.WorkingDirectory, value.Environment) is null &&
+            LaunchOverrideRules.HasAny(value.Arguments, value.WorkingDirectory, value.Environment) && ProviderProtocol.IsLowerHex64(value.Hash) &&
+            string.Equals(value.Hash, LaunchOverrideRules.ComputeHash(value.Arguments, value.WorkingDirectory, value.Environment), StringComparison.Ordinal);
+
     internal static bool IsTimestamp(string? value) =>
         value is { Length: > 0 and <= 40 } && DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
             System.Globalization.DateTimeStyles.None, out _);
@@ -709,12 +743,20 @@ internal static class ProviderBodyRules
         switch (operation)
         {
             case "capabilities.probe":
-            case "execution.readTarget":
                 target = ProviderProtocol.ParseBody<TargetOnlyRequestBody>(body).Target;
                 return IsValidTarget(target);
+            case "execution.readTarget":
+            {
+                var value = ProviderProtocol.ParseBody<ExecutionReadTargetRequestBody>(body);
+                target = value.Target;
+                return IsValidTarget(target) && IsValidProjectUniqueName(value.ProjectUniqueName);
+            }
             case "debugger.getState":
-                target = ProviderProtocol.ParseBody<DebuggerGetStateRequestBody>(body).Target;
-                return IsValidTarget(target);
+            {
+                var value = ProviderProtocol.ParseBody<DebuggerGetStateRequestBody>(body);
+                target = value.Target;
+                return IsValidTarget(target) && IsValidProjectUniqueName(value.ProjectUniqueName);
+            }
             case "execution.dispatch":
             {
                 var value = ProviderProtocol.ParseBody<ExecutionDispatchRequestBody>(body);
@@ -723,7 +765,8 @@ internal static class ProviderBodyRules
                     value.Action is "startDebugging" or "startWithoutDebugging" or "stopDebugging" &&
                     IsOptionalToken(value.ExpectedStartupSnapshotId, 64) && IsOptionalToken(value.ExpectedDebugSessionId, 64) &&
                     IsOptionalToken(value.ExpectedProcessSetSnapshotId, 64) && value.PolicyFlags is { Length: <= 16 } &&
-                    value.PolicyFlags.All(static flag => IsToken(flag, 64)) && ProviderProtocol.IsUuidN(value.OwnerFence);
+                    value.PolicyFlags.All(static flag => IsToken(flag, 64)) && ProviderProtocol.IsUuidN(value.OwnerFence) &&
+                    IsValidProjectUniqueName(value.ProjectUniqueName) && IsValidLaunchOverrides(value.LaunchOverrides);
             }
             case "ownership.reconcile":
             {

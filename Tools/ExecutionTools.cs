@@ -40,8 +40,13 @@ public sealed class ExecutionHttpTools
         string? operationId = null,
         [Description("When true, an exception stop may include its bounded description (sensitive). Defaults to false; category, type name and code are always returned.")]
         bool allowSensitiveRead = false,
+        [Description("Optional projectSnapshotId from list_solution_projects. Supply together with projectId to evaluate that project's launch snapshot instead of the startup project. The startup project is never changed.")]
+        string? projectSnapshotId = null,
+        [Description("Optional projectId from the same project snapshot. Supply together with projectSnapshotId.")]
+        string? projectId = null,
         CancellationToken cancellationToken = default) =>
-        ExecutionToolImplementation.GetDebuggerStateAsync(format, expectedSolutionPath, operationId, cancellationToken, allowSensitiveRead);
+        ExecutionToolImplementation.GetDebuggerStateAsync(format, expectedSolutionPath, operationId, cancellationToken, allowSensitiveRead,
+            projectSnapshotId, projectId);
 
     /// <summary>design mode から単一 startup project を debug 起動します。</summary>
     [McpServerTool]
@@ -53,9 +58,16 @@ public sealed class ExecutionHttpTools
         [Description("Must be true to start a debugger session.")] bool allowDebuggerControl = false,
         [Description("Must be true when the launch may build. The provider currently reports that a build may occur.")] bool allowBuild = false,
         [Description("Caller wait in milliseconds (1-30000). A shorter wait returns execution_pending without cancelling the operation.")] int timeoutMilliseconds = 10_000,
+        [Description("Optional projectSnapshotId from list_solution_projects; supply with projectId to launch that project instead of the startup project (the startup project is not changed). expectedStartupSnapshotId must come from get_debugger_state with the same project.")] string? projectSnapshotId = null,
+        [Description("Optional projectId from the same project snapshot.")] string? projectId = null,
+        [Description("Optional one-shot command-line arguments (at most 4096 characters). Requires allowLaunchOverrides=true. Output redirection syntax is not interpreted.")] string? arguments = null,
+        [Description("Optional one-shot absolute working directory that must exist (at most 1024 characters). Requires allowLaunchOverrides=true.")] string? workingDirectory = null,
+        [Description("Optional one-shot environment variables merged into the Visual Studio process environment (add or replace; at most 32 names, 8192 characters in total). Requires allowLaunchOverrides=true. Values are never logged or returned.")] Dictionary<string, string>? environment = null,
+        [Description("Must be true to use arguments, workingDirectory or environment. Override launches do not apply launchSettings.json profiles, Hot Reload, ASP.NET/IIS Express/Docker/WSL profiles, Visual C++ debugger property-page settings or remote debugging.")] bool allowLaunchOverrides = false,
         CancellationToken cancellationToken = default) =>
         ExecutionToolImplementation.ExecuteAsync(ExecutionAction.StartDebugging, requestId, expectedSolutionPath, expectedStartupSnapshotId,
-            null, null, allowDebuggerControl, false, allowBuild, false, timeoutMilliseconds, cancellationToken);
+            null, null, allowDebuggerControl, false, allowBuild, false, timeoutMilliseconds, cancellationToken,
+            projectSnapshotId, projectId, arguments, workingDirectory, environment, allowLaunchOverrides);
 
     /// <summary>design mode から単一 startup project を debug なしで起動します。</summary>
     [McpServerTool]
@@ -67,9 +79,16 @@ public sealed class ExecutionHttpTools
         [Description("Must be true to launch without debugging.")] bool allowLaunch = false,
         [Description("Must be true when the launch may build. The provider currently reports that a build may occur.")] bool allowBuild = false,
         [Description("Caller wait in milliseconds (1-30000). A shorter wait returns execution_pending without cancelling the operation.")] int timeoutMilliseconds = 10_000,
+        [Description("Optional projectSnapshotId from list_solution_projects; supply with projectId to launch that project instead of the startup project (the startup project is not changed). expectedStartupSnapshotId must come from get_debugger_state with the same project.")] string? projectSnapshotId = null,
+        [Description("Optional projectId from the same project snapshot.")] string? projectId = null,
+        [Description("Optional one-shot command-line arguments (at most 4096 characters). Requires allowLaunchOverrides=true. Output redirection syntax is not interpreted.")] string? arguments = null,
+        [Description("Optional one-shot absolute working directory that must exist (at most 1024 characters). Requires allowLaunchOverrides=true.")] string? workingDirectory = null,
+        [Description("Optional one-shot environment variables merged into the Visual Studio process environment (add or replace; at most 32 names, 8192 characters in total). Requires allowLaunchOverrides=true. Values are never logged or returned.")] Dictionary<string, string>? environment = null,
+        [Description("Must be true to use arguments, workingDirectory or environment. Override launches do not apply launchSettings.json profiles, Hot Reload, ASP.NET/IIS Express/Docker/WSL profiles, Visual C++ debugger property-page settings or remote debugging.")] bool allowLaunchOverrides = false,
         CancellationToken cancellationToken = default) =>
         ExecutionToolImplementation.ExecuteAsync(ExecutionAction.StartWithoutDebugging, requestId, expectedSolutionPath, expectedStartupSnapshotId,
-            null, null, false, allowLaunch, allowBuild, false, timeoutMilliseconds, cancellationToken);
+            null, null, false, allowLaunch, allowBuild, false, timeoutMilliseconds, cancellationToken,
+            projectSnapshotId, projectId, arguments, workingDirectory, environment, allowLaunchOverrides);
 
     /// <summary>指定した debugger session と process set だけを停止します。</summary>
     [McpServerTool]
@@ -105,7 +124,8 @@ internal sealed record ExecutionToolResponse(
     string RequestId,
     long? EventSequence,
     string? ProviderEpoch,
-    IReadOnlyList<ExecutionProcessOutcome>? ProcessOutcomes = null);
+    IReadOnlyList<ExecutionProcessOutcome>? ProcessOutcomes = null,
+    string? LaunchMode = null);
 
 internal sealed record DebuggerWaitResult(
     bool Success,
@@ -226,16 +246,44 @@ internal static class ExecutionToolImplementation
     internal static async Task<string> ExecuteAsync(ExecutionAction action, string? requestId, string? expectedSolutionPath,
         string? expectedStartupSnapshotId, string? expectedDebugSessionId, string? expectedProcessSetSnapshotId,
         bool allowDebuggerControl, bool allowLaunch, bool allowBuild, bool allowStopExistingSession, int timeoutMilliseconds,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, string? projectSnapshotId = null, string? projectId = null, string? arguments = null,
+        string? workingDirectory = null, IReadOnlyDictionary<string, string>? environment = null, bool allowLaunchOverrides = false)
     {
         var target = ExecutionRuntime.Target();
         var store = ProviderRuntime.ObservationStore;
         long? eventSequence = store?.CurrentSequence;
+        var isStart = action != ExecutionAction.StopDebugging;
+        var hasOverrides = LaunchOverrideRules.HasAny(arguments, workingDirectory, environment);
+        string? projectUniqueName = null;
+        ExecutionLaunchOverrides? overrides = null;
+        string? launchMode = isStart ? hasOverrides ? "override_launch" : "project_debug_launch" : null;
+        ExecutionToolResponse Reject(string code, string message) => new(false, code, message, null, "not_started", false,
+            target?.ProcessId, CapabilityRuntimeContext.ServerInstanceId, CapabilityRuntimeContext.ServerEpoch, null, null,
+            ProviderExecutionAdapter.ActionName(action), Bound(requestId), eventSequence, store?.ProviderEpoch, null, launchMode);
+        if (isStart)
+        {
+            if (hasOverrides && !allowLaunchOverrides)
+                return JsonConvert.SerializeObject(Reject("launch_override_policy_required", "allowLaunchOverrides=true is required for launch overrides."), Formatting.None);
+            if (hasOverrides)
+            {
+                var invalid = LaunchOverrideRules.Validate(arguments, workingDirectory, environment);
+                if (invalid is null && workingDirectory is not null && !Directory.Exists(workingDirectory))
+                    invalid = "workingDirectory does not name an existing directory";
+                if (invalid is not null)
+                    return JsonConvert.SerializeObject(Reject("launch_override_invalid", "The launch overrides are invalid: " + invalid + "."), Formatting.None);
+                overrides = new ExecutionLaunchOverrides(arguments, workingDirectory, environment,
+                    LaunchOverrideRules.ComputeHash(arguments, workingDirectory, environment));
+            }
+            var resolved = ProjectInventoryTools.ResolveLaunchProject(projectSnapshotId, projectId, expectedSolutionPath, cancellationToken);
+            if (resolved.Code is not null) return JsonConvert.SerializeObject(Reject(resolved.Code, resolved.Message!), Formatting.None);
+            projectUniqueName = resolved.UniqueName;
+        }
         var request = new ExecutionRequest(requestId ?? string.Empty, action, target?.ProcessId ?? 0, target?.StartTicks ?? 0,
             CapabilityRuntimeContext.ServerInstanceId ?? string.Empty, CapabilityRuntimeContext.ServerEpoch ?? Guid.Empty,
             expectedSolutionPath ?? string.Empty, Blank(expectedStartupSnapshotId), Blank(expectedDebugSessionId),
             Blank(expectedProcessSetSnapshotId), allowDebuggerControl, allowLaunch, allowBuild, allowStopExistingSession,
-            CallerWaitTimeoutMilliseconds: timeoutMilliseconds);
+            CallerWaitTimeoutMilliseconds: timeoutMilliseconds, ProjectUniqueName: projectUniqueName, LaunchOverrides: overrides,
+            AllowLaunchOverrides: allowLaunchOverrides);
         var waitBudget = System.Diagnostics.Stopwatch.StartNew();
         var result = await ExecutionRuntime.Coordinator.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
         if (action == ExecutionAction.StopDebugging && result.State == "accepted" && result.OperationId is { } operationId)
@@ -249,7 +297,7 @@ internal static class ExecutionToolImplementation
         var response = new ExecutionToolResponse(result.Success, result.Code, result.Message, result.OperationId, result.State,
             result.MayHaveChanged, result.TargetProcessId, result.ServerInstanceId, result.ServerEpoch, result.DebugSessionId,
             result.ProcessSetSnapshotId, ProviderExecutionAdapter.ActionName(action), Bound(requestId), eventSequence, store?.ProviderEpoch,
-            result.ProcessOutcomes);
+            result.ProcessOutcomes, launchMode);
         return JsonConvert.SerializeObject(response, Formatting.None);
     }
 
@@ -258,8 +306,14 @@ internal static class ExecutionToolImplementation
     private static string Bound(string? value) => value is null ? string.Empty : value.Length <= 128 ? value : value[..128];
 
     internal static async Task<string> GetDebuggerStateAsync(string format, string? expectedSolutionPath, string? operationId,
-        CancellationToken cancellationToken, bool allowSensitiveRead = false)
+        CancellationToken cancellationToken, bool allowSensitiveRead = false, string? projectSnapshotId = null, string? projectId = null)
     {
+        var resolvedProject = ProjectInventoryTools.ResolveLaunchProject(projectSnapshotId, projectId, expectedSolutionPath, cancellationToken);
+        if (resolvedProject.Code is not null)
+        {
+            var failed = DebuggerState.Unavailable(resolvedProject.Code, resolvedProject.Message!);
+            return format.Equals("json", StringComparison.OrdinalIgnoreCase) ? SerializeBounded(failed) : failed.Message;
+        }
         DebuggerState state;
         try { state = StaComDispatcher.Invoke(() => VisualStudioConnector.GetDebuggerState(expectedSolutionPath), TimeSpan.FromSeconds(5)); }
         catch (TimeoutException) { state = DebuggerState.Unavailable("com_timeout", "The bound Visual Studio debugger state did not respond within the inspection deadline."); }
@@ -271,7 +325,7 @@ internal static class ExecutionToolImplementation
 
         if (state.Code == "ok")
         {
-            await EnrichFromProviderAsync(state, expectedSolutionPath!, cancellationToken).ConfigureAwait(false);
+            await EnrichFromProviderAsync(state, expectedSolutionPath!, cancellationToken, resolvedProject.UniqueName).ConfigureAwait(false);
             ApplyStopInfo(state, ProviderRuntime.ObservationStore, allowSensitiveRead);
         }
         else state.ProviderStateReason = "debugger_state_unavailable";
@@ -322,7 +376,8 @@ internal static class ExecutionToolImplementation
             serverEpoch.Value);
     }
 
-    private static async Task EnrichFromProviderAsync(DebuggerState state, string expectedSolutionPath, CancellationToken cancellationToken)
+    private static async Task EnrichFromProviderAsync(DebuggerState state, string expectedSolutionPath, CancellationToken cancellationToken,
+        string? projectUniqueName = null)
     {
         var channel = ProviderRuntime.Channel;
         var store = ProviderRuntime.ObservationStore;
@@ -343,7 +398,8 @@ internal static class ExecutionToolImplementation
         var call = await channel.SendAsync("debugger.getState", new DebuggerGetStateRequestBody
         {
             Target = new ProviderTarget { VisualStudioPid = target.Value.ProcessId, VisualStudioStartTicks = target.Value.StartTicks },
-            IncludeStartupSnapshot = true
+            IncludeStartupSnapshot = true,
+            ProjectUniqueName = projectUniqueName
         }, ProviderReadTimeout).ConfigureAwait(false);
         var result = await call.Result.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (!result.IsOk)
